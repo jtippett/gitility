@@ -1,0 +1,63 @@
+defmodule Gitility.MixProject do
+  use Mix.Project
+
+  # Do not hand-edit. The release script (scripts/release.exs, via `just release`)
+  # bumps this line and the CHANGELOG together when cutting a release.
+  @version "0.1.0"
+  @source_url "https://github.com/jtippett/gitility"
+
+  def project do
+    [
+      app: :gitility,
+      version: @version,
+      elixir: "~> 1.17",
+      start_permanent: Mix.env() == :prod,
+      deps: deps(),
+      package: package(),
+      docs: docs(),
+      name: "Gitility",
+      description:
+        "Snapshot-first Git object queries for Elixir — bounded, cancellable, " <>
+          "structured reads (tree, file, search, log, diff, blame) over pluggable " <>
+          "object databases, no worktree or checkout required",
+      source_url: @source_url
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger]
+    ]
+  end
+
+  defp deps do
+    [
+      {:rustler, "~> 0.38", optional: true},
+      {:rustler_precompiled, "~> 0.9"},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+    ]
+  end
+
+  defp package do
+    [
+      licenses: ["MIT"],
+      links: %{
+        "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/master/CHANGELOG.md"
+      },
+      files: ~w(lib native/gitility/Cargo.toml native/gitility/Cargo.lock native/gitility/src
+           crates/gitility-core/Cargo.toml crates/gitility-core/src
+           checksum-Elixir.Gitility.Native.exs .formatter.exs mix.exs
+           README.md CHANGELOG.md LICENSE)
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md", "CHANGELOG.md"],
+      source_url: @source_url,
+      source_ref: "v#{@version}"
+    ]
+  end
+end

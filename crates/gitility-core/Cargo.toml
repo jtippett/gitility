@@ -1,0 +1,9 @@
+[package]
+name = "gitility-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[dependencies]
+# The pinned `gix` family lands here in Milestone 0/1. Pin exactly and never
+# let gix types cross this crate's public API (design doc, R5).

@@ -9,7 +9,8 @@
 
 #[rustler::nif]
 fn ping() -> rustler::Atom {
-    let _ = gitility_core::CORE_PRESENT;
+    // Touch the core so the scaffold proves the crates link end to end.
+    let _ = gitility_core::HashKind::Sha1;
     atoms::pong()
 }
 

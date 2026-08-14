@@ -133,6 +133,12 @@ These findings are load-bearing; the design references them by ID.
   finds blockers) touches nothing above the seam. `exqlite` was rejected
   outright: no blob I/O, a second NIF, and an Elixir round-trip on a local
   read path. Turso is exact-pinned like gix (R5).
+  **M0 spike result (2026-08-14, `crates/f6-spike`): PASS.** 16 concurrent
+  reader threads over one 64 MiB bundle-shaped file via synchronous
+  `Statement::step()` polling (`turso_core = "=0.7.2"`, `fs` feature, no
+  tokio): ~47 GiB verified byte-correct at ~2.2 GiB/s, connection
+  open/close churn clean, zero errors or deadlocks. The rusqlite fallback
+  was not triggered.
 
 ## Goals
 

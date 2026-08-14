@@ -1,0 +1,10 @@
+[package]
+name = "f6-spike"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Milestone 0 feasibility spike for concurrent Turso bundle reads"
+
+[dependencies]
+turso_core = { version = "=0.7.2", default-features = false, features = ["fs", "uuid"] }

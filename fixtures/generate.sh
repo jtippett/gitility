@@ -320,20 +320,55 @@ make_lfs_pointer() {
   export_bare "$work_repository" "$bare_repository" sha1
 }
 
+make_nested() {
+  local work_repository=$1
+  local bare_repository=$2
+
+  init_work_repo "$work_repository" sha1
+  mkdir -p "$work_repository/lib/gitility/core" \
+    "$work_repository/lib/gitility/helpers" \
+    "$work_repository/docs/guides" \
+    "$work_repository/docs/reference"
+  printf 'defmodule Gitility.Core.A do\nend\n' \
+    >"$work_repository/lib/gitility/core/a.ex"
+  printf 'deep text fixture\n' >"$work_repository/lib/gitility/core/b.txt"
+  printf '# Helper notes\n' >"$work_repository/lib/gitility/helpers/notes.md"
+  printf 'defmodule Gitility.Util do\nend\n' >"$work_repository/lib/gitility/util.ex"
+  printf 'library top-level text\n' >"$work_repository/lib/top.txt"
+  printf '# Nested fixture guide\n' >"$work_repository/docs/guides/intro.md"
+  printf 'reference text fixture\n' >"$work_repository/docs/reference/api.txt"
+  printf '# Nested fixture docs\n' >"$work_repository/docs/README.md"
+  printf 'root text fixture\n' >"$work_repository/root.txt"
+  commit_all_at "$work_repository" '2001-04-01T00:00:00+0000' \
+    'Add a deeply nested mixed-extension tree'
+  export_bare "$work_repository" "$bare_repository" sha1
+}
+
 sha1_work="$scratch_dir/sha1-basic-work"
 sha256_work="$scratch_dir/sha256-basic-work"
 history_work="$scratch_dir/sha1-history-work"
 lfs_work="$scratch_dir/lfs-pointer-work"
+nested_work="$scratch_dir/sha1-nested-work"
 
 make_basic sha1 "$sha1_work" "$output_dir/sha1-basic.git"
 make_basic sha256 "$sha256_work" "$output_dir/sha256-basic.git"
 make_history "$history_work" "$output_dir/sha1-history.git"
 make_lfs_pointer "$lfs_work" "$output_dir/lfs-pointer.git"
+make_nested "$nested_work" "$output_dir/sha1-nested.git"
 
 # Fully packed and deliberately mixed object layouts.
 cp -R "$output_dir/sha1-basic.git" "$output_dir/sha1-basic-packed.git"
 git -C "$output_dir/sha1-basic-packed.git" -c gc.writeCommitGraph=false \
   gc --quiet --prune=now
+basic_pack_index="$(find "$output_dir/sha1-basic-packed.git/objects/pack" -name '*.idx' -print -quit)"
+basic_pack_last_object="$(
+  git verify-pack -v "$basic_pack_index" |
+    awk 'length($1) == 40 && $5 ~ /^[0-9]+$/ { if ($5 > max) { max = $5; oid = $1 } } END { print oid }'
+)"
+if [[ ! "$basic_pack_last_object" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'error: could not identify the last object in the basic pack\n' >&2
+  exit 1
+fi
 cp -R "$output_dir/sha1-basic-packed.git" "$output_dir/sha1-basic-mixed.git"
 printf 'intentionally loose after gc\n' |
   git -C "$output_dir/sha1-basic-mixed.git" hash-object -w --stdin >/dev/null
@@ -492,6 +527,7 @@ sha1_head="$(git -C "$output_dir/sha1-basic.git" rev-parse HEAD)"
 sha256_head="$(git -C "$output_dir/sha256-basic.git" rev-parse HEAD)"
 history_head="$(git -C "$output_dir/sha1-history.git" rev-parse HEAD)"
 lfs_head="$(git -C "$output_dir/lfs-pointer.git" rev-parse HEAD)"
+nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
 
 {
   printf 'git_version=%s\n' "$git_version"
@@ -504,6 +540,12 @@ lfs_head="$(git -C "$output_dir/lfs-pointer.git" rev-parse HEAD)"
   printf 'sha1_history_criss_right=%s\n' \
     "$(git -C "$output_dir/sha1-history.git" rev-parse fixture/criss-right)"
   printf 'lfs_pointer_head=%s\n' "$lfs_head"
+  printf 'sha1_nested_head=%s\n' "$nested_head"
+  printf 'sha1_nested_root_txt=%s\n' \
+    "$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD:root.txt)"
+  printf 'sha1_nested_deep_txt=%s\n' \
+    "$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD:lib/gitility/core/b.txt)"
+  printf 'sha1_basic_pack_last_object=%s\n' "$basic_pack_last_object"
   printf 'midx_probe=%s\n' "$midx_probe_oid"
   printf 'replace_target=%s\n' "$replace_target"
   printf 'replace_with=%s\n' "$replace_oid"

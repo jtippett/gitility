@@ -23,6 +23,7 @@ defmodule Gitility.Differential.OracleTest do
       Oracle upgrades require differential triage and an updated GIT_VERSION.
       For an intentional one-off local run, set
       GITILITY_ORACLE_ALLOW_VERSION_MISMATCH=1 (never set it in CI).
+      Results from a version-mismatched run are non-authoritative.
       """
 
       if System.get_env("GITILITY_ORACLE_ALLOW_VERSION_MISMATCH") == "1" do

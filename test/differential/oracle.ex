@@ -46,10 +46,25 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
-  @spec ls_tree(Path.t(), binary()) :: result([map()])
-  def ls_tree(repository, treeish) do
-    with {:ok, output} <-
-           git(repository, ["ls-tree", "-r", "-z", "--full-tree", treeish]) do
+  @spec ls_tree(Path.t(), binary(), keyword()) :: result([map()])
+  def ls_tree(repository, treeish, options \\ []) do
+    options =
+      Keyword.validate!(options,
+        recursive: true,
+        include_trees: false,
+        include_size: false,
+        path: nil
+      )
+
+    arguments =
+      ["ls-tree"] ++
+        optional_flag(options[:recursive], "-r") ++
+        optional_flag(options[:include_trees], "-t") ++
+        ["-z"] ++
+        optional_flag(options[:include_size], "-l") ++
+        ["--full-tree", treeish] ++ path_arguments(options[:path])
+
+    with {:ok, output} <- git(repository, arguments) do
       parse_records(output, &parse_tree_entry/1)
     end
   end
@@ -58,6 +73,25 @@ defmodule Gitility.Differential.Oracle do
   def rev_list(repository, revisions) when is_list(revisions) do
     with {:ok, output} <- git(repository, ["rev-list", "--topo-order" | revisions]) do
       {:ok, metadata_lines(output)}
+    end
+  end
+
+  @spec rev_parse(Path.t(), binary()) :: result(binary())
+  def rev_parse(repository, expression) do
+    with {:ok, output} <- git(repository, ["rev-parse", "--verify", expression]) do
+      {:ok, trim_metadata(output)}
+    end
+  end
+
+  @spec tag_refs(Path.t()) :: result([map()])
+  def tag_refs(repository) do
+    with {:ok, output} <-
+           git(repository, [
+             "for-each-ref",
+             "--format=%(refname)%09%(objectname)%09%(objecttype)",
+             "refs/tags"
+           ]) do
+      parse_records_by_line(output, &parse_tag_ref/1)
     end
   end
 
@@ -160,12 +194,64 @@ defmodule Gitility.Differential.Oracle do
     with {tab_offset, 1} <- :binary.match(record, <<"\t">>),
          metadata = binary_part(record, 0, tab_offset),
          path = binary_part(record, tab_offset + 1, byte_size(record) - tab_offset - 1),
-         [mode, type, oid] <- :binary.split(metadata, <<" ">>, [:global]) do
-      {:ok, %{mode: mode, type: type, oid: oid, path: path}}
+         fields <-
+           metadata
+           |> :binary.split(<<" ">>, [:global])
+           |> Enum.reject(&(&1 == <<>>)),
+         {:ok, entry} <- tree_entry_from_fields(fields, path) do
+      {:ok, entry}
     else
       _ -> {:error, "malformed git ls-tree record: #{inspect(record)}"}
     end
   end
+
+  defp tree_entry_from_fields([mode, type, oid], path) do
+    {:ok, %{mode: mode, type: type, oid: oid, path: path}}
+  end
+
+  defp tree_entry_from_fields([mode, type, oid, <<"-">>], path) do
+    {:ok, %{mode: mode, type: type, oid: oid, path: path, size: nil}}
+  end
+
+  defp tree_entry_from_fields([mode, type, oid, size], path) do
+    case Integer.parse(size) do
+      {value, ""} when value >= 0 ->
+        {:ok, %{mode: mode, type: type, oid: oid, path: path, size: value}}
+
+      _other ->
+        {:error, "invalid git ls-tree size: #{inspect(size)}"}
+    end
+  end
+
+  defp tree_entry_from_fields(_fields, _path), do: {:error, "invalid ls-tree metadata"}
+
+  defp parse_tag_ref(record) do
+    case :binary.split(record, <<"\t">>, [:global]) do
+      [ref, oid, type] -> {:ok, %{ref: ref, oid: oid, type: type}}
+      _other -> {:error, "malformed git for-each-ref record: #{inspect(record)}"}
+    end
+  end
+
+  defp parse_records_by_line(output, parser) do
+    output
+    |> metadata_lines()
+    |> Enum.reduce_while({:ok, []}, fn record, {:ok, parsed} ->
+      case parser.(record) do
+        {:ok, value} -> {:cont, {:ok, [value | parsed]}}
+        {:error, reason} -> {:halt, {:error, %{status: 1, output: reason}}}
+      end
+    end)
+    |> case do
+      {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
+      error -> error
+    end
+  end
+
+  defp optional_flag(true, flag), do: [flag]
+  defp optional_flag(false, _flag), do: []
+
+  defp path_arguments(nil), do: []
+  defp path_arguments(path) when is_binary(path), do: ["--", path]
 
   defp parse_raw_changes([], changes), do: {:ok, Enum.reverse(changes)}
 

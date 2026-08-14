@@ -16,6 +16,9 @@ The corpus contains:
 - `sha1-history.git`: a criss-cross merge, exact and similarity renames,
   blame/follow history, delete/re-add history, an exact copy, and a
   four-candidate rename input. Stable `fixture/*` tags name useful queries.
+- `sha1-nested.git`: a three-plus-level tree with sibling directories and
+  mixed `.ex`, `.md`, and `.txt` files at the root and multiple depths. It is
+  the pathspec fixture for slash-crossing `**` and scope-relative partitions.
 - `sha1-basic-packed.git`, `sha1-basic-mixed.git`, and
   `sha1-history-midx.git`: fully packed, mixed loose/packed, and two-pack
   multi-pack-index layouts.
@@ -36,7 +39,8 @@ and receives exactly one mutation:
 - `loose-malformed-header.git`: the README loose object's type header is
   changed from `blob` to an invalid type without changing its payload.
 - `pack-truncated.git`: exactly 17 bytes are removed from the end of its sole
-  pack, truncating the pack checksum.
+  pack, truncating the pack checksum. `sha1_basic_pack_last_object` in `OIDS`
+  records the object at the greatest pack offset, nearest this damage.
 - `pack-bad-checksum.git`: one byte immediately before the pack checksum is
   flipped. The index remains untouched, so pack verification reports the
   damaged pack entry/checksum (the source pack includes delta-compressible

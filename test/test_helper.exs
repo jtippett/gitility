@@ -33,7 +33,3 @@ IO.puts(
 )
 
 ExUnit.start()
-
-# Milestone 0 has no Gitility query engine. Engine-backed cases opt into this
-# tag now; removing the exclusion later turns those comparisons on as a gate.
-ExUnit.configure(exclude: [gitility_engine: true])

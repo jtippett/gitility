@@ -15,7 +15,7 @@ toolchain needed to install, add the dep and go.
 **Status: pre-implementation.** This repository is a scaffold carrying the
 complete design; the public API described below does not exist yet.
 Implementation follows
-[`docs/plans/2026-08-14-gitility-design.md`](docs/plans/2026-08-14-gitility-design.md),
+[`docs/plans/2026-08-14-gitility-design.md`](https://github.com/jtippett/gitility/blob/master/docs/plans/2026-08-14-gitility-design.md),
 starting at Milestone 0.
 
 ## Why
@@ -70,8 +70,8 @@ Releases are cut by pushing a `v*` tag; `.github/workflows/release.yml` builds
 NIFs for all supported targets, attaches them to a GitHub release, regenerates
 the checksum file from those artifacts, and publishes to Hex behind a
 required-reviewer approval gate. The full contract is in
-[`UPDATE_PROCEDURE.md`](UPDATE_PROCEDURE.md).
+[`UPDATE_PROCEDURE.md`](https://github.com/jtippett/gitility/blob/master/UPDATE_PROCEDURE.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/jtippett/gitility/blob/master/LICENSE).

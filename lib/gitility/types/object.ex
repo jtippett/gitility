@@ -3,7 +3,7 @@ defmodule Gitility.Object do
   A raw Git object: ID, type, and full payload bytes.
 
   This is the currency of the ODB layer — what `Gitility.ODB.read/3`
-  returns and what `Gitility.ODB.Backend.read_many/2` supplies. Payloads
+  returns and what `c:Gitility.ODB.Backend.read_many/2` supplies. Payloads
   are the inflated object contents **without** the `<type> <size>\\0`
   header; Gitility recomputes and verifies the object ID from type + payload
   under `verify: :always`.

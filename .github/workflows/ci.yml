@@ -64,6 +64,33 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
+      # The differential oracle is pinned to the exact canonical git in
+      # test/differential/GIT_VERSION (the suite hard-fails on a
+      # major.minor mismatch — oracle upgrades are deliberate, triaged
+      # events). Runners ship whatever git is current, so build the pinned
+      # version once and cache it by version.
+      - name: Cache pinned canonical git
+        id: pinned-git-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/pinned-git
+          key: pinned-git-${{ runner.os }}-${{ hashFiles('test/differential/GIT_VERSION') }}
+
+      - name: Build pinned canonical git (oracle)
+        if: steps.pinned-git-cache.outputs.cache-hit != 'true'
+        run: |
+          VERSION="$(cat test/differential/GIT_VERSION)"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libexpat1-dev
+          curl -fsSL "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${VERSION}.tar.gz" | tar -xz
+          make -C "git-${VERSION}" -j"$(nproc)" prefix="$HOME/pinned-git" \
+            NO_TCLTK=1 NO_GETTEXT=1 INSTALL_SYMLINKS=1 install
+
+      - name: Use pinned canonical git
+        run: |
+          echo "$HOME/pinned-git/bin" >> "$GITHUB_PATH"
+          "$HOME/pinned-git/bin/git" --version
+
       - name: Fetch dependencies
         run: mix deps.get
 
@@ -84,3 +111,6 @@ jobs:
 
       - name: Run tests
         run: mix test
+
+      - name: Build API docs
+        run: mix docs --warnings-as-errors

@@ -393,12 +393,100 @@ python3 "$corrupt_helper" malform-header \
 cp -R "$output_dir/sha1-basic-packed.git" "$output_dir/corrupt/pack-truncated.git"
 cp -R "$output_dir/sha1-basic-packed.git" "$output_dir/corrupt/pack-bad-checksum.git"
 cp -R "$output_dir/sha1-basic-packed.git" "$output_dir/corrupt/idx-bad-checksum.git"
+cp -R "$output_dir/sha1-basic-packed.git" \
+  "$output_dir/corrupt/pack-body-corrupt-valid-checksums.git"
 truncated_pack="$(find "$output_dir/corrupt/pack-truncated.git/objects/pack" -name '*.pack' -print -quit)"
 bad_pack="$(find "$output_dir/corrupt/pack-bad-checksum.git/objects/pack" -name '*.pack' -print -quit)"
 bad_idx="$(find "$output_dir/corrupt/idx-bad-checksum.git/objects/pack" -name '*.idx' -print -quit)"
+body_pack="$(find "$output_dir/corrupt/pack-body-corrupt-valid-checksums.git/objects/pack" -name '*.pack' -print -quit)"
+body_idx="${body_pack%.pack}.idx"
 python3 "$corrupt_helper" truncate "$truncated_pack" 17
 python3 "$corrupt_helper" flip "$bad_pack" -21
 python3 "$corrupt_helper" flip "$bad_idx" -1
+
+# Damage the compressed body of one known entry while keeping the pack and
+# index structurally self-consistent. The old object ID stays in the index so
+# a lookup must reach pack decoding and then reject the damaged payload.
+pack_body_corrupt_oid="$missing_oid"
+body_entry_offset="$(
+  git verify-pack -v "$body_idx" |
+    awk -v oid="$pack_body_corrupt_oid" '$1 == oid { offset = $5 } END { print offset }'
+)"
+body_next_offset="$(
+  git verify-pack -v "$body_idx" |
+    awk -v offset="$body_entry_offset" \
+      '$5 ~ /^[0-9]+$/ && $5 > offset && (candidate == "" || $5 < candidate) { candidate = $5 } END { print candidate }'
+)"
+if [[ ! "$body_entry_offset" =~ ^[0-9]+$ || ! "$body_next_offset" =~ ^[0-9]+$ ]]; then
+  printf 'error: could not locate packed fixture entry boundaries\n' >&2
+  exit 1
+fi
+python3 - "$body_pack" "$body_idx" "$body_entry_offset" \
+  "$body_next_offset" "$pack_body_corrupt_oid" <<'PY'
+import hashlib
+import os
+import stat
+import struct
+import sys
+import zlib
+
+pack_path, idx_path, start_text, end_text, oid_text = sys.argv[1:]
+start = int(start_text)
+end = int(end_text)
+oid = bytes.fromhex(oid_text)
+
+with open(pack_path, "rb") as stream:
+    pack = bytearray(stream.read())
+if not (12 <= start < end <= len(pack) - 20):
+    raise SystemExit("packed fixture entry boundaries are invalid")
+
+# The selected non-delta blob has a two-byte entry header, so its midpoint is
+# safely inside the zlib body rather than the pack or entry header.
+body_offset = start + (end - start) // 2
+pack[body_offset] ^= 0x01
+pack_digest = hashlib.sha1(pack[:-20]).digest()
+pack[-20:] = pack_digest
+
+with open(idx_path, "rb") as stream:
+    index = bytearray(stream.read())
+if index[:4] != b"\xfftOc" or struct.unpack(">I", index[4:8])[0] != 2:
+    raise SystemExit("packed fixture index is not version 2")
+object_count = struct.unpack(">I", index[8 + 255 * 4 : 8 + 256 * 4])[0]
+oids_start = 8 + 256 * 4
+oids = [
+    bytes(index[oids_start + position * 20 : oids_start + (position + 1) * 20])
+    for position in range(object_count)
+]
+try:
+    oid_position = oids.index(oid)
+except ValueError as error:
+    raise SystemExit("damaged fixture object ID is absent from its index") from error
+
+crc_start = oids_start + object_count * 20
+offsets_start = crc_start + object_count * 4
+indexed_offset = struct.unpack(
+    ">I", index[offsets_start + oid_position * 4 : offsets_start + (oid_position + 1) * 4]
+)[0]
+if indexed_offset != start:
+    raise SystemExit("damaged fixture object offset does not match its index")
+
+# Update the entry CRC, the index's embedded pack checksum, and finally the
+# index checksum. Thus the entry data itself is the sole inconsistency.
+entry_crc = zlib.crc32(pack[start:end])
+index[crc_start + oid_position * 4 : crc_start + (oid_position + 1) * 4] = \
+    struct.pack(">I", entry_crc)
+index[-40:-20] = pack_digest
+index[-20:] = hashlib.sha1(index[:-20]).digest()
+
+for path, contents in [(pack_path, pack), (idx_path, index)]:
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    os.chmod(path, mode | stat.S_IWUSR)
+    try:
+        with open(path, "wb") as stream:
+            stream.write(contents)
+    finally:
+        os.chmod(path, mode)
+PY
 
 sha1_head="$(git -C "$output_dir/sha1-basic.git" rev-parse HEAD)"
 sha256_head="$(git -C "$output_dir/sha256-basic.git" rev-parse HEAD)"
@@ -419,6 +507,7 @@ lfs_head="$(git -C "$output_dir/lfs-pointer.git" rev-parse HEAD)"
   printf 'midx_probe=%s\n' "$midx_probe_oid"
   printf 'replace_target=%s\n' "$replace_target"
   printf 'replace_with=%s\n' "$replace_oid"
+  printf 'pack_body_corrupt_oid=%s\n' "$pack_body_corrupt_oid"
 } >"$output_dir/OIDS"
 
 python3 "$checksum_helper" "$output_dir" >"$output_dir/CHECKSUMS"

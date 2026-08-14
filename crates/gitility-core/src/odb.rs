@@ -56,113 +56,71 @@ pub trait ObjectDb: Send + Sync + 'static {
 const _: fn(&dyn ObjectDb) = |_| {};
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    //! The in-memory `ObjectDb` double.
-    //!
-    //! This is the Milestone 0 exit gate made executable: the core's
-    //! contracts must be drivable with no Gitoxide and no filesystem.
-    //! Milestone 1 grows it into the static-ODB store.
-
-    use super::*;
-    use std::collections::HashMap;
-
-    pub struct InMemoryOdb {
-        hash: HashKind,
-        objects: HashMap<Oid, (ObjectKind, Vec<u8>)>,
-    }
-
-    impl InMemoryOdb {
-        pub fn new(hash: HashKind) -> Self {
-            Self {
-                hash,
-                objects: HashMap::new(),
-            }
-        }
-
-        pub fn insert(&mut self, oid: Oid, kind: ObjectKind, data: Vec<u8>) {
-            self.objects.insert(oid, (kind, data));
-        }
-    }
-
-    impl ObjectDb for InMemoryOdb {
-        fn hash_kind(&self) -> HashKind {
-            self.hash
-        }
-
-        fn try_header(&self, oid: &Oid, budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
-            budget.check()?;
-            Ok(self.objects.get(oid).map(|(kind, data)| ObjectHeader {
-                kind: *kind,
-                size: data.len() as u64,
-            }))
-        }
-
-        fn try_find(
-            &self,
-            oid: &Oid,
-            out: &mut Vec<u8>,
-            budget: &Budget,
-        ) -> Result<Option<ObjectKind>, Error> {
-            match self.objects.get(oid) {
-                None => {
-                    budget.check()?;
-                    Ok(None)
-                }
-                Some((kind, data)) => {
-                    budget.charge_object(data.len() as u64)?;
-                    out.clear();
-                    out.extend_from_slice(data);
-                    Ok(Some(*kind))
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::test_support::InMemoryOdb;
     use super::*;
     use crate::budget::BudgetLimits;
     use crate::error::ErrorCode;
+    use crate::static_odb::StaticOdb;
+    use crate::verify::object_id;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    fn oid(byte: u8) -> Oid {
-        Oid::new(HashKind::Sha1, &[byte; 20]).unwrap()
-    }
-
-    /// The M0→M1 gate: a test double drives the contract through a
-    /// `&dyn ObjectDb`, no engine, no filesystem.
+    /// The M0→M1 gate: the real static store drives the contract through
+    /// a `&dyn ObjectDb`, no engine and no filesystem.
     #[test]
-    fn in_memory_double_drives_the_contract() {
-        let mut store = InMemoryOdb::new(HashKind::Sha1);
-        store.insert(oid(1), ObjectKind::Blob, b"hello".to_vec());
-        store.insert(oid(2), ObjectKind::Commit, b"tree ...".to_vec());
+    fn static_odb_drives_the_contract() {
+        let blob = b"hello".to_vec();
+        let commit = b"tree ...".to_vec();
+        let blob_oid =
+            object_id(HashKind::Sha1, ObjectKind::Blob, &blob).expect("blob object ID computes");
+        let commit_oid = object_id(HashKind::Sha1, ObjectKind::Commit, &commit)
+            .expect("commit object ID computes");
+        let missing = Oid::new(HashKind::Sha1, &[9; 20]).expect("valid missing ID");
+        let store = StaticOdb::from_objects(
+            HashKind::Sha1,
+            [(ObjectKind::Blob, blob), (ObjectKind::Commit, commit)],
+        )
+        .expect("static objects load");
         let db: &dyn ObjectDb = &store;
         let budget = Budget::unlimited();
 
-        let header = db.try_header(&oid(1), &budget).unwrap().unwrap();
+        let header = db
+            .try_header(&blob_oid, &budget)
+            .expect("header read succeeds")
+            .expect("blob exists");
         assert_eq!(header.kind, ObjectKind::Blob);
         assert_eq!(header.size, 5);
 
         let mut out = Vec::new();
-        let kind = db.try_find(&oid(2), &mut out, &budget).unwrap().unwrap();
+        let kind = db
+            .try_find(&commit_oid, &mut out, &budget)
+            .expect("payload read succeeds")
+            .expect("commit exists");
         assert_eq!(kind, ObjectKind::Commit);
         assert_eq!(out, b"tree ...");
 
-        assert!(db.try_header(&oid(9), &budget).unwrap().is_none());
-        assert!(db.try_find(&oid(9), &mut out, &budget).unwrap().is_none());
+        assert!(db
+            .try_header(&missing, &budget)
+            .expect("missing header lookup succeeds")
+            .is_none());
+        assert!(db
+            .try_find(&missing, &mut out, &budget)
+            .expect("missing payload lookup succeeds")
+            .is_none());
 
         // Defaults are usable through the trait object.
-        db.prefetch(&[oid(1), oid(2)], &budget).unwrap();
-        db.refresh(&budget).unwrap();
+        db.prefetch(&[blob_oid, commit_oid], &budget)
+            .expect("prefetch default succeeds");
+        db.refresh(&budget).expect("refresh default succeeds");
     }
 
     #[test]
     fn reads_respect_the_budget() {
-        let mut store = InMemoryOdb::new(HashKind::Sha1);
-        store.insert(oid(1), ObjectKind::Blob, vec![0u8; 64]);
+        let payload = vec![0u8; 64];
+        let oid =
+            object_id(HashKind::Sha1, ObjectKind::Blob, &payload).expect("blob object ID computes");
+        let store = StaticOdb::from_objects(HashKind::Sha1, [(ObjectKind::Blob, payload)])
+            .expect("static object loads");
         let limits = BudgetLimits {
             max_object_bytes: 10,
             ..BudgetLimits::default()
@@ -170,7 +128,9 @@ mod tests {
         let budget = Budget::new(limits, None, Arc::new(AtomicBool::new(false)));
 
         let mut out = Vec::new();
-        let err = store.try_find(&oid(1), &mut out, &budget).unwrap_err();
+        let err = store
+            .try_find(&oid, &mut out, &budget)
+            .expect_err("object size budget stops read");
         assert_eq!(err.code, ErrorCode::ObjectTooLarge);
     }
 }

@@ -43,6 +43,10 @@ and receives exactly one mutation:
   story revisions).
 - `idx-bad-checksum.git`: the final byte of the index checksum is flipped;
   the pack remains untouched.
+- `pack-body-corrupt-valid-checksums.git`: a compressed byte in the README
+  blob's pack entry is flipped. Its entry CRC, pack trailer, embedded pack
+  checksum, and index trailer are recomputed, leaving only the addressed entry
+  data inconsistent so per-object decoding and verification are exercised.
 
 Git 2.42 or newer is required because SHA-256 repository generation is part
 of every run. `test/test_helper.exs` runs the generator automatically when the

@@ -5,5 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# The pinned `gix` family lands here in Milestone 0/1. Pin exactly and never
-# let gix types cross this crate's public API (design doc, R5).
+# Exact pins are deliberate: gitoxide is an internal, pre-1.0 engine (R5).
+# Before changing them, run `../../scripts/check-public-api.sh` with
+# cargo-public-api installed; its rustdoc JSON input currently needs nightly.
+gix-config = { version = "=0.59.0", default-features = false }
+gix-hash = { version = "=0.26.0", default-features = false, features = ["sha1", "sha256"] }
+gix-object = { version = "=0.63.0", default-features = false, features = ["sha1", "sha256"] }
+gix-odb = { version = "=0.83.0", default-features = false, features = ["parallel", "sha1", "sha256"] }
+sha1-checked = { version = "=0.10.0", default-features = false }
+sha2 = { version = "=0.11.0", default-features = false }

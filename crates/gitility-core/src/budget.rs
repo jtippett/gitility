@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// The countable ceilings, mirroring `Gitility.Limits` (the timeout
-/// becomes [`Budget::deadline`]).
+/// The countable ceilings, mirroring `Gitility.Limits` (the timeout is
+/// carried separately by [`Budget`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetLimits {
     pub max_objects: u64,
@@ -136,6 +136,28 @@ impl Budget {
         )
     }
 
+    /// Charges a header lookup against the object-count ceiling only.
+    ///
+    /// Header reads intentionally do not spend byte budget because they do not
+    /// return or retain an inflated payload.
+    pub fn charge_header(&self) -> Result<(), Error> {
+        self.check()?;
+        charge(&self.objects, 1, self.limits.max_objects, "max_objects")
+    }
+
+    /// Charges bytes read by an optional whole-file object-store integrity
+    /// scan. These bytes count toward total object I/O, but not the per-object
+    /// size cap or object count.
+    pub(crate) fn charge_integrity_bytes(&self, bytes: u64) -> Result<(), Error> {
+        self.check()?;
+        charge(
+            &self.object_bytes,
+            bytes,
+            self.limits.max_total_object_bytes,
+            "max_total_object_bytes",
+        )
+    }
+
     /// Charges one provider round trip of `bytes` reply size.
     pub fn charge_provider_request(&self, bytes: u64) -> Result<(), Error> {
         self.check()?;
@@ -154,6 +176,14 @@ impl Budget {
     }
 
     /// Validates a delta-chain depth against the ceiling.
+    ///
+    /// # Pack-reader integration contract
+    ///
+    /// The pinned `gix-odb` lookup API does **not** expose the resolved
+    /// delta-chain depth or inflated base sizes. Consequently local ODB reads
+    /// cannot enforce this limit until the M5 pack reader owns delta traversal;
+    /// callers that do know a depth must still enforce it here. Do not infer a
+    /// depth from pack location or final object size.
     pub fn check_delta_depth(&self, depth: u32) -> Result<(), Error> {
         if depth > self.limits.max_delta_depth {
             return Err(Error::new(
@@ -229,6 +259,13 @@ mod tests {
         assert!(budget.charge_object(10).is_ok());
         let err = budget.charge_object(10).unwrap_err();
         assert_eq!(err.code, ErrorCode::BudgetExceeded);
+    }
+
+    #[test]
+    fn header_charge_spends_one_object_and_no_bytes() {
+        let budget = Budget::unlimited();
+        budget.charge_header().expect("header charge succeeds");
+        assert_eq!(budget.spent(), (1, 0, 0, 0));
     }
 
     #[test]

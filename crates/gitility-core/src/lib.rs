@@ -13,13 +13,26 @@
 #![forbid(unsafe_code)]
 
 pub mod budget;
+pub mod decode;
 pub mod error;
+pub mod local_odb;
 pub mod object;
 pub mod odb;
 pub mod refs;
+pub mod static_odb;
+pub mod verify;
+
+#[cfg(test)]
+mod test_support;
 
 pub use budget::{Budget, BudgetLimits};
+pub use decode::{
+    decode_commit, decode_tag, decode_tree, Commit, Identity, Tag, TreeEntry, TreeIter,
+};
 pub use error::{Error, ErrorCode};
+pub use local_odb::{LocalOdb, LocalOdbOptions, RepositoryLayout};
 pub use object::{HashKind, ObjectHeader, ObjectKind, Oid};
 pub use odb::ObjectDb;
 pub use refs::{RefDb, RefPage, RefQuery, RefTarget};
+pub use static_odb::StaticOdb;
+pub use verify::verify;

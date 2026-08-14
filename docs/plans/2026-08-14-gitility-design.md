@@ -786,8 +786,16 @@ with a hard hop limit, and cycles return `:malformed_ref`.
 
 ### Object verification
 
-`verify: :always` is the default and the only mode used by Gentility. For
-each object, Gitility recomputes the Git object ID from:
+`verify: :always` is the default and the only mode used by Gentility. It is
+also, deliberately, the only mode in 0.1 — but Milestone 1 must benchmark
+its cost on the local adapter (a large tree walk pays one hash per object
+that no other Git tooling pays for trusted local disk). Decision recorded
+2026-08-14: if the data shows a material tax, add a relaxed mode for
+trusted local stores (e.g. `verify: :packed` — trust pack checksums,
+verify loose objects and everything remote); the lean is that a read-only
+consumer over local disk does not need per-object hashing, but the
+benchmark, not the lean, makes the call. For each object under
+verification, Gitility recomputes the Git object ID from:
 
 ```text
 <type> <byte-size>\0<payload>
@@ -1321,6 +1329,11 @@ Compare normalized object IDs, tree entries, revision walks, merge bases,
 diffs, rename detection, blame hunks, and path history. The libgit2 oracle is
 a test dependency or separate harness, not the production engine.
 
+CI pins the canonical `git` version (and the libgit2 version while that
+oracle exists); each allowlist entry records the git version it was triaged
+against. Oracle upgrades are deliberate events, like gix upgrades —
+otherwise divergence triage silently chases upstream git behavior changes.
+
 Exact agreement is required by default. Where the engine is known to deviate
 from canonical Git — blame under rename tracking (F4, ~92.6% corpus line
 agreement at the time of writing) and rename-candidate selection in path
@@ -1438,6 +1451,11 @@ versions are independent and explicitly encoded.
 4. Add canonical Git and libgit2 differential harnesses before implementing
    queries.
 5. Build the fixture corpus (both hash algorithms) and initial fuzz targets.
+6. Spike F6: many `turso_core` connections reading one SQLite file from
+   concurrent native threads, verified correct under load. Expected to just
+   work (read-only, immutable file); proven with a test, not assumed —
+   this is the cheapest moment to trigger the rusqlite fallback if it ever
+   triggers.
 
 Exit criterion: API documentation builds, fixture/oracle harnesses run, and
 no Gitoxide or Rustler type appears in the public Elixir specs or core DTO
@@ -1519,9 +1537,17 @@ a documented latency.
 3. Compose ODB and refs into `Repository` without weakening snapshot
    pinning.
 4. Add atomic ref-resolution tests where refs move during queries.
-5. Implement `Gitility.Bundle`: the SQLite container format, its builder, and
-   its `RangeBackend`/`RefDB.Backend` implementations, including the
-   `into: {:bundle, path}` hydration destination.
+5. Write the bundle format specification **before the first byte is
+   written**: exact table DDL, chunk size, manifest-generation semantics,
+   the format-version field in the metadata table, and the
+   reader-compatibility rule (a reader refuses a newer major format
+   version with `:unsupported_operation`; minor versions are additive).
+   Format version 1 is frozen on 0.2 release.
+6. Implement `Gitility.Bundle` to that spec: the native store (ODB + refs
+   from one file), its builder (`Bundle.write/2` — load-bearing, decided
+   2026-08-14: one dependency does it all; publish pipelines should not
+   need SQLite tooling of their own), and the `into: {:bundle, path}`
+   hydration destination.
 
 Exit criterion: moving branches never change an existing snapshot and remote
 refs can be resolved without a local Git directory.

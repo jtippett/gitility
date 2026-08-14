@@ -72,7 +72,8 @@ defmodule Gitility do
     * `:depth` — maximum descent depth when recursive.
     * `:types` — kinds to include, from `[:blob, :tree, :symlink, :gitlink]`
       (default: all).
-    * `:pathspecs` — glob patterns (e.g. `["**/*.ex"]`) filtering entries.
+    * `:pathspecs` — Patterns are resolved relative to `path`; a pattern without
+      wildcards selects that path and everything under it.
     * `:include` — extra per-entry data: `[:size]` (blob sizes are opt-in
       because packed object headers may cost work).
     * `:limit`, `:cursor` — pagination (see `Gitility.Page`).
@@ -94,8 +95,9 @@ defmodule Gitility do
   ## Options
 
     * `:lines` — a 1-based inclusive `Range` to slice (e.g. `120..220`).
-    * `:max_bytes` — payload cap; the result is truncated (with
-      `truncated: true`), never partial-per-line.
+    * `:max_bytes` — payload cap; truncation is whole-line except when the first
+      requested line alone exceeds the cap, in which case that line is returned
+      truncated with `truncated: true`.
     * `:limits` — a `Gitility.Limits` override.
 
   The result's `total_lines` is `nil` when the byte budget stopped the

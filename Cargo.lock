@@ -637,7 +637,9 @@ dependencies = [
 name = "gitility-core"
 version = "0.1.0"
 dependencies = [
+ "bstr",
  "gix-config",
+ "gix-glob",
  "gix-hash",
  "gix-object",
  "gix-odb",

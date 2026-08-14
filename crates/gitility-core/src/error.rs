@@ -92,6 +92,8 @@ pub struct Error {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
+    /// The stable name of the resource limit that caused this failure.
+    pub limit: Option<&'static str>,
 }
 
 impl Error {
@@ -100,6 +102,7 @@ impl Error {
             code,
             message: message.into(),
             retryable: false,
+            limit: None,
         }
     }
 
@@ -108,7 +111,14 @@ impl Error {
             code,
             message: message.into(),
             retryable: true,
+            limit: None,
         }
+    }
+
+    /// Associates this failure with the stable name of an exceeded limit.
+    pub fn with_limit(mut self, limit: &'static str) -> Self {
+        self.limit = Some(limit);
+        self
     }
 }
 

@@ -8,7 +8,9 @@ rust-version.workspace = true
 # Exact pins are deliberate: gitoxide is an internal, pre-1.0 engine (R5).
 # Before changing them, run `../../scripts/check-public-api.sh` with
 # cargo-public-api installed; its rustdoc JSON input currently needs nightly.
+bstr = { version = "=1.13.1", default-features = false, features = ["std"] }
 gix-config = { version = "=0.59.0", default-features = false }
+gix-glob = { version = "=0.27.0", default-features = false }
 gix-hash = { version = "=0.26.0", default-features = false, features = ["sha1", "sha256"] }
 gix-object = { version = "=0.63.0", default-features = false, features = ["sha1", "sha256"] }
 gix-odb = { version = "=0.83.0", default-features = false, features = ["parallel", "sha1", "sha256"] }

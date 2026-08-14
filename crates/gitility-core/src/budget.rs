@@ -26,6 +26,7 @@ pub struct BudgetLimits {
     pub max_total_object_bytes: u64,
     pub max_provider_requests: u64,
     pub max_provider_bytes: u64,
+    pub max_tree_entries: u64,
     pub max_delta_depth: u32,
 }
 
@@ -38,6 +39,7 @@ impl Default for BudgetLimits {
             max_total_object_bytes: 256 << 20,
             max_provider_requests: 500,
             max_provider_bytes: 256 << 20,
+            max_tree_entries: 20_000,
             max_delta_depth: 128,
         }
     }
@@ -54,6 +56,7 @@ pub struct Budget {
     object_bytes: AtomicU64,
     provider_requests: AtomicU64,
     provider_bytes: AtomicU64,
+    tree_entries: AtomicU64,
 }
 
 impl Budget {
@@ -70,6 +73,7 @@ impl Budget {
             object_bytes: AtomicU64::new(0),
             provider_requests: AtomicU64::new(0),
             provider_bytes: AtomicU64::new(0),
+            tree_entries: AtomicU64::new(0),
         }
     }
 
@@ -83,6 +87,7 @@ impl Budget {
                 max_total_object_bytes: u64::MAX,
                 max_provider_requests: u64::MAX,
                 max_provider_bytes: u64::MAX,
+                max_tree_entries: u64::MAX,
                 max_delta_depth: u32::MAX,
             },
             None,
@@ -125,7 +130,8 @@ impl Budget {
                     "object of {bytes} bytes exceeds max_object_bytes {}",
                     self.limits.max_object_bytes
                 ),
-            ));
+            )
+            .with_limit("max_object_bytes"));
         }
         charge(&self.objects, 1, self.limits.max_objects, "max_objects")?;
         charge(
@@ -143,6 +149,17 @@ impl Budget {
     pub fn charge_header(&self) -> Result<(), Error> {
         self.check()?;
         charge(&self.objects, 1, self.limits.max_objects, "max_objects")
+    }
+
+    /// Charges one tree entry that is about to be emitted.
+    pub fn charge_tree_entry(&self) -> Result<(), Error> {
+        self.check()?;
+        charge(
+            &self.tree_entries,
+            1,
+            self.limits.max_tree_entries,
+            "max_tree_entries",
+        )
     }
 
     /// Charges bytes read by an optional whole-file object-store integrity
@@ -192,7 +209,8 @@ impl Budget {
                     "delta chain depth {depth} exceeds max_delta_depth {}",
                     self.limits.max_delta_depth
                 ),
-            ));
+            )
+            .with_limit("max_delta_depth"));
         }
         Ok(())
     }
@@ -207,19 +225,29 @@ impl Budget {
             self.provider_bytes.load(Ordering::Relaxed),
         )
     }
+
+    /// Number of tree-entry emission charges attempted so far.
+    pub fn tree_entries_spent(&self) -> u64 {
+        self.tree_entries.load(Ordering::Relaxed)
+    }
 }
 
 /// Adds `amount` to `counter`, failing with `BudgetExceeded` naming the
 /// limit if the new total would pass `ceiling`. The add-then-check shape
 /// is intentionally conservative under concurrency: two racing charges
 /// may both fail at the boundary, never both succeed past it.
-fn charge(counter: &AtomicU64, amount: u64, ceiling: u64, limit_name: &str) -> Result<(), Error> {
+fn charge(
+    counter: &AtomicU64,
+    amount: u64,
+    ceiling: u64,
+    limit_name: &'static str,
+) -> Result<(), Error> {
     let previous = counter.fetch_add(amount, Ordering::Relaxed);
     if previous.saturating_add(amount) > ceiling {
-        return Err(Error::new(
-            ErrorCode::BudgetExceeded,
-            format!("{limit_name} exceeded"),
-        ));
+        return Err(
+            Error::new(ErrorCode::BudgetExceeded, format!("{limit_name} exceeded"))
+                .with_limit(limit_name),
+        );
     }
     Ok(())
 }
@@ -259,6 +287,7 @@ mod tests {
         assert!(budget.charge_object(10).is_ok());
         let err = budget.charge_object(10).unwrap_err();
         assert_eq!(err.code, ErrorCode::BudgetExceeded);
+        assert_eq!(err.limit, Some("max_objects"));
     }
 
     #[test]
@@ -275,10 +304,9 @@ mod tests {
             ..BudgetLimits::default()
         };
         let budget = Budget::new(limits, None, Arc::new(AtomicBool::new(false)));
-        assert_eq!(
-            budget.charge_object(101).unwrap_err().code,
-            ErrorCode::ObjectTooLarge
-        );
+        let error = budget.charge_object(101).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ObjectTooLarge);
+        assert_eq!(error.limit, Some("max_object_bytes"));
     }
 
     #[test]
@@ -308,6 +336,32 @@ mod tests {
         };
         let bounded = Budget::new(limits, None, Arc::new(AtomicBool::new(false)));
         assert!(bounded.check_delta_depth(4).is_ok());
-        assert!(bounded.check_delta_depth(5).is_err());
+        assert_eq!(
+            bounded.check_delta_depth(5).unwrap_err().limit,
+            Some("max_delta_depth")
+        );
+    }
+
+    #[test]
+    fn tree_entry_ceiling_is_separate_from_object_spend() {
+        let budget = Budget::new(
+            BudgetLimits {
+                max_tree_entries: 1,
+                ..BudgetLimits::default()
+            },
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        budget
+            .charge_tree_entry()
+            .expect("first tree entry is allowed");
+        let err = budget
+            .charge_tree_entry()
+            .expect_err("second tree entry exceeds the limit");
+        assert_eq!(err.code, ErrorCode::BudgetExceeded);
+        assert!(err.message.contains("max_tree_entries"));
+        assert_eq!(err.limit, Some("max_tree_entries"));
+        assert_eq!(budget.spent(), (0, 0, 0, 0));
+        assert_eq!(budget.tree_entries_spent(), 2);
     }
 }

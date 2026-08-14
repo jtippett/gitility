@@ -1132,6 +1132,41 @@ Cursors are untrusted input. They are parsed with strict size limits and must
 match the operation, options, and snapshot. They contain no secrets and
 require no server-side session.
 
+**Cursor wire format v1** (frozen 2026-08-14; implemented in
+`gitility-core`'s cursor module, base64url-encoded without padding at the
+NIF boundary):
+
+```text
+offset  size  field
+0       1     format version        (0x01)
+1       1     hash kind             (0x01 = sha1, 0x02 = sha256)
+2       D     snapshot commit digest (D = 20 or 32, per hash kind)
+2+D     1     operation tag          (0x01 list_tree, 0x02 search,
+                                      0x03 log, 0x04 history, 0x05 refs)
+3+D     8     option fingerprint     (FNV-1a 64 of the normalized
+                                      options, little-endian)
+11+D    2     generation length G    (u16 LE; 0 = no storage generation)
+13+D    G     storage generation bytes
+13+D+G  2     position length N      (u16 LE)
+15+D+G  N     position payload       (operation-specific; list_tree and
+                                      search: the raw path bytes of the
+                                      last emitted item, resumed by
+                                      strictly-greater traversal order;
+                                      log/history: last emitted commit
+                                      digest)
+…       4     CRC32 (IEEE) of every preceding byte (LE)
+```
+
+Decoding enforces, in order: total length ≤ 4096 bytes, CRC, version,
+then hash kind / digest / operation tag / fingerprint equality with the
+query being resumed — any failure is `:invalid_cursor`, and a version
+this build does not know is `:invalid_cursor` too (cursors are
+short-lived continuations, not archival artifacts; new versions may be
+added but v1 fields are never reinterpreted). Position payloads are
+themselves untrusted and re-validated against the operation's own
+bounds. The operation-tag and position-payload registries grow
+append-only.
+
 ## Limits and safety
 
 All operations accept `%Gitility.Limits{}` and merge it with package defaults:

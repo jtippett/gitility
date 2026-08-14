@@ -36,3 +36,6 @@ gitility-*.tar
 .DS_Store
 .private-journal/
 .claude/
+
+# Vendored upstream sources for verification reading (not ours, not shipped)
+/sources/

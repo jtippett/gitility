@@ -113,6 +113,26 @@ These findings are load-bearing; the design references them by ID.
   Git (first-found candidate vs Git's four-candidate selection). Gitility builds
   path history itself on top of commit traversal plus tree diffs with
   rewrite tracking.
+- **F6 — the bundle engine is Turso, keeping the project pure Rust.**
+  Turso Database (v0.7.0, 2026-07) is a SQLite-compatible engine written in
+  Rust, in production use per its maintainers. Verified against its COMPAT
+  matrix and source: the SQLite file format is fully supported (bundles stay
+  inspectable with any SQLite tool), as are transactions, blob storage,
+  `integrity_check`, and `VACUUM INTO`; incremental blob I/O
+  (`sqlite3_blob_*`) is stubbed, which is moot here — the 1 MiB chunked-row
+  schema *is* the range-read mechanism (deliberately identical to the
+  Postgres backend, which has no sub-value range reads either).
+  `turso_core` is drivable synchronously (`Statement::step()` polling, as
+  the Turso CLI does) — no tokio in the NIF. Risk containment is
+  structural: Gitility's pack/index checksums and `verify: :always` object
+  hashing turn any engine read bug into a loud error rather than a wrong
+  answer; publish can run `integrity_check` plus full readback; and the
+  bundle store sits behind the internal range-read seam, so swapping to
+  C SQLite via `rusqlite` (verified: incremental blob I/O plus a `bundled`
+  static amalgamation, the documented fallback if conformance/fuzz testing
+  finds blockers) touches nothing above the seam. `exqlite` was rejected
+  outright: no blob I/O, a second NIF, and an Elixir round-trip on a local
+  read path. Turso is exact-pinned like gix (R5).
 
 ## Goals
 
@@ -861,6 +881,28 @@ Fossil SCM stores entire repositories this way — and a single file makes
 publish, copy, and cache operations atomic by construction: no
 manifest-points-at-missing-pack states, ever.
 
+This is not a side feature. For the driving use case — an easy-to-deploy,
+easy-to-manage Git browser for agents — "clone a repository to a single S3
+object, open it anywhere" is the product's acquisition story, and the
+bundle is core to it. It is designed inside the library, versioned with the
+library, and exercised by the same conformance suites as every other store.
+
+Mechanism (F6): bundle reading and writing are implemented **natively in
+`gitility-core` via the `turso_core` crate** — Turso Database, the
+SQLite-compatible engine written in Rust — keeping the project pure Rust
+with no C toolchain anywhere in the build. Bundle files are standard
+SQLite format, so they remain inspectable and repairable with any SQLite
+tooling. The bundle store is a native store — local file access never
+round-trips through an Elixir provider — and presents the same internal
+range-read seam as the remote backends. Elixir-side implementations were
+evaluated and rejected for the read path: `exqlite` lacks incremental blob
+I/O entirely, and `ex_turso` (a DBConnection wrapper over the same `turso`
+crate) would put an Elixir hop inside a local native read loop — though its
+existence is useful prior art that the `turso` crate runs happily under
+Rustler. If conformance or fuzz testing surfaces a Turso blocker, the
+recorded fallback is `rusqlite` with the `bundled` static amalgamation
+(verified: true incremental blob I/O), swapped behind the seam.
+
 Schema: pack and index bytes as chunked blobs (1 MiB rows, deliberately the
 same shape as the Postgres backend), a manifest table, a refs table
 capturing the ref state at publish time, and a metadata table (hash
@@ -870,8 +912,8 @@ compression and balloon the file.
 
 Consumption is symmetrical with everything else in this document:
 
-- the bundle backend implements `RangeBackend` over SQLite incremental blob
-  I/O, so a local bundle file serves `PackFetch` (or `PackRange`) directly;
+- the native bundle store serves `PackFetch` (or `PackRange`) directly from
+  a local bundle file through SQLite incremental blob I/O;
 - it also implements `RefDB.Backend` from the refs table, so **one file
   opens as a complete repository** — ODB plus refs — with no other
   infrastructure;
@@ -1371,6 +1413,10 @@ Follow the established ExBashkit pattern:
   - `x86_64-unknown-linux-gnu`
 - add musl only after the TLS and Gitoxide feature set is intentionally
   chosen;
+- **Windows is explicitly out of scope** — no targets, no CI, no
+  source-build support claims. Elixir is not deployed on Windows in
+  practice, and the agent-hosting use case is Linux/macOS only. Revisit
+  only on demonstrated demand;
 - build with a pinned Rust toolchain and committed `Cargo.lock`;
 - generate SBOMs and provenance attestations for release artifacts;
 - run the complete ODB conformance suite against precompiled artifacts
@@ -1667,6 +1713,11 @@ without Gitoxide or a filesystem.
   as SQLite bundles — packs kept as packs (never row-per-object, which
   forfeits delta compression), with manifest and refs snapshot riding in the
   same atomic file.
+- **Turso over C SQLite (F6).** The bundle engine is `turso_core`, keeping
+  the build pure Rust; the file format stays standard SQLite. Gitility's own
+  checksums and object verification convert engine bugs into loud errors,
+  which is what makes a young engine acceptable for a convenience library.
+  `rusqlite`+bundled is the recorded fallback behind the same seam.
 - **Object-by-OID callback ODBs are the universal remote escape hatch.**
   They ship before pack-range optimization, and checkpoint C1 decides with
   data whether the lazy reader is a 1.0 requirement or a post-1.0
@@ -1718,6 +1769,23 @@ Upstream evidence (all re-verified 2026-08-14):
   (0.9.0 current)
 - [libgit2 custom ODB backend reference](https://libgit2.org/docs/reference/main/sys/odb_backend/git_odb_backend.html)
   (oracle harness only)
+- [Turso Database](https://github.com/tursodatabase/turso) v0.7.0 —
+  SQLite-compatible engine in pure Rust (F6): COMPAT.md confirms full
+  SQLite file-format support, transactions, `integrity_check`, and
+  `VACUUM INTO`; `turso_core::Statement::step()` confirms synchronous
+  drivability without tokio
+- [`ex_turso`](https://hex.pm/packages/ex_turso) — DBConnection wrapper
+  binding the `turso` crate via Rustler; prior art for Turso-under-Rustler,
+  not a dependency (F6)
+- [`rusqlite` incremental blob I/O](https://docs.rs/rusqlite/latest/rusqlite/blob/index.html)
+  (`Blob::blob_open`, `read_at_exact`) and its `bundled` static-amalgamation
+  feature — the recorded C fallback if Turso fails conformance (F6);
+  `exqlite` verified to contain no `sqlite3_blob_*` usage
+
+Upstream repositories are shallow-cloned under `sources/` (gitignored) —
+gitoxide, rustler, turso, rusqlite, exqlite, concord (ex_turso) — so
+findings can be re-verified by reading the code directly rather than
+trusting docs or memory.
 
 Ecosystem survey (Hex, 2026-08-14): `gitility` unclaimed; prior art `xgit`,
 `gitex`, `egit`, `ex_gix`, `exgit`, `ex_git_engine`, `source` reviewed in

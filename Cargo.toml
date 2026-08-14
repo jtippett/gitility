@@ -1,0 +1,18 @@
+# Single workspace, single lockfile: the exact-pin discipline (design doc R5)
+# is auditable in one place. `crates/*` is a glob so new internal crates
+# (spikes, the M5 pack reader) join without editing this file.
+[workspace]
+resolver = "2"
+members = ["native/gitility", "crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# The shipped NIF is precompiled (CI builds with `stable`), so this only
+# constrains rare from-source consumer builds — keep it recent rather than
+# artificially low.
+rust-version = "1.82"
+
+[workspace.dependencies]
+gitility-core = { path = "crates/gitility-core" }
+rustler = "0.38"

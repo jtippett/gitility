@@ -45,7 +45,7 @@ defmodule Gitility.MixProject do
         "GitHub" => @source_url,
         "Changelog" => "#{@source_url}/blob/master/CHANGELOG.md"
       },
-      files: ~w(lib native/gitility/Cargo.toml native/gitility/Cargo.lock native/gitility/src
+      files: ~w(lib Cargo.toml Cargo.lock native/gitility/Cargo.toml native/gitility/src
            crates/gitility-core/Cargo.toml crates/gitility-core/src
            checksum-Elixir.Gitility.Native.exs .formatter.exs mix.exs
            README.md CHANGELOG.md LICENSE)

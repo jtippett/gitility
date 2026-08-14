@@ -59,8 +59,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            native/gitility/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('native/gitility/Cargo.lock') }}
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-
 
@@ -70,28 +70,17 @@ jobs:
       - name: Check Elixir formatting
         run: mix format --check-formatted
 
-      - name: Check Rust formatting (core)
-        working-directory: crates/gitility-core
-        run: cargo fmt --check
-
-      - name: Check Rust formatting (NIF)
-        working-directory: native/gitility
-        run: cargo fmt --check
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
-      - name: Clippy (core)
-        working-directory: crates/gitility-core
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Clippy (NIF)
-        working-directory: native/gitility
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Rust tests (core)
-        working-directory: crates/gitility-core
-        run: cargo test --all-targets
+      - name: Rust tests (workspace)
+        run: cargo test --workspace --all-targets
 
       - name: Run tests
         run: mix test

@@ -44,12 +44,9 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native/gitility
 
       - name: Build NIF
-        working-directory: native/gitility
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --package gitility --target ${{ matrix.target }}
 
       - name: Package NIF
         id: package
@@ -60,9 +57,9 @@ jobs:
           NIF_NAME="libgitility-v${VERSION}-nif-2.15-${TARGET}.so"
 
           if [[ "$TARGET" == *"apple"* ]]; then
-            SRC="native/gitility/target/${TARGET}/release/libgitility.dylib"
+            SRC="target/${TARGET}/release/libgitility.dylib"
           else
-            SRC="native/gitility/target/${TARGET}/release/libgitility.so"
+            SRC="target/${TARGET}/release/libgitility.so"
           fi
 
           cp "$SRC" "${NIF_NAME}"

@@ -22,9 +22,8 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 gitility-*.tar
 
-# Rust build artifacts
-/native/gitility/target/
-/crates/gitility-core/target/
+# Rust build artifacts (single workspace target at the root)
+/target/
 
 # Compiled NIF shared library
 /priv/native/

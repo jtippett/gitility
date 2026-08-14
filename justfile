@@ -12,11 +12,10 @@ test:
 build:
     GITILITY_BUILD=1 mix compile
 
-# Format Elixir + Rust.
+# Format Elixir + Rust (whole workspace).
 fmt:
     mix format
-    cd crates/gitility-core && cargo fmt
-    cd native/gitility && cargo fmt
+    cargo fmt --all
 
 # Regenerate the precompiled-NIF checksum file from a published GitHub release.
 # Run AFTER release.yml has uploaded the artifacts (see UPDATE_PROCEDURE.md).

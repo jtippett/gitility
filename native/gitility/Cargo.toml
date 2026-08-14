@@ -1,11 +1,8 @@
 [package]
 name = "gitility"
-version = "0.1.0"
-edition = "2021"
-# The shipped NIF is precompiled (CI builds with `stable`), so this only
-# constrains rare from-source consumer builds — keep it recent rather than
-# artificially low.
-rust-version = "1.82"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "gitility"
@@ -13,5 +10,5 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-rustler = "0.38"
-gitility-core = { path = "../../crates/gitility-core" }
+rustler = { workspace = true }
+gitility-core = { workspace = true }

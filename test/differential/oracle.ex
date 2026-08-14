@@ -1,0 +1,458 @@
+defmodule Gitility.Differential.Oracle do
+  @moduledoc """
+  Byte-oriented adapters around canonical Git plumbing commands.
+
+  Successful queries return `{:ok, normalized_result}`. Failed Git commands
+  return `{:error, %{status: status, output: output}}`; the output remains a
+  raw binary because corrupt-object diagnostics are not part of the oracle's
+  normalized contract.
+  """
+
+  @git_environment [
+    {"GIT_CONFIG_GLOBAL", "/dev/null"},
+    {"GIT_CONFIG_SYSTEM", "/dev/null"},
+    {"GIT_TERMINAL_PROMPT", "0"},
+    {"LC_ALL", "C"}
+  ]
+
+  @git_options ["-c", "color.ui=false", "-c", "core.quotePath=false"]
+
+  @type git_error :: %{status: non_neg_integer(), output: binary()}
+  @type result(value) :: {:ok, value} | {:error, git_error()}
+
+  @spec git_environment() :: [{binary(), binary()}]
+  def git_environment, do: @git_environment
+
+  @spec git_version() :: binary()
+  def git_version do
+    case System.cmd("git", ["--version"], env: @git_environment, stderr_to_stdout: true) do
+      {<<"git version ", version::binary>>, 0} -> trim_metadata(version)
+      {output, status} -> raise "git --version failed (#{status}): #{inspect(output)}"
+    end
+  end
+
+  @spec cat_file(Path.t(), binary()) ::
+          result(%{type: binary(), size: non_neg_integer(), content: binary()})
+  def cat_file(repository, object) do
+    with {:ok, type_output} <- git(repository, ["cat-file", "-t", object]),
+         type = trim_metadata(type_output),
+         {:ok, size_output} <- git(repository, ["cat-file", "-s", object]),
+         {size, ""} <- Integer.parse(trim_metadata(size_output)),
+         {:ok, content} <- git(repository, ["cat-file", type, object]) do
+      {:ok, %{type: type, size: size, content: content}}
+    else
+      {:error, _error} = error -> error
+      _invalid_size -> {:error, %{status: 1, output: "git cat-file returned an invalid size"}}
+    end
+  end
+
+  @spec ls_tree(Path.t(), binary()) :: result([map()])
+  def ls_tree(repository, treeish) do
+    with {:ok, output} <-
+           git(repository, ["ls-tree", "-r", "-z", "--full-tree", treeish]) do
+      parse_records(output, &parse_tree_entry/1)
+    end
+  end
+
+  @spec rev_list(Path.t(), [binary()]) :: result([binary()])
+  def rev_list(repository, revisions) when is_list(revisions) do
+    with {:ok, output} <- git(repository, ["rev-list", "--topo-order" | revisions]) do
+      {:ok, metadata_lines(output)}
+    end
+  end
+
+  @spec merge_base(Path.t(), binary(), binary()) :: result([binary()])
+  def merge_base(repository, left, right) do
+    with {:ok, output} <- git(repository, ["merge-base", "--all", left, right]) do
+      {:ok, metadata_lines(output)}
+    end
+  end
+
+  @spec diff_raw(Path.t(), binary(), binary(), [binary()]) :: result([map()])
+  def diff_raw(repository, left, right, options \\ []) do
+    arguments =
+      ["diff", "--raw", "-z", "--no-abbrev", "--no-ext-diff"] ++
+        options ++ [left, right]
+
+    with {:ok, output} <- git(repository, arguments) do
+      output
+      |> nul_fields()
+      |> parse_raw_changes([])
+    end
+  end
+
+  @spec diff_patch(Path.t(), binary(), binary(), [binary()]) :: result(binary())
+  def diff_patch(repository, left, right, options \\ []) do
+    git(
+      repository,
+      [
+        "diff",
+        "-p",
+        "--no-color",
+        "--no-ext-diff",
+        "--src-prefix=a/",
+        "--dst-prefix=b/"
+      ] ++ options ++ [left, right]
+    )
+  end
+
+  @spec blame(Path.t(), binary(), binary(), [binary()]) :: result([map()])
+  def blame(repository, revision, path, options \\ []) do
+    with {:ok, output} <-
+           git(repository, ["blame", "--porcelain"] ++ options ++ [revision, "--", path]),
+         {:ok, lines} <- parse_blame_lines(output, %{}, []) do
+      {:ok, coalesce_blame_lines(lines)}
+    end
+  end
+
+  @spec log_follow(Path.t(), binary(), binary(), [binary()]) :: result([map()])
+  def log_follow(repository, revision, path, options \\ []) do
+    format = "--format=format:%H%x00%P%x00"
+
+    with {:ok, output} <-
+           git(
+             repository,
+             ["log", "--topo-order", "--follow", "--name-status", "-z", format] ++
+               options ++ [revision, "--", path]
+           ) do
+      output
+      |> :binary.split(<<0>>, [:global])
+      |> parse_log_fields([])
+    end
+  end
+
+  @spec fsck(Path.t()) :: :ok | {:error, git_error()}
+  def fsck(repository) do
+    case git(repository, ["fsck", "--full", "--strict", "--no-dangling"]) do
+      {:ok, _output} -> :ok
+      {:error, _error} = error -> error
+    end
+  end
+
+  defp git(repository, arguments) do
+    command_arguments = @git_options ++ ["-C", Path.expand(repository)] ++ arguments
+
+    case System.cmd("git", command_arguments,
+           env: @git_environment,
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> {:ok, output}
+      {output, status} -> {:error, %{status: status, output: output}}
+    end
+  end
+
+  defp parse_records(output, parser) do
+    output
+    |> nul_fields()
+    |> Enum.reduce_while({:ok, []}, fn record, {:ok, parsed} ->
+      case parser.(record) do
+        {:ok, value} -> {:cont, {:ok, [value | parsed]}}
+        {:error, reason} -> {:halt, {:error, %{status: 1, output: reason}}}
+      end
+    end)
+    |> case do
+      {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
+      error -> error
+    end
+  end
+
+  defp parse_tree_entry(record) do
+    with {tab_offset, 1} <- :binary.match(record, <<"\t">>),
+         metadata = binary_part(record, 0, tab_offset),
+         path = binary_part(record, tab_offset + 1, byte_size(record) - tab_offset - 1),
+         [mode, type, oid] <- :binary.split(metadata, <<" ">>, [:global]) do
+      {:ok, %{mode: mode, type: type, oid: oid, path: path}}
+    else
+      _ -> {:error, "malformed git ls-tree record: #{inspect(record)}"}
+    end
+  end
+
+  defp parse_raw_changes([], changes), do: {:ok, Enum.reverse(changes)}
+
+  defp parse_raw_changes([header | fields], changes) do
+    with {:ok, metadata} <- parse_raw_header(header),
+         {:ok, paths, remaining} <- take_change_paths(metadata.status, fields) do
+      change =
+        metadata
+        |> Map.put(:path, hd(paths))
+        |> maybe_put_destination(paths)
+
+      parse_raw_changes(remaining, [change | changes])
+    else
+      {:error, reason} -> {:error, %{status: 1, output: reason}}
+    end
+  end
+
+  defp parse_raw_header(<<":", metadata::binary>>) do
+    case :binary.split(metadata, <<" ">>, [:global]) do
+      [old_mode, new_mode, old_oid, new_oid, status] ->
+        {status_code, similarity} = status_parts(status)
+
+        {:ok,
+         %{
+           old_mode: old_mode,
+           new_mode: new_mode,
+           old_oid: old_oid,
+           new_oid: new_oid,
+           status: status_code,
+           similarity: similarity
+         }}
+
+      _ ->
+        {:error, "malformed git diff --raw header: #{inspect(metadata)}"}
+    end
+  end
+
+  defp parse_raw_header(other),
+    do: {:error, "git diff --raw record does not start with a colon: #{inspect(other)}"}
+
+  defp take_change_paths(status, [source, destination | remaining])
+       when status in ["R", "C"],
+       do: {:ok, [source, destination], remaining}
+
+  defp take_change_paths(status, [_source | _remaining]) when status in ["R", "C"],
+    do: {:error, "rename/copy record is missing its destination path"}
+
+  defp take_change_paths(_status, [path | remaining]), do: {:ok, [path], remaining}
+  defp take_change_paths(_status, []), do: {:error, "diff record is missing its path"}
+
+  defp maybe_put_destination(change, [_source, destination]),
+    do: Map.put(change, :destination, destination)
+
+  defp maybe_put_destination(change, [_path]), do: change
+
+  defp status_parts(<<status::binary-size(1), score::binary>>) do
+    similarity =
+      case Integer.parse(score) do
+        {value, ""} -> value
+        :error -> nil
+      end
+
+    {status, similarity}
+  end
+
+  defp parse_blame_lines(<<>>, _path_cache, lines), do: {:ok, Enum.reverse(lines)}
+
+  defp parse_blame_lines(output, path_cache, lines) do
+    with {:ok, header, rest} <- take_line(output),
+         {:ok, commit, original_line, final_line} <- parse_blame_header(header),
+         {:ok, original_path, remaining, next_cache} <-
+           consume_blame_metadata(rest, commit, path_cache, nil) do
+      line = %{
+        commit: commit,
+        original_line: original_line,
+        final_line: final_line,
+        original_path: original_path
+      }
+
+      parse_blame_lines(remaining, next_cache, [line | lines])
+    end
+  end
+
+  defp parse_blame_header(header) do
+    case :binary.split(header, <<" ">>, [:global]) do
+      [commit, original, final | _group_size] ->
+        with {original_line, ""} <- Integer.parse(original),
+             {final_line, ""} <- Integer.parse(final) do
+          {:ok, commit, original_line, final_line}
+        else
+          _ -> {:error, "invalid line numbers in blame header: #{inspect(header)}"}
+        end
+
+      _ ->
+        {:error, "malformed blame header: #{inspect(header)}"}
+    end
+  end
+
+  defp consume_blame_metadata(output, commit, path_cache, current_path) do
+    with {:ok, line, rest} <- take_line(output) do
+      case line do
+        <<"\t", _source_line::binary>> ->
+          case current_path || Map.get(path_cache, commit) do
+            nil -> {:error, "blame record has no original path for #{commit}"}
+            path -> {:ok, path, rest, Map.put(path_cache, commit, path)}
+          end
+
+        <<"filename ", encoded_path::binary>> ->
+          with {:ok, path} <- unquote_git_path(encoded_path) do
+            consume_blame_metadata(rest, commit, path_cache, path)
+          end
+
+        _metadata ->
+          consume_blame_metadata(rest, commit, path_cache, current_path)
+      end
+    end
+  end
+
+  defp coalesce_blame_lines(lines) do
+    lines
+    |> Enum.reduce([], fn line, hunks ->
+      case hunks do
+        [last | rest] ->
+          {last_original_start, last_original_end} = last.original_range
+          {last_final_start, last_final_end} = last.final_range
+
+          if last.commit == line.commit and last.original_path == line.original_path and
+               last_original_end + 1 == line.original_line and
+               last_final_end + 1 == line.final_line do
+            [
+              %{
+                last
+                | original_range: {last_original_start, line.original_line},
+                  final_range: {last_final_start, line.final_line}
+              }
+              | rest
+            ]
+          else
+            [blame_hunk(line) | hunks]
+          end
+
+        [] ->
+          [blame_hunk(line)]
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp blame_hunk(line) do
+    %{
+      commit: line.commit,
+      original_path: line.original_path,
+      original_range: {line.original_line, line.original_line},
+      final_range: {line.final_line, line.final_line}
+    }
+  end
+
+  defp parse_log_fields([], records), do: {:ok, Enum.reverse(records)}
+  defp parse_log_fields([<<>>], records), do: {:ok, Enum.reverse(records)}
+
+  defp parse_log_fields([commit, parents_field | fields], records) when commit != <<>> do
+    with {:ok, changes, remaining} <- parse_name_status_fields(fields, []) do
+      parsed = %{
+        commit: commit,
+        parents: split_nonempty(parents_field, <<" ">>),
+        changes: changes
+      }
+
+      parse_log_fields(remaining, [parsed | records])
+    end
+  end
+
+  defp parse_log_fields(fields, _records),
+    do: {:error, %{status: 1, output: "malformed git log field stream: #{inspect(fields)}"}}
+
+  defp parse_name_status_fields([], changes), do: {:ok, Enum.reverse(changes), []}
+
+  defp parse_name_status_fields([<<>> | remaining], changes),
+    do: {:ok, Enum.reverse(changes), remaining}
+
+  defp parse_name_status_fields([status_field | fields], changes) do
+    status_field = trim_name_status_prefix(status_field)
+    {status, similarity} = status_parts(status_field)
+
+    case take_change_paths(status, fields) do
+      {:ok, paths, remaining} ->
+        change =
+          %{status: status, similarity: similarity, path: hd(paths)}
+          |> maybe_put_destination(paths)
+
+        parse_name_status_fields(remaining, [change | changes])
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp trim_name_status_prefix(<<"\n", status::binary>>), do: status
+  defp trim_name_status_prefix(status), do: status
+
+  defp unquote_git_path(<<"\"", quoted::binary>>) do
+    size = byte_size(quoted)
+
+    if size > 0 and :binary.at(quoted, size - 1) == ?" do
+      parse_quoted_path(binary_part(quoted, 0, size - 1), [])
+    else
+      {:error, "unterminated quoted Git path: #{inspect(quoted)}"}
+    end
+  end
+
+  defp unquote_git_path(path), do: {:ok, path}
+
+  defp parse_quoted_path(<<>>, bytes), do: {:ok, IO.iodata_to_binary(Enum.reverse(bytes))}
+
+  defp parse_quoted_path(<<"\\", a, b, c, rest::binary>>, bytes)
+       when a in ?0..?7 and b in ?0..?7 and c in ?0..?7 do
+    value = (a - ?0) * 64 + (b - ?0) * 8 + (c - ?0)
+    parse_quoted_path(rest, [<<value>> | bytes])
+  end
+
+  defp parse_quoted_path(<<"\\", escaped, rest::binary>>, bytes) do
+    value =
+      case escaped do
+        ?a -> 0x07
+        ?b -> 0x08
+        ?t -> 0x09
+        ?n -> 0x0A
+        ?v -> 0x0B
+        ?f -> 0x0C
+        ?r -> 0x0D
+        other -> other
+      end
+
+    parse_quoted_path(rest, [<<value>> | bytes])
+  end
+
+  defp parse_quoted_path(<<byte, rest::binary>>, bytes),
+    do: parse_quoted_path(rest, [<<byte>> | bytes])
+
+  defp take_line(binary) do
+    case :binary.match(binary, <<"\n">>) do
+      {offset, 1} ->
+        line = binary_part(binary, 0, offset)
+        rest = binary_part(binary, offset + 1, byte_size(binary) - offset - 1)
+        {:ok, line, rest}
+
+      :nomatch ->
+        {:error, "canonical Git output ended in the middle of a line"}
+    end
+  end
+
+  defp nul_fields(binary) do
+    binary
+    |> :binary.split(<<0>>, [:global])
+    |> drop_trailing_empty_fields()
+  end
+
+  defp drop_trailing_empty_fields(fields) do
+    fields
+    |> Enum.reverse()
+    |> Enum.drop_while(&(&1 == <<>>))
+    |> Enum.reverse()
+  end
+
+  defp metadata_lines(binary),
+    do: split_nonempty(trim_metadata(binary), <<"\n">>)
+
+  defp split_nonempty(<<>>, _separator), do: []
+
+  defp split_nonempty(binary, separator),
+    do: Enum.reject(:binary.split(binary, separator, [:global]), &(&1 == <<>>))
+
+  defp trim_metadata(binary) do
+    binary
+    |> trim_metadata_byte(?\n)
+    |> trim_metadata_byte(?\r)
+  end
+
+  defp trim_metadata_byte(<<>>, _byte), do: <<>>
+
+  defp trim_metadata_byte(binary, byte) do
+    size = byte_size(binary)
+
+    if :binary.at(binary, size - 1) == byte do
+      binary_part(binary, 0, size - 1)
+    else
+      binary
+    end
+  end
+end

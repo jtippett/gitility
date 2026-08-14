@@ -20,7 +20,8 @@ defmodule Gitility.MixProject do
         "Snapshot-first Git object queries for Elixir — bounded, cancellable, " <>
           "structured reads (tree, file, search, log, diff, blame) over pluggable " <>
           "object databases, no worktree or checkout required",
-      source_url: @source_url
+      source_url: @source_url,
+      test_pattern: "*_test.exs"
     ]
   end
 

@@ -14,7 +14,9 @@ defmodule Gitility.File do
   the returned slice. `total_lines` is the whole blob's line count **when
   known** — it is `nil` when the byte budget stopped the read before the
   full blob could be scanned, because reporting it would require reading
-  what the caller asked us not to.
+  what the caller asked us not to. `truncated: true` with `total_lines: nil`
+  specifically indicates that the byte cap stopped the scan; a genuinely
+  empty range reports `total_lines` and `truncated: false`.
 
   `lfs_pointer` carries parsed Git LFS pointer metadata when the blob is a
   well-formed LFS pointer; the pointer text itself is still in `data`.

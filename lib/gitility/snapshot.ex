@@ -13,7 +13,7 @@ defmodule Gitility.Snapshot do
   `Gitility.Repository.snapshot/3` for selector-based creation.
   """
 
-  alias Gitility.{Error, NotImplementedError, ODB, OID}
+  alias Gitility.{Error, Limits, Native, NativeSupport, ODB, OID}
 
   @typedoc "A pinned snapshot: the store it reads from plus its identity."
   @type t :: %__MODULE__{
@@ -34,8 +34,22 @@ defmodule Gitility.Snapshot do
   until engine support lands — a clean refusal, never a wrong answer.
   """
   @spec open(ODB.t(), OID.t() | String.t(), keyword()) :: {:ok, t()} | {:error, Error.t()}
-  def open(odb, commit_oid, opts \\ []) do
-    _ = {odb, commit_oid, opts}
-    NotImplementedError.stub!(:"Snapshot.open/3", "Milestone 1")
+  def open(%ODB{ref: resource, hash: hash} = odb, commit_oid, opts \\ []) do
+    opts = Keyword.validate!(opts, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+
+    with {:ok, oid} <- NativeSupport.parse_oid(commit_oid),
+         {:ok, result} <- Native.snapshot_open(resource, oid.bytes, limits_map) do
+      {:ok,
+       %__MODULE__{
+         odb: odb,
+         commit_oid: NativeSupport.oid_from_bytes(hash, result.commit_oid),
+         tree_oid: NativeSupport.oid_from_bytes(hash, result.tree_oid)
+       }}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, error} -> {:error, NativeSupport.nif_error(error, :snapshot_open)}
+    end
   end
 end

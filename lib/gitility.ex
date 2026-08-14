@@ -35,6 +35,9 @@ defmodule Gitility do
     * Normal failures return `{:error, %Gitility.Error{}}`; nothing here
       raises for repository data, missing objects, timeouts, or backend
       failures.
+    * Unknown option keys and wrongly typed values for known keys raise
+      `ArgumentError`; well-typed values that violate an option's semantic
+      constraints return `%Gitility.Error{code: :invalid_argument}`.
     * Everything that can grow returns `%Gitility.Page{}` or carries
       `truncated`/`stats`/`warnings` — truncation is explicit, never silent.
     * All operations accept `limits: %Gitility.Limits{}` and run as
@@ -48,12 +51,17 @@ defmodule Gitility do
     Error,
     File,
     Job,
+    Limits,
+    Native,
+    NativeSupport,
     NotImplementedError,
     ODB,
     OID,
     Page,
     Repository,
-    Snapshot
+    Snapshot,
+    Stats,
+    TreeEntry
   }
 
   @typedoc "Any handle that can answer plumbing queries: a repository or ODB."
@@ -84,9 +92,75 @@ defmodule Gitility do
   """
   @spec list_tree(Snapshot.t(), binary(), keyword()) ::
           {:ok, Page.t(Gitility.TreeEntry.t())} | {:error, Error.t()}
-  def list_tree(snapshot, path \\ "", opts \\ []) do
-    _ = {snapshot, path, opts}
-    NotImplementedError.stub!(:"list_tree/3", "Milestone 1")
+  def list_tree(
+        %Snapshot{odb: %ODB{ref: resource, hash: hash}} = snapshot,
+        path \\ "",
+        opts \\ []
+      ) do
+    opts =
+      Keyword.validate!(opts,
+        recursive: false,
+        depth: nil,
+        types: [:blob, :tree, :symlink, :gitlink],
+        pathspecs: [],
+        include: [],
+        limit: 1_000,
+        cursor: nil,
+        limits: nil
+      )
+
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+    recursive = NativeSupport.boolean_option!(opts, :recursive)
+
+    with :ok <- validate_binary(path, "tree path"),
+         {:ok, depth} <- validate_depth(opts[:depth]),
+         {:ok, types} <- validate_tree_types(opts[:types]),
+         {:ok, pathspecs} <- validate_pathspecs(opts[:pathspecs]),
+         {:ok, include_size} <- validate_include(opts[:include]),
+         {:ok, limit} <- effective_page_limit(opts[:limit], limits.max_results),
+         {:ok, cursor} <- decode_cursor(opts[:cursor]),
+         {:ok, page} <-
+           Native.list_tree(
+             resource,
+             snapshot.commit_oid.bytes,
+             snapshot.tree_oid.bytes,
+             %{
+               path: path,
+               recursive: recursive,
+               depth: depth,
+               types: types,
+               pathspecs: pathspecs,
+               include_size: include_size,
+               limit: limit,
+               cursor: cursor
+             },
+             limits_map
+           ) do
+      entries =
+        Enum.map(page.entries, fn entry ->
+          %TreeEntry{
+            path: entry.path,
+            name: entry.name,
+            oid: NativeSupport.oid_from_bytes(hash, entry.oid),
+            type: entry.kind,
+            mode: entry.mode,
+            size: entry.size
+          }
+        end)
+
+      {:ok,
+       %Page{
+         items: entries,
+         next_cursor: encode_cursor(page.next_cursor),
+         truncated: page.truncated,
+         stats: struct!(Stats, Map.to_list(page.stats)),
+         warnings: page_warnings(page.truncated, page.stats.stopped_by)
+       }}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, error} -> {:error, NativeSupport.nif_error(error, :list_tree)}
+    end
   end
 
   @doc """
@@ -105,9 +179,40 @@ defmodule Gitility do
   (`lfs_pointer`) but never resolved.
   """
   @spec read_file(Snapshot.t(), binary(), keyword()) :: {:ok, File.t()} | {:error, Error.t()}
-  def read_file(snapshot, path, opts \\ []) do
-    _ = {snapshot, path, opts}
-    NotImplementedError.stub!(:"read_file/3", "Milestone 1")
+  def read_file(%Snapshot{odb: %ODB{ref: resource, hash: hash}} = snapshot, path, opts \\ []) do
+    opts = Keyword.validate!(opts, lines: nil, max_bytes: 256_000, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+
+    with :ok <- validate_binary(path, "file path"),
+         {:ok, lines} <- validate_lines(opts[:lines]),
+         {:ok, max_bytes} <- effective_max_bytes(opts[:max_bytes], limits.max_object_bytes),
+         {:ok, file} <-
+           Native.read_file(
+             resource,
+             snapshot.commit_oid.bytes,
+             snapshot.tree_oid.bytes,
+             path,
+             %{lines: lines, max_bytes: max_bytes},
+             limits_map
+           ) do
+      {:ok,
+       %File{
+         path: file.path,
+         blob_oid: NativeSupport.oid_from_bytes(hash, file.blob_oid),
+         mode: file.mode,
+         kind: file.kind,
+         data: file.data,
+         start_line: file.start_line,
+         end_line: file.end_line,
+         total_lines: file.total_lines,
+         truncated: file.truncated,
+         lfs_pointer: file.lfs_pointer
+       }}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, error} -> {:error, NativeSupport.nif_error(error, :read_file)}
+    end
   end
 
   ## ————————————————————————————————————————————————————————————————
@@ -272,10 +377,144 @@ defmodule Gitility do
   Peels an object to a target kind — e.g. an annotated tag chain to its
   commit (`to: :commit`, the default).
   """
-  @spec peel(store(), OID.t(), keyword()) :: {:ok, OID.t()} | {:error, Error.t()}
+  @spec peel(store(), OID.t() | String.t(), keyword()) ::
+          {:ok, OID.t()} | {:error, Error.t()}
   def peel(store, oid, opts \\ []) do
-    _ = {store, oid, opts}
-    NotImplementedError.stub!(:"peel/3", "Milestone 1")
+    opts = Keyword.validate!(opts, to: :commit, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+
+    with {:ok, resource, hash} <- NativeSupport.store(store),
+         {:ok, oid} <- NativeSupport.parse_oid(oid),
+         {:ok, target} <- validate_peel_target(opts[:to]),
+         {:ok, peeled} <- Native.peel(resource, oid.bytes, target, limits_map) do
+      {:ok, NativeSupport.oid_from_bytes(hash, peeled)}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, error} -> {:error, NativeSupport.nif_error(error, :peel)}
+    end
+  end
+
+  defp validate_binary(value, _label) when is_binary(value), do: :ok
+
+  defp validate_binary(_value, label), do: raise(ArgumentError, "#{label} must be a binary")
+
+  defp validate_depth(nil), do: {:ok, nil}
+
+  defp validate_depth(depth)
+       when is_integer(depth) and depth >= 0 and depth <= 4_294_967_295,
+       do: {:ok, depth}
+
+  defp validate_depth(depth) when is_integer(depth),
+    do: NativeSupport.invalid_argument(":depth must be a non-negative 32-bit integer or nil")
+
+  defp validate_depth(_depth),
+    do: raise(ArgumentError, ":depth must be an integer or nil")
+
+  defp validate_tree_types(types) when is_list(types) do
+    cond do
+      not Enum.all?(types, &is_atom/1) ->
+        raise ArgumentError, ":types entries must be atoms"
+
+      Enum.all?(types, &(&1 in [:blob, :tree, :symlink, :gitlink])) ->
+        {:ok, types}
+
+      true ->
+        NativeSupport.invalid_argument(
+          ":types must contain only :blob, :tree, :symlink, and :gitlink"
+        )
+    end
+  end
+
+  defp validate_tree_types(_types),
+    do: raise(ArgumentError, ":types must be a list of atoms")
+
+  defp validate_pathspecs(pathspecs) when is_list(pathspecs) do
+    if Enum.all?(pathspecs, &is_binary/1) do
+      {:ok, pathspecs}
+    else
+      raise ArgumentError, ":pathspecs entries must be binaries"
+    end
+  end
+
+  defp validate_pathspecs(_pathspecs),
+    do: raise(ArgumentError, ":pathspecs must be a list of binaries")
+
+  defp validate_include(include) when is_list(include) do
+    cond do
+      not Enum.all?(include, &is_atom/1) ->
+        raise ArgumentError, ":include entries must be atoms"
+
+      Enum.all?(include, &(&1 == :size)) ->
+        {:ok, :size in include}
+
+      true ->
+        NativeSupport.invalid_argument(":include supports only :size")
+    end
+  end
+
+  defp validate_include(_include),
+    do: raise(ArgumentError, ":include must be a list of atoms")
+
+  defp effective_page_limit(limit, _max_results) when is_integer(limit) and limit > 0,
+    do: {:ok, limit}
+
+  defp effective_page_limit(limit, _max_results) when is_integer(limit),
+    do: NativeSupport.invalid_argument(":limit must be a positive integer")
+
+  defp effective_page_limit(_limit, _max_results),
+    do: raise(ArgumentError, ":limit must be an integer")
+
+  defp decode_cursor(nil), do: {:ok, nil}
+
+  defp decode_cursor(cursor) when is_binary(cursor) do
+    case Base.url_decode64(cursor, padding: false) do
+      {:ok, bytes} -> {:ok, bytes}
+      :error -> {:error, Error.new(:invalid_cursor, "cursor is not valid unpadded base64url")}
+    end
+  end
+
+  defp decode_cursor(_cursor),
+    do: raise(ArgumentError, ":cursor must be a binary or nil")
+
+  defp encode_cursor(nil), do: nil
+  defp encode_cursor(bytes), do: Base.url_encode64(bytes, padding: false)
+
+  defp validate_lines(nil), do: {:ok, nil}
+
+  defp validate_lines(%Range{first: first, last: last, step: step})
+       when first > 0 and last > 0 and first <= last and step > 0 and
+              first <= 4_294_967_295 and last <= 4_294_967_295,
+       do: {:ok, {first, last}}
+
+  defp validate_lines(range) do
+    case range do
+      %Range{} ->
+        NativeSupport.invalid_argument(
+          ":lines must be an ascending Range with positive 1-based endpoints"
+        )
+
+      _ ->
+        raise ArgumentError, ":lines must be a Range or nil"
+    end
+  end
+
+  defp effective_max_bytes(max_bytes, hard_limit)
+       when is_integer(max_bytes) and max_bytes >= 0,
+       do: {:ok, min(max_bytes, hard_limit)}
+
+  defp effective_max_bytes(_max_bytes, _hard_limit),
+    do: raise(ArgumentError, ":max_bytes must be an integer")
+
+  defp validate_peel_target(target) when target in [:commit, :tree, :blob], do: {:ok, target}
+
+  defp validate_peel_target(_target),
+    do: NativeSupport.invalid_argument(":to must be :commit, :tree, or :blob")
+
+  defp page_warnings(false, _stopped_by), do: []
+
+  defp page_warnings(true, stopped_by) do
+    [%{code: :truncated, message: "page truncated by #{stopped_by || "an unknown limit"}"}]
   end
 
   ## ————————————————————————————————————————————————————————————————

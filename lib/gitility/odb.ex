@@ -25,7 +25,16 @@ defmodule Gitility.ODB do
   caching is never implicit — there is no disk anywhere in this module.
   """
 
-  alias Gitility.{Error, NotImplementedError, Object, ObjectHeader, OID}
+  alias Gitility.{
+    Error,
+    Limits,
+    Native,
+    NativeSupport,
+    NotImplementedError,
+    Object,
+    ObjectHeader,
+    OID
+  }
 
   @typedoc """
   An opaque handle to an object store.
@@ -108,8 +117,27 @@ defmodule Gitility.ODB do
   """
   @spec from_objects(Enumerable.t(), keyword()) :: {:ok, t()} | {:error, Error.t()}
   def from_objects(objects, opts \\ []) do
-    _ = {objects, opts}
-    NotImplementedError.stub!(:"ODB.from_objects/2", "Milestone 1")
+    opts = Keyword.validate!(opts, hash: :sha1, verify: :always, runtime: :default)
+    hash = opts[:hash]
+
+    cond do
+      hash not in [:sha1, :sha256] ->
+        NativeSupport.invalid_argument(":hash must be :sha1 or :sha256")
+
+      opts[:verify] != :always ->
+        NativeSupport.invalid_argument("only verify: :always is supported")
+
+      true ->
+        native_objects = Enum.map(objects, &native_object!/1)
+
+        case Native.static_from_objects(native_objects, hash) do
+          {:ok, {resource, ^hash}} ->
+            {:ok, %__MODULE__{kind: :static, ref: resource, hash: hash, runtime: :default}}
+
+          {:error, error} ->
+            {:error, NativeSupport.nif_error(error, :odb_from_objects)}
+        end
+    end
   end
 
   @doc """
@@ -149,32 +177,128 @@ defmodule Gitility.ODB do
   @doc """
   Reads one object's header (type and size) without its payload.
   """
-  @spec header(t(), OID.t(), keyword()) ::
+  @spec header(t(), OID.t() | String.t(), keyword()) ::
           {:ok, ObjectHeader.t()} | {:error, Error.t()}
-  def header(odb, oid, opts \\ []) do
-    _ = {odb, oid, opts}
-    NotImplementedError.stub!(:"ODB.header/3", "Milestone 1")
+  def header(%__MODULE__{ref: resource} = _odb, oid, opts \\ []) do
+    opts = Keyword.validate!(opts, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+
+    with {:ok, oid} <- NativeSupport.parse_oid(oid),
+         {:ok, header} <- Native.odb_header(resource, oid.bytes, limits_map) do
+      {:ok, %ObjectHeader{oid: oid, type: header.kind, size: header.size}}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, error} -> {:error, NativeSupport.nif_error(error, :odb_header)}
+    end
   end
 
   @doc """
   Reads one object, bounded. `max_bytes:` caps the inflated payload;
-  exceeding it returns `:object_too_large` rather than a partial object.
+  exceeding it returns `:object_too_large` rather than a partial object. If
+  `limits.max_object_bytes` is lower, that hard limit becomes the effective
+  cap and an oversized object returns `:object_too_large` naming
+  `:max_object_bytes` in the error details.
   """
-  @spec read(t(), OID.t(), keyword()) :: {:ok, Object.t()} | {:error, Error.t()}
-  def read(odb, oid, opts \\ []) do
-    _ = {odb, oid, opts}
-    NotImplementedError.stub!(:"ODB.read/3", "Milestone 1")
+  @spec read(t(), OID.t() | String.t(), keyword()) ::
+          {:ok, Object.t()} | {:error, Error.t()}
+  def read(%__MODULE__{ref: resource} = _odb, oid, opts \\ []) do
+    opts = Keyword.validate!(opts, max_bytes: nil, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+
+    with {:ok, max_bytes} <- effective_cap(opts[:max_bytes], limits.max_object_bytes, :max_bytes),
+         {:ok, oid} <- NativeSupport.parse_oid(oid),
+         {:ok, object} <- Native.odb_read(resource, oid.bytes, max_bytes, limits_map) do
+      {:ok, %Object{oid: oid, type: object.kind, data: object.data}}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, error} -> {:error, NativeSupport.nif_error(error, :odb_read)}
+    end
   end
 
   @doc """
   Reads a batch of objects, bounded by `max_total_bytes:`. Returns a map of
   OID to object or `:not_found` — per-object misses are results, not
-  errors.
+  errors. The batch cap (`max_total_bytes:`) returns `:result_too_large`;
+  exhaustion of the overall `Limits.max_total_object_bytes` budget returns
+  `:budget_exceeded`.
   """
-  @spec read_many(t(), [OID.t()], keyword()) ::
+  @spec read_many(t(), [OID.t() | String.t()], keyword()) ::
           {:ok, %{OID.t() => Object.t() | :not_found}} | {:error, Error.t()}
-  def read_many(odb, oids, opts \\ []) do
-    _ = {odb, oids, opts}
-    NotImplementedError.stub!(:"ODB.read_many/3", "Milestone 1")
+  def read_many(%__MODULE__{ref: resource, hash: hash} = _odb, oids, opts \\ []) do
+    opts = Keyword.validate!(opts, max_total_bytes: nil, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+
+    with {:ok, max_total_bytes} <-
+           effective_cap(
+             opts[:max_total_bytes],
+             limits.max_total_object_bytes,
+             :max_total_bytes
+           ),
+         {:ok, parsed_oids} <- parse_oids(oids),
+         {:ok, objects} <-
+           Native.odb_read_many(
+             resource,
+             Enum.map(parsed_oids, & &1.bytes),
+             max_total_bytes,
+             limits_map
+           ) do
+      {:ok,
+       Map.new(objects, fn
+         {oid_bytes, :not_found} ->
+           {NativeSupport.oid_from_bytes(hash, oid_bytes), :not_found}
+
+         {oid_bytes, object} ->
+           oid = NativeSupport.oid_from_bytes(hash, oid_bytes)
+           {oid, %Object{oid: oid, type: object.kind, data: object.data}}
+       end)}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, error} -> {:error, NativeSupport.nif_error(error, :odb_read_many)}
+    end
   end
+
+  defp native_object!(%Object{oid: oid, type: type, data: data})
+       when type in [:commit, :tree, :blob, :tag] and is_binary(data) do
+    oid_bytes =
+      case oid do
+        nil -> nil
+        %OID{bytes: bytes} -> bytes
+        _ -> raise ArgumentError, "object :oid must be a Gitility.OID or nil"
+      end
+
+    {oid_bytes, type, data}
+  end
+
+  defp native_object!(object) do
+    raise ArgumentError,
+          "expected a Gitility.Object with a valid type and binary data, got: #{inspect(object)}"
+  end
+
+  defp effective_cap(nil, hard_limit, _name), do: {:ok, hard_limit}
+
+  defp effective_cap(value, hard_limit, _name)
+       when is_integer(value) and value >= 0,
+       do: {:ok, min(value, hard_limit)}
+
+  defp effective_cap(_value, _hard_limit, name),
+    do: raise(ArgumentError, ":#{name} must be an integer or nil")
+
+  defp parse_oids(oids) when is_list(oids) do
+    Enum.reduce_while(oids, {:ok, []}, fn oid, {:ok, parsed} ->
+      case NativeSupport.parse_oid(oid) do
+        {:ok, value} -> {:cont, {:ok, [value | parsed]}}
+        {:error, error} -> {:halt, {:error, error}}
+      end
+    end)
+    |> case do
+      {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
+      error -> error
+    end
+  end
+
+  defp parse_oids(_oids),
+    do: NativeSupport.invalid_argument("object IDs must be provided as a list")
 end

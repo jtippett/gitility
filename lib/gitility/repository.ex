@@ -22,7 +22,7 @@ defmodule Gitility.Repository do
   the operations it requires.
   """
 
-  alias Gitility.{Error, NotImplementedError, ODB, OID, RefDB, Snapshot}
+  alias Gitility.{Error, Native, NativeSupport, NotImplementedError, ODB, OID, RefDB, Snapshot}
 
   @typedoc "A repository handle: object store plus optional ref store."
   @type t :: %__MODULE__{odb: ODB.t(), refs: RefDB.t() | nil}
@@ -47,6 +47,8 @@ defmodule Gitility.Repository do
 
     * `:require_bare` — reject a non-bare repository (default `false`).
     * `:object_cache_bytes` — native object cache ceiling (default 64 MiB).
+    * `:verify_pack_checksums` — deep-check pack and index checksums before
+      the first object read (default `false`).
     * `:runtime` — the `Gitility.Runtime` to attach to (default: shared).
 
   ## Example
@@ -58,8 +60,36 @@ defmodule Gitility.Repository do
   """
   @spec open(Path.t(), keyword()) :: {:ok, t()} | {:error, Error.t()}
   def open(path, opts \\ []) do
-    _ = {path, opts}
-    NotImplementedError.stub!(:"Repository.open/2", "Milestone 1")
+    opts =
+      Keyword.validate!(opts,
+        require_bare: false,
+        object_cache_bytes: 64 * 1024 * 1024,
+        verify_pack_checksums: false,
+        runtime: :default
+      )
+
+    unless is_binary(path) do
+      raise ArgumentError, "expected repository path to be a binary"
+    end
+
+    require_bare = NativeSupport.boolean_option!(opts, :require_bare)
+    verify_pack_checksums = NativeSupport.boolean_option!(opts, :verify_pack_checksums)
+
+    _object_cache_bytes = opts[:object_cache_bytes]
+    # cache wiring lands with the M2 runtime
+    _runtime = opts[:runtime]
+
+    case Native.open_local(path, %{
+           require_bare: require_bare,
+           verify_pack_checksums: verify_pack_checksums
+         }) do
+      {:ok, {resource, hash}} ->
+        odb = %ODB{kind: :local, ref: resource, hash: hash, runtime: :default}
+        {:ok, %__MODULE__{odb: odb, refs: nil}}
+
+      {:error, error} ->
+        {:error, NativeSupport.nif_error(error, :repository_open)}
+    end
   end
 
   @doc """
@@ -86,8 +116,15 @@ defmodule Gitility.Repository do
   afterwards.
   """
   @spec snapshot(t(), selector(), keyword()) :: {:ok, Snapshot.t()} | {:error, Error.t()}
-  def snapshot(repo, selector, opts \\ []) do
-    _ = {repo, selector, opts}
-    NotImplementedError.stub!(:"Repository.snapshot/3", "Milestone 1")
+  def snapshot(repo, selector, opts \\ [])
+
+  def snapshot(%__MODULE__{odb: odb}, {:oid, oid}, opts) do
+    opts = Keyword.validate!(opts, limits: nil)
+    Snapshot.open(odb, oid, opts)
+  end
+
+  def snapshot(%__MODULE__{}, _selector, opts) do
+    _opts = Keyword.validate!(opts, limits: nil)
+    NativeSupport.unsupported_selector()
   end
 end

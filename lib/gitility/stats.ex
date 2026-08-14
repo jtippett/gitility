@@ -4,13 +4,17 @@ defmodule Gitility.Stats do
 
   Stats make cost visible: how many objects a query touched, what the caches
   saved, how many provider round trips remote storage cost, and — when work
-  stopped early — which limit stopped it (`stopped_by`, one of the field
-  names of `Gitility.Limits`, or `nil` when the operation ran to
-  completion).
+  stopped early — which limit stopped it. `stopped_by` is either a field name
+  from `Gitility.Limits`, `:limit` for the operation's own `limit:` option, or
+  `nil` when the operation ran to completion.
+
+  In Milestone 1, `objects_requested` equals `objects_read`; requests are
+  measured separately from the Milestone 2 provider path onward.
   """
 
   defstruct objects_requested: 0,
             objects_read: 0,
+            entries_emitted: 0,
             cache_hits: 0,
             cache_misses: 0,
             provider_requests: 0,
@@ -23,6 +27,7 @@ defmodule Gitility.Stats do
   @type t :: %__MODULE__{
           objects_requested: non_neg_integer(),
           objects_read: non_neg_integer(),
+          entries_emitted: non_neg_integer(),
           cache_hits: non_neg_integer(),
           cache_misses: non_neg_integer(),
           provider_requests: non_neg_integer(),

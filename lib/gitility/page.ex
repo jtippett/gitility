@@ -26,10 +26,10 @@ defmodule Gitility.Page do
   @type cursor :: binary()
 
   @typedoc """
-  A structured warning attached to a successful result — for example which
-  limit truncated the page.
+  A structured warning attached to a successful result. Truncated pages use
+  `%{code: :truncated, message: "page truncated by <limit>"}`.
   """
-  @type warning :: %{code: atom(), message: String.t()}
+  @type warning :: %{code: :truncated, message: String.t()}
 
   @type t(item) :: %__MODULE__{
           items: [item],

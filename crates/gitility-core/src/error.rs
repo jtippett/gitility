@@ -46,6 +46,44 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// Every stable error code, in the same order as the public Elixir list.
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::InvalidArgument,
+            Self::InvalidOid,
+            Self::InvalidPath,
+            Self::InvalidCursor,
+            Self::UnsupportedHash,
+            Self::UnsupportedOperation,
+            Self::UnsupportedRegex,
+            Self::NotACommit,
+            Self::NotATree,
+            Self::NotABlob,
+            Self::RefNotFound,
+            Self::AmbiguousPrefix,
+            Self::MissingObject,
+            Self::ShallowBoundary,
+            Self::MalformedObject,
+            Self::MalformedRef,
+            Self::HashMismatch,
+            Self::PackChecksumMismatch,
+            Self::IndexChecksumMismatch,
+            Self::ObjectTooLarge,
+            Self::BudgetExceeded,
+            Self::ResultTooLarge,
+            Self::Timeout,
+            Self::AwaitTimeout,
+            Self::Cancelled,
+            Self::Busy,
+            Self::ProviderDown,
+            Self::ProviderTimeout,
+            Self::ProviderProtocolError,
+            Self::BackendError,
+            Self::RuntimeMismatch,
+            Self::InternalError,
+        ]
+    }
+
     /// The snake_case name used on the Elixir side.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -129,3 +167,55 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::ErrorCode;
+
+    #[test]
+    fn all_contains_every_variant_once() {
+        let mut seen = [false; 32];
+
+        for code in ErrorCode::all() {
+            let index = match code {
+                ErrorCode::InvalidArgument => 0,
+                ErrorCode::InvalidOid => 1,
+                ErrorCode::InvalidPath => 2,
+                ErrorCode::InvalidCursor => 3,
+                ErrorCode::UnsupportedHash => 4,
+                ErrorCode::UnsupportedOperation => 5,
+                ErrorCode::UnsupportedRegex => 6,
+                ErrorCode::NotACommit => 7,
+                ErrorCode::NotATree => 8,
+                ErrorCode::NotABlob => 9,
+                ErrorCode::RefNotFound => 10,
+                ErrorCode::AmbiguousPrefix => 11,
+                ErrorCode::MissingObject => 12,
+                ErrorCode::ShallowBoundary => 13,
+                ErrorCode::MalformedObject => 14,
+                ErrorCode::MalformedRef => 15,
+                ErrorCode::HashMismatch => 16,
+                ErrorCode::PackChecksumMismatch => 17,
+                ErrorCode::IndexChecksumMismatch => 18,
+                ErrorCode::ObjectTooLarge => 19,
+                ErrorCode::BudgetExceeded => 20,
+                ErrorCode::ResultTooLarge => 21,
+                ErrorCode::Timeout => 22,
+                ErrorCode::AwaitTimeout => 23,
+                ErrorCode::Cancelled => 24,
+                ErrorCode::Busy => 25,
+                ErrorCode::ProviderDown => 26,
+                ErrorCode::ProviderTimeout => 27,
+                ErrorCode::ProviderProtocolError => 28,
+                ErrorCode::BackendError => 29,
+                ErrorCode::RuntimeMismatch => 30,
+                ErrorCode::InternalError => 31,
+            };
+
+            assert!(!seen[index], "duplicate error code: {code:?}");
+            seen[index] = true;
+        }
+
+        assert!(seen.into_iter().all(|present| present));
+    }
+}

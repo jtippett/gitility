@@ -41,7 +41,7 @@ pub use local_odb::{LocalOdb, LocalOdbOptions, RepositoryLayout};
 pub use object::{HashKind, ObjectHeader, ObjectKind, Oid};
 pub use odb::ObjectDb;
 pub use refs::{RefDb, RefPage, RefQuery, RefTarget};
-pub use snapshot::{open as open_snapshot, Snapshot};
+pub use snapshot::{open as open_snapshot, peel, PeelTarget, Snapshot};
 pub use static_odb::StaticOdb;
 pub use tree::{list_tree, QueryStats, TreeItem, TreeItemKind, TreeOptions, TreePage, TypeFilter};
 pub use verify::verify;

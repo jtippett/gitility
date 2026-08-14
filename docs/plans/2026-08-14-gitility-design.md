@@ -800,7 +800,18 @@ that no other Git tooling pays for trusted local disk). Decision recorded
 trusted local stores (e.g. `verify: :packed` — trust pack checksums,
 verify loose objects and everything remote); the lean is that a read-only
 consumer over local disk does not need per-object hashing, but the
-benchmark, not the lean, makes the call. For each object under
+benchmark, not the lean, makes the call.
+
+**Benchmark verdict (2026-08-14, M1 exit;
+`crates/gitility-core/benches/RESULTS.md`):** verify's share of adapter
+read time on a real corpus is 31% for tree walks and 35% for blob
+sweeps, zero for headers — but the absolute cost at agent-query
+granularity is microseconds (≈0.7 ms per thousand-entry recursive
+listing). Decision: **`verify: :always` stays the universal default.**
+The guarantee is the product's identity and the differential gate leans
+on it; a relaxed opt-in mode for trusted local bulk workloads is
+deferred until a real bulk path demands the ~35% back, and will be an
+explicit per-open knob, never a changed default. For each object under
 verification, Gitility recomputes the Git object ID from:
 
 ```text

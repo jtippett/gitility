@@ -109,6 +109,35 @@ jobs:
       - name: Rust tests (workspace)
         run: cargo test --workspace --all-targets
 
+      - name: Cache loom cargo artifacts
+        uses: actions/cache@v5
+        with:
+          path: target-loom
+          key: cargo-loom-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-loom-${{ runner.os }}-
+
+      - name: Loom runtime concurrency tests
+        env:
+          CARGO_TARGET_DIR: target-loom
+          RUSTFLAGS: --cfg loom
+        run: |
+          set -o pipefail
+          cargo test -p gitility-core --release -- \
+            --exact \
+            runtime::loom_tests::loom_queue_has_no_lost_wakeup \
+            runtime::loom_tests::loom_cancel_dequeue_race_has_one_terminal_transition \
+            runtime::loom_tests::loom_terminal_state_publishes_output_first \
+            runtime::loom_tests::loom_shutdown_submit_race_never_strands_a_job \
+            runtime::loom_tests::loom_two_workers_two_jobs_have_no_lost_wakeup \
+            runtime::loom_tests::loom_shutdown_races_queued_cancel \
+            runtime::loom_tests::loom_double_cancel_from_two_threads_fires_once \
+            runtime::loom_tests::loom_shutdown_races_reentrant_shutdown_without_deadlock \
+            --test-threads=1 | tee /tmp/gitility-loom-tests.log
+          grep -Fq \
+            "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured;" \
+            /tmp/gitility-loom-tests.log
+
       - name: Run tests
         run: mix test
 

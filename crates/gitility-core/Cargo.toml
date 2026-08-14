@@ -20,6 +20,12 @@ sha2 = { version = "=0.11.0", default-features = false }
 [dev-dependencies]
 criterion = "=0.7.0"
 
+[target.'cfg(loom)'.dev-dependencies]
+loom = "=0.7.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [[bench]]
 name = "verify_tax"
 harness = false

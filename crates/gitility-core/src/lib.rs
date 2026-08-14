@@ -22,6 +22,7 @@ pub mod object;
 pub mod odb;
 pub mod pathspec;
 pub mod refs;
+pub mod runtime;
 pub mod snapshot;
 pub mod static_odb;
 pub mod tree;
@@ -41,6 +42,10 @@ pub use local_odb::{LocalOdb, LocalOdbOptions, RepositoryLayout};
 pub use object::{HashKind, ObjectHeader, ObjectKind, Oid};
 pub use odb::ObjectDb;
 pub use refs::{RefDb, RefPage, RefQuery, RefTarget};
+pub use runtime::{
+    BusyReason, Job, JobObserver, JobOutput, JobSpec, JobState, JobTask, OwnerKey, ReadManyOutput,
+    Runtime, RuntimeConfig, RuntimeCounters, SubmitError, TestObserver,
+};
 pub use snapshot::{open as open_snapshot, peel, PeelTarget, Snapshot};
 pub use static_odb::StaticOdb;
 pub use tree::{list_tree, QueryStats, TreeItem, TreeItemKind, TreeOptions, TreePage, TypeFilter};

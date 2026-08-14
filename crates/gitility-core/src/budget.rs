@@ -108,7 +108,7 @@ impl Budget {
     /// diff, and decode — this is what makes cancellation latency and
     /// timeouts real.
     pub fn check(&self) -> Result<(), Error> {
-        if self.cancelled.load(Ordering::Relaxed) {
+        if self.cancelled.load(Ordering::Acquire) {
             return Err(Error::new(ErrorCode::Cancelled, "operation cancelled"));
         }
         if let Some(deadline) = self.deadline {

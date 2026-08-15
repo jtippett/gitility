@@ -21,6 +21,7 @@ pub mod local_odb;
 pub mod object;
 pub mod odb;
 pub mod pathspec;
+pub mod provider_odb;
 pub mod refs;
 pub mod runtime;
 pub mod snapshot;
@@ -40,7 +41,11 @@ pub use error::{Error, ErrorCode};
 pub use file::{read_file, FileKind, FileOptions, FileRead, LfsPointer};
 pub use local_odb::{LocalOdb, LocalOdbOptions, RepositoryLayout};
 pub use object::{HashKind, ObjectHeader, ObjectKind, Oid};
-pub use odb::ObjectDb;
+pub use odb::{ObjectDb, ObjectReadResult};
+pub use provider_odb::{
+    PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions,
+    ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport, ReplySlot,
+};
 pub use refs::{RefDb, RefPage, RefQuery, RefTarget};
 pub use runtime::{
     BusyReason, Job, JobObserver, JobOutput, JobSpec, JobState, JobTask, OwnerKey, ReadManyOutput,

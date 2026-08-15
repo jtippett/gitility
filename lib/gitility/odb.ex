@@ -36,6 +36,8 @@ defmodule Gitility.ODB do
     OID
   }
 
+  alias Gitility.ODB.Provider
+
   @typedoc """
   An opaque handle to an object store.
 
@@ -52,7 +54,7 @@ defmodule Gitility.ODB do
           }
 
   @enforce_keys [:kind, :ref, :hash, :runtime]
-  defstruct [:kind, :ref, :hash, :runtime]
+  defstruct [:kind, :ref, :hash, :runtime, :provider, :supervisor]
 
   @doc """
   Starts a provider-backed ODB serving objects through a
@@ -62,6 +64,12 @@ defmodule Gitility.ODB do
   supervision tree. Gitility monitors it: provider exit fails pending
   requests with `:provider_down` and cancels jobs that cannot progress.
 
+  A provider handle is permanently bound to the exact provider process that
+  created it. If that process dies, pending and future reads through the old
+  handle fail with retryable `:provider_down`; a restarted provider owns a new
+  native handle, so callers must obtain a fresh ODB by calling `start_link/1`
+  again.
+
   ## Options
 
     * `:backend` (required) — `{module, init_arg}`.
@@ -70,6 +78,8 @@ defmodule Gitility.ODB do
     * `:verify` — `:always` (default): recompute and check every object ID.
     * `:concurrency` — max concurrent backend callbacks (default `8`).
     * `:request_timeout` — per-batch deadline in ms (default `15_000`).
+      Expiry returns retryable `:provider_timeout`; the job's overall deadline
+      remains `:timeout` and wins when both expire together.
     * `:runtime` — the `Gitility.Runtime` to attach to (default: shared).
     * `:cache` — provider-side cache: `object_bytes:`, `header_entries:`,
       `negative_ttl:` (ms; missing objects may arrive later in shallow or
@@ -88,15 +98,59 @@ defmodule Gitility.ODB do
   """
   @spec start_link(keyword()) :: {:ok, t()} | {:error, Error.t()}
   def start_link(opts) do
-    _ = opts
-    NotImplementedError.stub!(:"ODB.start_link/1", "Milestone 2")
+    opts =
+      Keyword.validate!(opts,
+        backend: nil,
+        name: nil,
+        hash: :sha1,
+        verify: :always,
+        concurrency: 8,
+        request_timeout: 15_000,
+        runtime: :default,
+        cache: []
+      )
+
+    with :ok <- validate_provider_backend(opts[:backend]),
+         :ok <- validate_provider_name(opts[:name]),
+         :ok <- validate_provider_hash(opts[:hash]),
+         :ok <- validate_provider_verify(opts[:verify]),
+         {:ok, concurrency} <- positive_provider_option(opts[:concurrency], :concurrency),
+         {:ok, request_timeout} <-
+           positive_provider_option(opts[:request_timeout], :request_timeout),
+         {:ok, cache} <- validate_provider_cache(opts[:cache]),
+         {:ok, runtime, _runtime_resource} <- NativeSupport.runtime_and_resource(opts[:runtime]),
+         {:ok, supervisor} <-
+           Gitility.ODB.Provider.Supervisor.start_link(
+             backend: opts[:backend],
+             name: opts[:name],
+             hash: opts[:hash],
+             concurrency: concurrency,
+             request_timeout: request_timeout,
+             object_cache_bytes: cache[:object_bytes],
+             header_cache_entries: cache[:header_entries],
+             negative_ttl: cache[:negative_ttl]
+           ),
+         {:ok, {resource, hash, provider}} <- provider_handle(supervisor) do
+      {:ok,
+       %__MODULE__{
+         kind: :provider,
+         ref: resource,
+         hash: hash,
+         runtime: runtime,
+         provider: provider,
+         supervisor: supervisor
+       }}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> provider_start_error(reason)
+    end
   end
 
   @doc false
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
     %{
-      id: Keyword.get(opts, :name, __MODULE__),
+      id: Keyword.get(opts, :name) || {__MODULE__, make_ref()},
       start: {__MODULE__, :start_link, [opts]}
     }
   end
@@ -176,6 +230,29 @@ defmodule Gitility.ODB do
   """
   @spec cache(keyword()) :: cache_spec()
   def cache(opts), do: {:cache, opts}
+
+  @doc """
+  Clears a provider store's native negative cache and asks its backend to
+  refresh availability state when the optional callback is implemented.
+
+  Other store kinds return `:unsupported_operation` in this milestone.
+  """
+  @spec refresh(t()) :: :ok | {:error, Error.t()}
+  def refresh(%__MODULE__{kind: :provider, ref: resource, provider: provider}) do
+    with {:ok, nil} <- native_provider_refresh(resource),
+         :ok <- provider_refresh(provider) do
+      :ok
+    end
+  end
+
+  def refresh(%__MODULE__{}) do
+    {:error,
+     Error.new(
+       :unsupported_operation,
+       "refresh is supported only for provider object stores",
+       operation: :odb_refresh
+     )}
+  end
 
   @doc """
   Reads one object's header (type and size) without its payload.
@@ -334,4 +411,132 @@ defmodule Gitility.ODB do
 
   defp parse_oids(_oids),
     do: NativeSupport.invalid_argument("object IDs must be provided as a list")
+
+  defp validate_provider_backend({module, _init_arg}) when is_atom(module) do
+    if function_exported?(module, :init, 1) and function_exported?(module, :read_many, 2) do
+      :ok
+    else
+      NativeSupport.invalid_argument(
+        ":backend module must implement Gitility.ODB.Backend init/1 and read_many/2"
+      )
+    end
+  end
+
+  defp validate_provider_backend(_backend) do
+    NativeSupport.invalid_argument(":backend must be a {module, init_arg} tuple")
+  end
+
+  defp validate_provider_name(nil), do: :ok
+  defp validate_provider_name(name) when is_atom(name), do: :ok
+  defp validate_provider_name({:global, _term}), do: :ok
+  defp validate_provider_name({:via, module, _term}) when is_atom(module), do: :ok
+
+  defp validate_provider_name(_name) do
+    NativeSupport.invalid_argument(
+      ":name must be an atom, {:global, term}, {:via, module, term}, or nil"
+    )
+  end
+
+  defp validate_provider_hash(hash) when hash in [:sha1, :sha256], do: :ok
+
+  defp validate_provider_hash(_hash) do
+    NativeSupport.invalid_argument(":hash must be :sha1 or :sha256")
+  end
+
+  defp validate_provider_verify(:always), do: :ok
+
+  defp validate_provider_verify(_verify) do
+    NativeSupport.invalid_argument("only verify: :always is supported")
+  end
+
+  defp positive_provider_option(value, _name) when is_integer(value) and value > 0,
+    do: {:ok, value}
+
+  defp positive_provider_option(_value, name) do
+    NativeSupport.invalid_argument(":#{name} must be a positive integer")
+  end
+
+  defp validate_provider_cache(cache) when is_list(cache) do
+    cache = Keyword.validate!(cache, object_bytes: 0, header_entries: 0, negative_ttl: 0)
+
+    Enum.reduce_while([:object_bytes, :header_entries, :negative_ttl], {:ok, cache}, fn key,
+                                                                                        result ->
+      if is_integer(cache[key]) and cache[key] >= 0 do
+        {:cont, result}
+      else
+        {:halt, NativeSupport.invalid_argument(":cache #{key}: must be a non-negative integer")}
+      end
+    end)
+  end
+
+  defp validate_provider_cache(_cache) do
+    NativeSupport.invalid_argument(":cache must be a keyword list")
+  end
+
+  defp provider_handle(supervisor) do
+    provider =
+      supervisor
+      |> Supervisor.which_children()
+      |> Enum.find_value(fn
+        {Provider, pid, :worker, _modules} when is_pid(pid) -> pid
+        _child -> nil
+      end)
+
+    if provider do
+      GenServer.call(provider, :handle)
+    else
+      {:error, :provider_not_started}
+    end
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  defp provider_start_error(
+         {:shutdown, {:failed_to_start_child, Provider, {:backend_init, reason}}}
+       ),
+       do: {:error, reason}
+
+  defp provider_start_error(reason) do
+    {:error,
+     Error.new(
+       :backend_error,
+       "provider failed to start",
+       retryable: true,
+       operation: :odb_start_link,
+       details: %{reason: sanitize_start_reason(reason)}
+     )}
+  end
+
+  defp sanitize_start_reason(_reason), do: :provider_start_failed
+
+  defp native_provider_refresh(resource) do
+    case Native.provider_refresh(resource) do
+      {:ok, {}} -> {:ok, nil}
+      {:ok, nil} -> {:ok, nil}
+      {:error, error} -> {:error, NativeSupport.nif_error(error, :odb_refresh)}
+    end
+  end
+
+  defp provider_refresh(provider) do
+    try do
+      case GenServer.call(provider, :refresh, :infinity) do
+        :ok ->
+          :ok
+
+        {:error, _reason} ->
+          {:error,
+           Error.new(:backend_error, "provider callback failed",
+             retryable: true,
+             operation: :odb_refresh
+           )}
+      end
+    catch
+      :exit, _reason ->
+        {:error,
+         Error.new(:provider_down, "provider process is down",
+           retryable: true,
+           operation: :odb_refresh
+         )}
+    end
+  end
 end

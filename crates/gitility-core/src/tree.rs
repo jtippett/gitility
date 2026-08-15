@@ -208,6 +208,18 @@ pub fn list_tree(
     } else {
         match walker.walk_tree(tree_oid, &opts.path, max_depth) {
             Ok(outcome) => outcome,
+            // Provider ceilings are transport backpressure, not stable
+            // pagination boundaries: retrying a cursor could spend the same
+            // remote budget again. Surface them as hard named failures.
+            Err(error)
+                if error.code == ErrorCode::BudgetExceeded
+                    && matches!(
+                        error.limit,
+                        Some("max_provider_requests" | "max_provider_bytes")
+                    ) =>
+            {
+                return Err(error);
+            }
             Err(error) if error.code == ErrorCode::BudgetExceeded => {
                 WalkOutcome::Stopped(error.limit.unwrap_or("budget"))
             }

@@ -99,6 +99,14 @@ impl Budget {
         &self.limits
     }
 
+    /// The wall-clock deadline carried by this operation, when one exists.
+    ///
+    /// Provider waits use this to bound their own per-request timeout by the
+    /// job deadline without sleeping past the next cancellation check.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     /// The cancellation flag, shared with the job that owns this budget.
     pub fn cancel_flag(&self) -> &Arc<AtomicBool> {
         &self.cancelled
@@ -185,15 +193,20 @@ impl Budget {
         )
     }
 
-    /// Charges one provider round trip of `bytes` reply size.
-    pub fn charge_provider_request(&self, bytes: u64) -> Result<(), Error> {
+    /// Charges one provider round trip before it is dispatched.
+    pub fn charge_provider_request(&self) -> Result<(), Error> {
         self.check()?;
         charge(
             &self.provider_requests,
             1,
             self.limits.max_provider_requests,
             "max_provider_requests",
-        )?;
+        )
+    }
+
+    /// Charges bytes in a provider reply before they are trusted or cached.
+    pub fn charge_provider_bytes(&self, bytes: u64) -> Result<(), Error> {
+        self.check()?;
         charge(
             &self.provider_bytes,
             bytes,
@@ -327,9 +340,11 @@ mod tests {
             ..BudgetLimits::default()
         };
         let budget = Budget::new(limits, None, Arc::new(AtomicBool::new(false)));
-        assert!(budget.charge_provider_request(400).is_ok());
-        assert!(budget.charge_provider_request(400).is_ok());
-        assert!(budget.charge_provider_request(400).is_err());
+        assert!(budget.charge_provider_request().is_ok());
+        assert!(budget.charge_provider_bytes(400).is_ok());
+        assert!(budget.charge_provider_request().is_ok());
+        assert!(budget.charge_provider_bytes(400).is_ok());
+        assert!(budget.charge_provider_request().is_err());
         let (_, _, requests, bytes) = budget.spent();
         assert_eq!(requests, 3); // failed charge still recorded as attempted spend
         assert_eq!(bytes, 800);

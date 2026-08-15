@@ -13,7 +13,9 @@ defmodule Gitility.ODB.Backend do
   **Batch retrieval is required.** `c:read_many/2` is the primitive; a
   single read is a one-element batch. A single-object callback would be an
   attractive but catastrophically chatty remote interface, so it does not
-  exist.
+  exist. Explicit `Gitility.ODB.read_many/3` calls and prefetch hints retain
+  real batches. V1 deliberately does not coalesce independent jobs; adding
+  cross-job coalescing later is compatible with this batch-first contract.
 
   **Callbacks are stateless and concurrent.** `c:init/1` produces a state
   term passed to every callback read-only; callbacks do not return updated

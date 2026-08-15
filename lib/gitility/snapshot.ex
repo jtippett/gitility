@@ -40,7 +40,21 @@ defmodule Gitility.Snapshot do
     limits_map = NativeSupport.limits_map!(limits)
 
     with {:ok, oid} <- NativeSupport.parse_oid(commit_oid),
-         {:ok, result} <- Native.snapshot_open(resource, oid.bytes, limits_map) do
+         {:ok, result} <-
+           NativeSupport.await_sync(
+             fn ->
+               NativeSupport.submit_job(odb.runtime, :snapshot_open, fn runtime_resource ->
+                 Native.job_submit_snapshot_open(
+                   runtime_resource,
+                   resource,
+                   oid.bytes,
+                   limits_map
+                 )
+               end)
+             end,
+             limits.timeout_ms,
+             :snapshot_open
+           ) do
       {:ok,
        %__MODULE__{
          odb: odb,
@@ -49,7 +63,6 @@ defmodule Gitility.Snapshot do
        }}
     else
       {:error, %Error{} = error} -> {:error, error}
-      {:error, error} -> {:error, NativeSupport.nif_error(error, :snapshot_open)}
     end
   end
 end

@@ -11,6 +11,9 @@ use crate::budget::Budget;
 use crate::error::Error;
 use crate::object::{HashKind, ObjectHeader, ObjectKind, Oid};
 
+/// One owned payload result in a batch, retaining misses as `None`.
+pub type ObjectReadResult = Option<(ObjectKind, Vec<u8>)>;
+
 /// A content-addressed, read-only object store.
 ///
 /// The trait is deliberately `dyn`-compatible: stores are composed and
@@ -33,6 +36,24 @@ pub trait ObjectDb: Send + Sync + 'static {
         out: &mut Vec<u8>,
         budget: &Budget,
     ) -> Result<Option<ObjectKind>, Error>;
+
+    /// Reads a batch of objects in input order. Providers override this to
+    /// make one callback round trip; local stores keep the simple default.
+    ///
+    /// The public backend contract is batch-first even though many Git
+    /// algorithms ask for one object at a time. Cross-job coalescing is not
+    /// part of v1, but can be added without changing this contract.
+    fn try_find_many(&self, oids: &[Oid], budget: &Budget) -> Result<Vec<ObjectReadResult>, Error> {
+        let mut results = Vec::with_capacity(oids.len());
+        for oid in oids {
+            let mut data = Vec::new();
+            let value = self
+                .try_find(oid, &mut data, budget)?
+                .map(|kind| (kind, data));
+            results.push(value);
+        }
+        Ok(results)
+    }
 
     /// A hint that these OIDs will likely be read soon. Batching stores
     /// (remote providers, pack ranges) use it to coalesce round trips;

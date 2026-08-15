@@ -11,11 +11,14 @@ use gitility_core::{
     list_tree as core_list_tree, peel as core_peel, read_file as core_read_file, Budget,
     BudgetLimits, BusyReason, Error, ErrorCode, FileKind, FileOptions, HashKind, Job as CoreJob,
     JobObserver, JobOutput, JobSpec, JobState, LocalOdb, LocalOdbOptions, ObjectDb, ObjectHeader,
-    ObjectKind, Oid, PeelTarget, QueryStats, Runtime as CoreRuntime, RuntimeConfig, Snapshot,
-    StaticOdb, SubmitError, TreeItemKind, TreeOptions, TypeFilter,
+    ObjectKind, Oid, PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb,
+    ProviderOptions, ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport,
+    QueryStats, Runtime as CoreRuntime, RuntimeConfig, Snapshot, StaticOdb, SubmitError,
+    TreeItemKind, TreeOptions, TypeFilter,
 };
 use rustler::{
-    Atom, Binary, Encoder, Env, LocalPid, Monitor, NewBinary, NifMap, NifResult, OwnedEnv,
+    types::{map::MapIterator, tuple::get_tuple},
+    Atom, Binary, Decoder, Encoder, Env, LocalPid, Monitor, NewBinary, NifMap, NifResult, OwnedEnv,
     Resource, ResourceArc, Term,
 };
 use std::collections::{BTreeMap, HashSet};
@@ -24,14 +27,72 @@ use std::os::unix::ffi::OsStrExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 enum StoreImpl {
     Local(LocalOdb),
     Static(StaticStore),
+    Provider(Box<ProviderOdb<NifProviderTransport>>),
 }
+
+#[derive(Clone)]
+struct NifProviderTransport {
+    provider: LocalPid,
+    pending: Weak<PendingTable>,
+    hash: HashKind,
+}
+
+impl ProviderTransport for NifProviderTransport {
+    fn request(&self, request: ProviderRequest) -> Result<(), Error> {
+        // Provider callbacks are emitted only from Rust-owned runtime workers.
+        // OwnedEnv::send_and_clear is forbidden on BEAM-managed scheduler
+        // threads, hence this direct send does not use the M2b notification
+        // pump and must never be called by a scheduler NIF.
+        debug_assert!(!rustler::thread::is_scheduler_thread());
+        let request_resource = ResourceArc::new(RequestResource {
+            id: request.id,
+            pending: self.pending.clone(),
+            kind: request.kind,
+            expected: request.oids.iter().copied().collect(),
+            hash: self.hash,
+            max_object_bytes: request.max_object_bytes,
+            max_reply_bytes: request.max_reply_bytes,
+        });
+        let provider = self.provider;
+        let kind = provider_kind_atom(request.kind);
+        let oids = request.oids;
+        let mut env = OwnedEnv::new();
+        env.send_and_clear(&provider, move |send_env| {
+            let oid_terms = oids
+                .iter()
+                .map(|oid| binary(send_env, oid.as_bytes()))
+                .collect::<Vec<_>>();
+            (
+                atoms::gitility_provider_request(),
+                request_resource,
+                kind,
+                oid_terms,
+            )
+                .encode(send_env)
+        })
+        .map_err(|_| Error::retryable(ErrorCode::ProviderDown, "provider process is down"))
+    }
+}
+
+struct RequestResource {
+    id: u64,
+    pending: Weak<PendingTable>,
+    kind: ProviderKind,
+    expected: HashSet<Oid>,
+    hash: HashKind,
+    max_object_bytes: u64,
+    max_reply_bytes: u64,
+}
+
+#[rustler::resource_impl]
+impl Resource for RequestResource {}
 
 struct StaticStore {
     hash: HashKind,
@@ -72,6 +133,14 @@ impl StoreImpl {
         match self {
             Self::Local(store) => store,
             Self::Static(store) => store,
+            Self::Provider(store) => store.as_ref(),
+        }
+    }
+
+    fn as_provider(&self) -> Option<&ProviderOdb<NifProviderTransport>> {
+        match self {
+            Self::Provider(store) => Some(store.as_ref()),
+            Self::Local(_) | Self::Static(_) => None,
         }
     }
 }
@@ -340,6 +409,14 @@ fn notify_waiters(
 struct OpenLocalOptions {
     require_bare: bool,
     verify_pack_checksums: bool,
+}
+
+#[derive(Clone, Copy, NifMap)]
+struct ProviderStoreOptions {
+    request_timeout_ms: u64,
+    object_cache_bytes: u64,
+    header_cache_entries: u64,
+    negative_ttl_ms: u64,
 }
 
 #[derive(Clone, Copy, NifMap)]
@@ -712,6 +789,282 @@ fn static_from_objects<'a>(
     .encode(env))
 }
 
+#[rustler::nif]
+fn provider_store_new<'a>(
+    env: Env<'a>,
+    hash: Atom,
+    opts: ProviderStoreOptions,
+) -> NifResult<Term<'a>> {
+    let hash = match parse_hash(hash) {
+        Ok(hash) => hash,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let header_cache_entries = match usize::try_from(opts.header_cache_entries) {
+        Ok(value) => value,
+        Err(_) => {
+            let error = Error::new(
+                ErrorCode::InvalidArgument,
+                "provider header cache entry cap is too large",
+            );
+            return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+        }
+    };
+    let pending = Arc::new(PendingTable::default());
+    let transport = NifProviderTransport {
+        provider: env.pid(),
+        pending: Arc::downgrade(&pending),
+        hash,
+    };
+    let provider = ProviderOdb::new_with_pending(
+        hash,
+        ProviderOptions {
+            request_timeout: Duration::from_millis(opts.request_timeout_ms),
+            cache: ProviderCacheOptions {
+                object_bytes: opts.object_cache_bytes,
+                header_entries: header_cache_entries,
+                negative_ttl: Duration::from_millis(opts.negative_ttl_ms),
+            },
+        },
+        transport,
+        pending,
+    );
+    Ok(Result::<_, ErrorMap>::Ok((
+        ResourceArc::new(StoreResource(StoreImpl::Provider(Box::new(provider)))),
+        hash_atom(hash),
+    ))
+    .encode(env))
+}
+
+/// Copies a provider reply on a dirty CPU scheduler. Binary sizes and object
+/// IDs are checked while still borrowed from the BEAM term, before any
+/// payload is copied into a Rust-owned `Vec`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn provider_reply(request: ResourceArc<RequestResource>, reply: Term<'_>) -> Atom {
+    let Some(pending) = request.pending.upgrade() else {
+        return atoms::ok();
+    };
+    match decode_provider_reply(&request, reply) {
+        Ok(payload) => {
+            pending.reply(request.id, payload);
+        }
+        Err(error) => {
+            pending.reply_error(request.id, error);
+        }
+    }
+    atoms::ok()
+}
+
+#[rustler::nif]
+fn provider_failed(store: ResourceArc<StoreResource>) -> Atom {
+    if let Some(provider) = store.0.as_provider() {
+        provider.provider_down();
+    }
+    atoms::ok()
+}
+
+#[rustler::nif]
+fn provider_refresh<'a>(env: Env<'a>, store: ResourceArc<StoreResource>) -> NifResult<Term<'a>> {
+    let result = match store.0.as_provider() {
+        Some(provider) => provider.refresh(&Budget::unlimited()),
+        None => Err(Error::new(
+            ErrorCode::UnsupportedOperation,
+            "refresh is supported only for provider stores",
+        )),
+    };
+    Ok(match result {
+        Ok(()) => Result::<(), ErrorMap>::Ok(()).encode(env),
+        Err(error) => Result::<(), _>::Err(error_map(env, error)?).encode(env),
+    })
+}
+
+fn decode_provider_reply(
+    request: &RequestResource,
+    reply: Term<'_>,
+) -> Result<ProviderPayload, Error> {
+    let tuple = get_tuple(reply).map_err(|_| provider_protocol_error("invalid reply envelope"))?;
+    if tuple.len() != 2 {
+        return Err(provider_protocol_error("invalid reply envelope"));
+    }
+    let tag = tuple[0]
+        .decode::<Atom>()
+        .map_err(|_| provider_protocol_error("invalid reply envelope"))?;
+    if tag == atoms::error() {
+        return Ok(ProviderPayload::BackendError);
+    }
+    if tag != atoms::ok() {
+        return Err(provider_protocol_error("invalid reply envelope"));
+    }
+    if request.kind == ProviderKind::Prefetch {
+        return Ok(ProviderPayload::Results(Vec::new()));
+    }
+
+    preflight_provider_results(request, tuple[1])?;
+    let iterator = MapIterator::new(tuple[1]).expect("preflight proved the result is a map");
+    let mut results = Vec::with_capacity(request.expected.len());
+    for (oid_term, value_term) in iterator {
+        let oid = decode_provider_oid(request.hash, oid_term)?;
+        results.push((oid, decode_provider_value(request, oid, value_term)?));
+    }
+    Ok(ProviderPayload::Results(results))
+}
+
+/// Validates the complete reply, including cumulative caps, before the
+/// decode pass copies the first payload byte into Rust-owned memory.
+fn preflight_provider_results(
+    request: &RequestResource,
+    results_term: Term<'_>,
+) -> Result<(), Error> {
+    let iterator = MapIterator::new(results_term)
+        .ok_or_else(|| provider_protocol_error("provider results must be a map"))?;
+    let mut seen = HashSet::with_capacity(request.expected.len());
+    let mut total_bytes = 0u64;
+    for (oid_term, value_term) in iterator {
+        let oid = decode_provider_oid(request.hash, oid_term)?;
+        if !request.expected.contains(&oid) || !seen.insert(oid) {
+            return Err(provider_protocol_error(
+                "provider reply contains an unexpected or duplicate object ID",
+            ));
+        }
+        total_bytes =
+            total_bytes.saturating_add(preflight_provider_value(request, oid, value_term)?);
+        if total_bytes > request.max_reply_bytes {
+            return Err(
+                Error::new(ErrorCode::BudgetExceeded, "max_provider_bytes exceeded")
+                    .with_limit("max_provider_bytes"),
+            );
+        }
+    }
+    if seen.len() != request.expected.len() {
+        return Err(provider_protocol_error(
+            "provider reply omitted a requested object ID",
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_provider_value(
+    request: &RequestResource,
+    oid: Oid,
+    value: Term<'_>,
+) -> Result<u64, Error> {
+    if value.decode::<Atom>().ok() == Some(atoms::not_found()) {
+        return Ok(0);
+    }
+    validate_embedded_oid(request.hash, oid, value)?;
+    decode_provider_kind(value)?;
+    match request.kind {
+        ProviderKind::Object => provider_data_size(request, value),
+        ProviderKind::Header => {
+            if value.map_get(atoms::data()).is_ok() {
+                provider_data_size(request, value)
+            } else {
+                value
+                    .map_get(atoms::size())
+                    .and_then(u64::decode)
+                    .map_err(|_| provider_protocol_error("provider header size is invalid"))?;
+                Ok(0)
+            }
+        }
+        ProviderKind::Prefetch => unreachable!("prefetch returned before preflight"),
+    }
+}
+
+fn provider_data_size(request: &RequestResource, value: Term<'_>) -> Result<u64, Error> {
+    let data = value
+        .map_get(atoms::data())
+        .and_then(Binary::decode)
+        .map_err(|_| provider_protocol_error("provider object data is invalid"))?;
+    let bytes = data.len() as u64;
+    if bytes > request.max_object_bytes {
+        return Err(Error::new(
+            ErrorCode::ObjectTooLarge,
+            "provider object exceeds max_object_bytes",
+        )
+        .with_limit("max_object_bytes"));
+    }
+    Ok(bytes)
+}
+
+fn decode_provider_value(
+    request: &RequestResource,
+    oid: Oid,
+    value: Term<'_>,
+) -> Result<ProviderReplyValue, Error> {
+    if value.decode::<Atom>().ok() == Some(atoms::not_found()) {
+        return Ok(ProviderReplyValue::NotFound);
+    }
+    validate_embedded_oid(request.hash, oid, value)?;
+    let kind = decode_provider_kind(value)?;
+    match request.kind {
+        ProviderKind::Object => Ok(ProviderReplyValue::Object {
+            kind,
+            data: value
+                .map_get(atoms::data())
+                .and_then(Binary::decode)
+                .expect("preflight proved provider object data")
+                .as_slice()
+                .to_vec(),
+        }),
+        ProviderKind::Header => match value.map_get(atoms::data()).and_then(Binary::decode) {
+            Ok(data) => Ok(ProviderReplyValue::Object {
+                kind,
+                data: data.as_slice().to_vec(),
+            }),
+            Err(_) => Ok(ProviderReplyValue::Header(ObjectHeader {
+                kind,
+                size: value
+                    .map_get(atoms::size())
+                    .and_then(u64::decode)
+                    .expect("preflight proved provider header size"),
+            })),
+        },
+        ProviderKind::Prefetch => unreachable!("prefetch returned before decode"),
+    }
+}
+
+fn decode_provider_oid(hash: HashKind, term: Term<'_>) -> Result<Oid, Error> {
+    let algorithm = term
+        .map_get(atoms::algorithm())
+        .and_then(Atom::decode)
+        .map_err(|_| provider_protocol_error("provider object ID is invalid"))?;
+    if algorithm != hash_atom(hash) {
+        return Err(provider_protocol_error(
+            "provider object ID uses the wrong hash algorithm",
+        ));
+    }
+    let bytes = term
+        .map_get(atoms::bytes())
+        .and_then(Binary::decode)
+        .map_err(|_| provider_protocol_error("provider object ID is invalid"))?;
+    Oid::new(hash, bytes.as_slice())
+        .map_err(|_| provider_protocol_error("provider object ID is invalid"))
+}
+
+fn validate_embedded_oid(hash: HashKind, expected: Oid, term: Term<'_>) -> Result<(), Error> {
+    let oid_term = term
+        .map_get(atoms::oid())
+        .map_err(|_| provider_protocol_error("provider result object ID is missing"))?;
+    if decode_provider_oid(hash, oid_term)? == expected {
+        Ok(())
+    } else {
+        Err(provider_protocol_error(
+            "provider result object ID does not match its map key",
+        ))
+    }
+}
+
+fn decode_provider_kind(term: Term<'_>) -> Result<ObjectKind, Error> {
+    let kind = term
+        .map_get(atoms::type_atom())
+        .and_then(Atom::decode)
+        .map_err(|_| provider_protocol_error("provider object type is invalid"))?;
+    parse_object_kind(kind).map_err(|_| provider_protocol_error("provider object type is invalid"))
+}
+
+fn provider_protocol_error(message: &'static str) -> Error {
+    Error::new(ErrorCode::ProviderProtocolError, message)
+}
+
 #[rustler::nif(schedule = "DirtyCpu")]
 fn snapshot_open<'a>(
     env: Env<'a>,
@@ -886,8 +1239,9 @@ fn job_submit_odb_read_many<'a>(
     let task = Box::new(move |budget: &Budget| {
         let mut total = 0u64;
         let mut results = Vec::with_capacity(oids.len());
-        for oid in oids {
-            let value = match read_object(task_store.0.as_dyn(), oid, None, budget)? {
+        let values = task_store.0.as_dyn().try_find_many(&oids, budget)?;
+        for (oid, value) in oids.into_iter().zip(values) {
+            let value = match value {
                 Some((kind, data)) => {
                     total = total.saturating_add(data.len() as u64);
                     if max_total_bytes.is_some_and(|maximum| total > maximum) {
@@ -904,6 +1258,33 @@ fn job_submit_odb_read_many<'a>(
             results.push((oid, value));
         }
         Ok(JobOutput::ReadMany(results))
+    });
+    submit_job(
+        env,
+        runtime,
+        false,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Other,
+        task,
+    )
+}
+
+#[rustler::nif]
+fn job_submit_snapshot_open<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    store: ResourceArc<StoreResource>,
+    raw_oid: Binary<'a>,
+    limits: LimitsMap,
+) -> NifResult<Term<'a>> {
+    let oid = match oid_for_store(&store, raw_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let task_store = store.clone();
+    let task = Box::new(move |budget: &Budget| {
+        Snapshot::open(task_store.0.as_dyn(), oid, budget).map(JobOutput::Snapshot)
     });
     submit_job(
         env,
@@ -1140,6 +1521,7 @@ fn job_take_result<'a>(env: Env<'a>, resource: ResourceArc<JobResource>) -> NifR
     let Some(result) = resource.job.take_output() else {
         return Ok(atoms::already_taken().encode(env));
     };
+    let provider_spend = resource.job.spent();
     match result {
         Ok(output) if output_payload_bytes(&output) > resource.max_result_bytes => {
             let error = Error::new(
@@ -1156,6 +1538,7 @@ fn job_take_result<'a>(env: Env<'a>, resource: ResourceArc<JobResource>) -> NifR
                 output,
                 resource.result_kind,
                 resource.elapsed_ms.load(Ordering::Acquire),
+                provider_spend,
             )?,
         )
             .encode(env)),
@@ -1168,6 +1551,7 @@ fn encode_job_output<'a>(
     output: JobOutput,
     result_kind: JobResultKind,
     elapsed_ms: u64,
+    provider_spend: (u64, u64, u64, u64),
 ) -> NifResult<Term<'a>> {
     let term = match output {
         JobOutput::Tree(page) => {
@@ -1196,7 +1580,7 @@ fn encode_job_output<'a>(
                 entries,
                 next_cursor: page.next_cursor.map(|cursor| binary(env, &cursor)),
                 truncated: page.truncated,
-                stats: stats_map(page.stats, elapsed_ms, stopped_by),
+                stats: stats_map(page.stats, elapsed_ms, stopped_by, provider_spend),
             }
             .encode(env)
         }
@@ -1348,15 +1732,20 @@ fn object_map<'a>(env: Env<'a>, kind: ObjectKind, data: Vec<u8>) -> ObjectMap<'a
     }
 }
 
-fn stats_map(stats: QueryStats, elapsed_ms: u64, page_limit_stopped_by: Atom) -> StatsMap {
+fn stats_map(
+    stats: QueryStats,
+    elapsed_ms: u64,
+    page_limit_stopped_by: Atom,
+    provider_spend: (u64, u64, u64, u64),
+) -> StatsMap {
     StatsMap {
         objects_requested: stats.objects_read,
         objects_read: stats.objects_read,
         entries_emitted: stats.entries_emitted,
         cache_hits: 0,
         cache_misses: 0,
-        provider_requests: 0,
-        provider_bytes: 0,
+        provider_requests: provider_spend.2,
+        provider_bytes: provider_spend.3,
         decompressed_bytes: stats.bytes_read,
         scanned_blobs: 0,
         elapsed_ms,
@@ -1444,6 +1833,14 @@ fn hash_atom(hash: HashKind) -> Atom {
     match hash {
         HashKind::Sha1 => atoms::sha1(),
         HashKind::Sha256 => atoms::sha256(),
+    }
+}
+
+fn provider_kind_atom(kind: ProviderKind) -> Atom {
+    match kind {
+        ProviderKind::Header => atoms::header(),
+        ProviderKind::Object => atoms::object(),
+        ProviderKind::Prefetch => atoms::prefetch(),
     }
 }
 
@@ -1537,6 +1934,7 @@ mod atoms {
         queue_full,
         owner_ceiling,
         not_found,
+        gitility_provider_request,
         sha1,
         sha256,
         commit,
@@ -1547,6 +1945,15 @@ mod atoms {
         gitlink,
         text,
         binary,
+        header,
+        object,
+        prefetch,
+        algorithm,
+        bytes,
+        oid,
+        data,
+        size,
+        type_atom = "type",
         limit,
         timeout_ms,
         max_objects,

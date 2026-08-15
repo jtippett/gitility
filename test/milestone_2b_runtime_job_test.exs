@@ -63,7 +63,9 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
     assert length(page.items) == 1
     assert elapsed < 2_000
     assert Runtime.stats(runtime_a).submitted >= 1
-    assert Runtime.stats(runtime_b).completed == 1
+    # Snapshot.open is itself a runtime job as of the callback ODB milestone;
+    # the attached runtime therefore completed snapshot-open + list-tree.
+    assert Runtime.stats(runtime_b).completed == 2
 
     :ok = Job.cancel(slow_job)
   end

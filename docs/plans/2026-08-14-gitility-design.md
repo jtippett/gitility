@@ -139,6 +139,16 @@ These findings are load-bearing; the design references them by ID.
   tokio): ~47 GiB verified byte-correct at ~2.2 GiB/s, connection
   open/close churn clean, zero errors or deadlocks. The rusqlite fallback
   was not triggered.
+- **F7 — stock gix cannot serve a pack from Rust-owned bytes.** Verified in
+  `gix-pack/src/{bundle,index}/init.rs`: `Bundle::at` and `index::File::at`
+  accept paths and mmap the files; there is no in-memory constructor. In 0.2,
+  `PackFetch` therefore uses stock gix over an explicit directory, while
+  `into: :memory` is available only on Linux as a caller-invisible,
+  size-capped directory under the RAM-backed `/dev/shm` tmpfs (cleaned on
+  shutdown/GC). macOS and other platforms return `:unsupported_operation`
+  pointing callers to `{:dir, path}`. True bytes-in-Rust serving belongs to
+  the M5 `PackRange` reader's own pack machinery and is an input to checkpoint
+  C1; no hidden disk materialization is introduced.
 
 ## Goals
 
@@ -846,6 +856,11 @@ successful remote read populates earlier writable cache layers when allowed.
 `Gitility.ODB.cache/1` stores verified, inflated object payloads with byte,
 entry, and per-object caps. Disk caching is never implicit.
 
+A layer error fails the read; layers are not failover replicas. A hit before
+the failing layer still succeeds, while a miss that reaches it returns the
+error with that layer's zero-based index. Compose caches with one authoritative
+store; use supervision/retry at the store level for availability.
+
 ## Remote pack storage
 
 The callback ODB solves remote access universally, but an object-at-a-time
@@ -853,9 +868,10 @@ service is not optimal for repositories already stored as normal Git packs.
 Two adapters share one storage model — an immutable pack manifest fetched
 through a `RangeBackend` — and differ only in access policy:
 
-- `Gitility.ODB.PackFetch` **eagerly materializes** whole packs into memory or
-  an explicit directory, then serves queries through stock gix-pack at local
-  speed. Thin and low-risk; ships in 0.2.
+- `Gitility.ODB.PackFetch` **eagerly materializes** whole packs into an
+  explicit directory or, on Linux, a size-capped RAM-backed tmpfs directory,
+  then serves queries through stock gix-pack at local speed. Thin and
+  low-risk; ships in 0.2.
 - `Gitility.ODB.PackRange` **lazily range-reads** pack bytes behind a block
   cache. This is the net-new reader (F2), scoped as Milestone 5 behind
   checkpoint C1, for repositories too large or too sparsely touched to
@@ -882,7 +898,7 @@ queries feel interactive.
 ### Eager hydration — `Gitility.ODB.PackFetch`
 
 ```elixir
-{:ok, odb} =
+{:ok, supervisor} =
   Gitility.ODB.PackFetch.start_link(
     backend: {MyApp.PackStore, backend_options},
     into: :memory,                     # or {:dir, "/var/cache/gitility"}
@@ -890,18 +906,26 @@ queries feel interactive.
     verify: :always
   )
 
+{:ok, odb} = Gitility.ODB.handle(supervisor)
+
 {:ok, snapshot} = Gitility.Snapshot.open(odb, commit_oid)
 ```
 
 Load fetches the manifest, then all index and pack files through coalesced
-parallel range reads, verifies pack and index checksums, and hands the bytes
-to the standard gix-pack machinery. `into: :memory` holds pack bytes in
-Rust-owned memory, counted against explicit ceilings; `into: {:dir, path}`
-writes them under the caller-supplied directory keyed by pack checksum, so a
-reused volume makes restarts near-free while a fresh container re-pays a few
-seconds. Both destinations are declared by the caller — the
-no-implicit-materialization principle bans hidden writes, not explicit ones.
-`refresh/1` re-reads the manifest and fetches only packs it has not seen.
+parallel range reads, verifies pack and index checksums, and hands their paths
+to the standard gix-pack machinery. `start_link/1` blocks until this initial
+hydration and store open complete, so no unusable handle is exposed. Per F7,
+`into: :memory` is a Linux-only,
+size-capped `/dev/shm` destination rather than a bytes-in-Rust gix store;
+`into: {:dir, path}` writes under the caller-supplied directory keyed by pack
+checksum, so a reused volume makes restarts near-free while a fresh container
+re-pays a few seconds. `into: {:bundle, path}` arrives with `Gitility.Bundle`
+(0.2, later milestone) and returns `:unsupported_operation` for now. Every
+active destination is declared by the caller — the no-implicit-materialization
+principle bans hidden disk writes, not an explicit directory or a documented
+RAM-backed tmpfs. `refresh/1` re-reads the manifest and fetches only packs it
+has not seen; packs removed from the manifest remain on disk during the 0.2
+publisher grace period and are never deleted by refresh.
 
 ### Single-file bundles — `Gitility.Bundle`
 
@@ -1078,7 +1102,7 @@ Two reference backends ship with the library's docs and conformance tests:
 
 - a local-directory backend (fixtures and development);
 - a Postgres chunked-pack backend — pack and index files stored as 1 MiB
-  `bytea` rows keyed by `(pack_id, chunk_index)`. Same-VPC reads cost about
+  `bytea` rows keyed by `(pack_id, artifact, chunk_index)`. Same-VPC reads cost about
   a millisecond, 30–80× lower latency than S3, and most deployments already
   run Postgres; for small and medium repositories this is often a better
   home than object storage. S3-style ranged HTTP is a documented example

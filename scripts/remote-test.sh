@@ -16,6 +16,8 @@
 #            fixtures/generated are never shipped — fixtures self-generate)
 #   rust     cargo test --workspace, clippy -D warnings, fmt, spawn guard
 #   loom     RUSTFLAGS="--cfg loom" release loom suite (9 models, exact names)
+#   postgres install/start PostgreSQL, create the peer-auth test role/database
+#            used by M2e's optional reference-backend conformance suite
 #   mix      GITILITY_BUILD=1 mix test (differential gate included, needs
 #            the pinned git 2.55.0 the provisioning step built)
 #   soak     GITILITY_BUILD=1 mix test --only soak (the 30s runtime soak)
@@ -26,6 +28,7 @@
 #                              A healthy suite uses < 200 threads; the
 #                              budget caps ours at 512.
 #   GITILITY_REMOTE_DIR        remote checkout dir (default ~/gitility)
+#   GITILITY_TEST_POSTGRES_URL override the auto-detected sprite test database
 #
 # Requires: `sprite` CLI authenticated, `sprite use gitility-test` done in
 # this directory (or SPRITE=<name>).
@@ -35,7 +38,7 @@ SPRITE_NAME="${SPRITE:-gitility-test}"
 REMOTE_DIR="${GITILITY_REMOTE_DIR:-\$HOME/gitility}"
 PIDS_MAX="${GITILITY_REMOTE_PIDS_MAX:-2000}"
 STAGES=("$@")
-[ ${#STAGES[@]} -eq 0 ] && STAGES=(sync rust loom mix soak)
+[ ${#STAGES[@]} -eq 0 ] && STAGES=(sync rust loom postgres mix soak)
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
@@ -52,6 +55,14 @@ export PATH="\$HOME/.cargo/bin:\$HOME/pinned-git/bin:\$PATH"
 export GITILITY_BUILD=1
 export CARGO_TERM_COLOR=never
 cd $REMOTE_DIR
+# The postgres stage creates a login matching the sprite user, so peer auth
+# over the local socket needs no embedded secret.
+if command -v pg_isready >/dev/null 2>&1 && pg_isready -q; then
+  export GITILITY_TEST_POSTGRES_URL="\${GITILITY_TEST_POSTGRES_URL:-postgresql:///\$(id -un)_gitility_test?host=/var/run/postgresql}"
+  echo "[remote] PostgreSQL conformance enabled"
+else
+  echo "[remote] PostgreSQL unavailable; optional conformance will log a skip"
+fi
 capped() {
   local root=/sys/fs/cgroup cg=/sys/fs/cgroup/gitility-test
   # cgroup v2 "no internal processes" rule: the root can only delegate a
@@ -100,6 +111,22 @@ stage_sync() {
   echo "==> sync: done"
 }
 
+stage_postgres() {
+  echo "==> postgres: provisioning optional M2e conformance database"
+  rexec 'set -euo pipefail
+if ! command -v psql >/dev/null 2>&1; then
+  sudo -n apt-get update -qq
+  sudo -n apt-get install -y postgresql
+fi
+sudo -n service postgresql start
+role=$(id -un)
+db="${role}_gitility_test"
+sudo -n -u postgres createuser --login "$role" 2>/dev/null || true
+sudo -n -u postgres createdb --owner "$role" "$db" 2>/dev/null || true
+psql -d "$db" -tAc "SELECT 1" | grep -q 1
+echo "[remote] PostgreSQL database=$db role=$role ready"'
+}
+
 run_stage() {
   local name="$1" cmd="$2"
   echo "==> $name"
@@ -110,6 +137,7 @@ capped bash -c '$cmd'"
 for s in "${STAGES[@]}"; do
   case "$s" in
     sync) stage_sync ;;
+    postgres) stage_postgres ;;
     smoke) run_stage smoke "echo hello-from-cap; cat /proc/self/cgroup; cat /sys/fs/cgroup/gitility-test/pids.max 2>/dev/null; nproc" ;;
     rust) run_stage rust "cargo test --workspace 2>&1 | grep -E \"^test result|error|FAILED|panicked\"; cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -2; cargo fmt --all --check && echo FMT-OK; bash scripts/check-thread-spawns.sh" ;;
     loom) run_stage loom "RUSTFLAGS=\"--cfg loom\" cargo test -p gitility-core --release 2>&1 | grep -E \"^test .*loom_|^test result\"" ;;

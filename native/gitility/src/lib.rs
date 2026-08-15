@@ -9,20 +9,23 @@
 use gitility_core::runtime::thread_budget;
 use gitility_core::{
     list_tree as core_list_tree, peel as core_peel, read_file as core_read_file, Budget,
-    BudgetLimits, BusyReason, CacheOptions, CacheStats, Error, ErrorCode, FileKind, FileOptions,
-    HashKind, Job as CoreJob, JobObserver, JobOutput, JobSpec, JobState, LayeredOdb, LocalOdb,
-    LocalOdbOptions, ObjectDb, ObjectHeader, ObjectKind, ObjectReadResult, Oid, PeelTarget,
-    PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions,
-    ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport, QueryStats,
-    ReadManyBudget, Runtime as CoreRuntime, RuntimeConfig, Snapshot, StaticOdb, SubmitError,
-    TreeItemKind, TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
+    BudgetLimits, BusyReason, ByteRange as CoreByteRange, CacheOptions, CacheStats,
+    CallbackRangeTransport, Error, ErrorCode, FileKind, FileOptions, HashKind, HydrationStats,
+    Job as CoreJob, JobObserver, JobOutput, JobSpec, JobState, LayeredOdb, LocalOdb,
+    LocalOdbOptions, ObjectDb, ObjectHeader, ObjectKind, ObjectReadResult, Oid, PackDescriptor,
+    PackFetchOdb, PackFetchOptions, PackManifest, PeelTarget, PendingTable, ProviderCacheOptions,
+    ProviderKind, ProviderOdb, ProviderOptions, ProviderPayload, ProviderReplyValue,
+    ProviderRequest, ProviderTransport, QueryStats, RangePayload, RangePendingTable, RangeRequest,
+    RangeRequestKind, RangeRequestSender, ReadManyBudget, Runtime as CoreRuntime, RuntimeConfig,
+    Snapshot, StaticOdb, SubmitError, TreeItemKind, TreeOptions, TypeFilter,
+    PROVIDER_HEADER_SIZE_CEILING,
 };
 use rustler::{
     types::{map::MapIterator, tuple::get_tuple},
     Atom, Binary, Decoder, Encoder, Env, LocalPid, Monitor, NewBinary, NifMap, NifResult, OwnedEnv,
     Resource, ResourceArc, Term,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -36,8 +39,11 @@ enum StoreImpl {
     Local(LocalOdb),
     Static(StaticStore),
     Provider(Box<ProviderOdb<NifProviderTransport>>),
+    PackFetch(Box<NifPackFetch>),
     Layered(LayeredOdb),
 }
+
+type NifPackFetch = PackFetchOdb<CallbackRangeTransport<NifRangeRequestSender>>;
 
 #[derive(Clone)]
 struct NifProviderTransport {
@@ -103,6 +109,72 @@ struct RequestResource {
 #[rustler::resource_impl]
 impl Resource for RequestResource {}
 
+#[derive(Clone)]
+struct NifRangeRequestSender {
+    provider: LocalPid,
+    pending: Weak<RangePendingTable>,
+}
+
+impl RangeRequestSender for NifRangeRequestSender {
+    fn request(&self, request: RangeRequest) -> Result<(), Error> {
+        // As with object-provider callbacks, PackFetch requests originate only
+        // on existing Gitility runtime workers. No scheduler send and no new
+        // native thread is involved.
+        if rustler::thread::is_scheduler_thread() {
+            return Err(Error::new(
+                ErrorCode::BackendError,
+                "range request from a scheduler thread — Gitility bug",
+            ));
+        }
+        let request_resource = ResourceArc::new(RangeRequestResource {
+            id: request.id,
+            pending: self.pending.clone(),
+            expected: request.kind.clone(),
+            max_reply_bytes: request.max_reply_bytes,
+        });
+        let provider = self.provider;
+        let kind = request.kind;
+        let mut env = OwnedEnv::new();
+        env.send_and_clear(&provider, move |send_env| match kind {
+            RangeRequestKind::Manifest => (
+                atoms::gitility_range_request(),
+                request_resource,
+                atoms::manifest(),
+                Vec::<ByteRangeMap<'_>>::new(),
+            )
+                .encode(send_env),
+            RangeRequestKind::ReadRanges(ranges) => {
+                let ranges = ranges
+                    .iter()
+                    .map(|range| ByteRangeMap {
+                        key: binary(send_env, range.key.as_bytes()),
+                        offset: range.offset,
+                        length: range.length,
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    atoms::gitility_range_request(),
+                    request_resource,
+                    atoms::read_ranges(),
+                    ranges,
+                )
+                    .encode(send_env)
+            }
+        })
+        .map_err(|_| Error::retryable(ErrorCode::ProviderDown, "range provider is down"))
+    }
+}
+
+struct RangeRequestResource {
+    id: u64,
+    pending: Weak<RangePendingTable>,
+    expected: RangeRequestKind,
+    max_reply_bytes: u64,
+}
+
+#[rustler::resource_impl]
+impl Resource for RangeRequestResource {}
+
 struct StaticStore {
     hash: HashKind,
     addressed: StaticOdb,
@@ -143,6 +215,7 @@ impl StoreImpl {
             Self::Local(store) => store,
             Self::Static(store) => store,
             Self::Provider(store) => store.as_ref(),
+            Self::PackFetch(store) => store.as_ref(),
             Self::Layered(store) => store,
         }
     }
@@ -150,7 +223,14 @@ impl StoreImpl {
     fn as_provider(&self) -> Option<&ProviderOdb<NifProviderTransport>> {
         match self {
             Self::Provider(store) => Some(store.as_ref()),
-            Self::Local(_) | Self::Static(_) | Self::Layered(_) => None,
+            Self::Local(_) | Self::Static(_) | Self::PackFetch(_) | Self::Layered(_) => None,
+        }
+    }
+
+    fn as_packfetch(&self) -> Option<&NifPackFetch> {
+        match self {
+            Self::PackFetch(store) => Some(store.as_ref()),
+            Self::Local(_) | Self::Static(_) | Self::Provider(_) | Self::Layered(_) => None,
         }
     }
 
@@ -230,10 +310,12 @@ impl ObjectDb for SharedStore {
     fn refresh(&self, budget: &Budget) -> Result<(), Error> {
         match &self.0 .0 {
             StoreImpl::Provider(_) | StoreImpl::Layered(_) => self.as_dyn().refresh(budget),
-            StoreImpl::Local(_) | StoreImpl::Static(_) => Err(Error::new(
-                ErrorCode::UnsupportedOperation,
-                "object store does not support refresh",
-            )),
+            StoreImpl::Local(_) | StoreImpl::Static(_) | StoreImpl::PackFetch(_) => {
+                Err(Error::new(
+                    ErrorCode::UnsupportedOperation,
+                    "object store does not support refresh",
+                ))
+            }
         }
     }
 }
@@ -507,6 +589,16 @@ struct ProviderStoreOptions {
     negative_ttl_ms: u64,
 }
 
+#[derive(NifMap)]
+struct PackFetchStoreOptions<'a> {
+    request_timeout_ms: u64,
+    destination: Binary<'a>,
+    chunk_bytes: u64,
+    concurrency: u64,
+    max_bytes: Option<u64>,
+    cleanup_destination: bool,
+}
+
 #[derive(Clone, Copy, NifMap)]
 struct LayeredCacheOptions {
     max_bytes: u64,
@@ -613,6 +705,29 @@ struct StatsMap {
     scanned_blobs: u64,
     elapsed_ms: u64,
     stopped_by: Option<Atom>,
+}
+
+#[derive(NifMap)]
+struct ByteRangeMap<'a> {
+    key: Binary<'a>,
+    offset: u64,
+    length: u64,
+}
+
+#[derive(NifMap)]
+struct HydrationStatsMap {
+    generation: String,
+    packs_hydrated: u64,
+    bytes_fetched: u64,
+    bytes_verified: u64,
+    packs_skipped: u64,
+    replaced_corrupt: u64,
+    manifest_ms: u64,
+    fetch_ms: u64,
+    verify_ms: u64,
+    write_ms: u64,
+    open_ms: u64,
+    elapsed_ms: u64,
 }
 
 #[derive(NifMap)]
@@ -932,6 +1047,53 @@ fn provider_store_new<'a>(
 }
 
 #[rustler::nif]
+fn packfetch_store_new<'a>(
+    env: Env<'a>,
+    hash: Atom,
+    opts: PackFetchStoreOptions<'a>,
+) -> NifResult<Term<'a>> {
+    let hash = match parse_hash(hash) {
+        Ok(hash) => hash,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let concurrency = match usize::try_from(opts.concurrency) {
+        Ok(value) if value > 0 => value,
+        _ => {
+            let error = Error::new(
+                ErrorCode::InvalidArgument,
+                "PackFetch concurrency must be a positive platform-sized integer",
+            );
+            return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+        }
+    };
+    let pending = Arc::new(RangePendingTable::default());
+    let sender = NifRangeRequestSender {
+        provider: env.pid(),
+        pending: Arc::downgrade(&pending),
+    };
+    let transport = CallbackRangeTransport::new_with_pending(
+        sender,
+        pending,
+        Duration::from_millis(opts.request_timeout_ms),
+    );
+    let options = PackFetchOptions {
+        destination: Path::new(OsStr::from_bytes(opts.destination.as_slice())).to_path_buf(),
+        chunk_bytes: opts.chunk_bytes,
+        concurrency,
+        max_bytes: opts.max_bytes,
+        cleanup_destination: opts.cleanup_destination,
+    };
+    match PackFetchOdb::new(hash, options, transport) {
+        Ok(store) => Ok(Result::<_, ErrorMap>::Ok((
+            ResourceArc::new(StoreResource(StoreImpl::PackFetch(Box::new(store)))),
+            hash_atom(hash),
+        ))
+        .encode(env)),
+        Err(error) => Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    }
+}
+
+#[rustler::nif]
 fn layered_store_new<'a>(
     env: Env<'a>,
     stores: Vec<ResourceArc<StoreResource>>,
@@ -1008,10 +1170,31 @@ fn provider_reply(request: ResourceArc<RequestResource>, reply: Term<'_>) -> Ato
     atoms::ok()
 }
 
+/// Copies range replies on a dirty CPU scheduler after exact byte-count
+/// preflight. The ordered vector handed to core follows request order even
+/// though the public backend contract returns a map.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn range_reply(request: ResourceArc<RangeRequestResource>, reply: Term<'_>) -> Atom {
+    let Some(pending) = request.pending.upgrade() else {
+        return atoms::ok();
+    };
+    match decode_range_reply(&request, reply) {
+        Ok(payload) => {
+            pending.reply(request.id, payload);
+        }
+        Err(error) => {
+            pending.reply_error(request.id, error);
+        }
+    }
+    atoms::ok()
+}
+
 #[rustler::nif]
 fn provider_failed(store: ResourceArc<StoreResource>) -> Atom {
     if let Some(provider) = store.0.as_provider() {
         provider.provider_down();
+    } else if let Some(packfetch) = store.0.as_packfetch() {
+        packfetch.provider_down();
     }
     atoms::ok()
 }
@@ -1022,7 +1205,7 @@ fn provider_refresh<'a>(env: Env<'a>, store: ResourceArc<StoreResource>) -> NifR
         StoreImpl::Provider(_) | StoreImpl::Layered(_) => {
             store.0.as_dyn().refresh(&Budget::unlimited())
         }
-        StoreImpl::Local(_) | StoreImpl::Static(_) => Err(Error::new(
+        StoreImpl::Local(_) | StoreImpl::Static(_) | StoreImpl::PackFetch(_) => Err(Error::new(
             ErrorCode::UnsupportedOperation,
             "refresh is supported only for provider and layered stores",
         )),
@@ -1031,6 +1214,211 @@ fn provider_refresh<'a>(env: Env<'a>, store: ResourceArc<StoreResource>) -> NifR
         Ok(()) => Result::<(), ErrorMap>::Ok(()).encode(env),
         Err(error) => Result::<(), _>::Err(error_map(env, error)?).encode(env),
     })
+}
+
+#[rustler::nif]
+fn packfetch_stats<'a>(env: Env<'a>, store: ResourceArc<StoreResource>) -> NifResult<Term<'a>> {
+    let Some(packfetch) = store.0.as_packfetch() else {
+        let error = Error::new(
+            ErrorCode::UnsupportedOperation,
+            "hydration stats are available only for PackFetch stores",
+        );
+        return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+    };
+    Ok(Result::<_, ErrorMap>::Ok(hydration_stats_map(packfetch.stats())).encode(env))
+}
+
+fn decode_range_reply(
+    request: &RangeRequestResource,
+    reply: Term<'_>,
+) -> Result<RangePayload, Error> {
+    let tuple = get_tuple(reply).map_err(|_| range_protocol_error("invalid reply envelope"))?;
+    if tuple.len() != 2 {
+        return Err(range_protocol_error("invalid reply envelope"));
+    }
+    let tag = tuple[0]
+        .decode::<Atom>()
+        .map_err(|_| range_protocol_error("invalid reply envelope"))?;
+    if tag == atoms::error() {
+        return Ok(RangePayload::BackendError);
+    }
+    if tag != atoms::ok() {
+        return Err(range_protocol_error("invalid reply envelope"));
+    }
+
+    match &request.expected {
+        RangeRequestKind::Manifest => decode_pack_manifest(tuple[1]).map(RangePayload::Manifest),
+        RangeRequestKind::ReadRanges(expected) => {
+            let iterator = MapIterator::new(tuple[1])
+                .ok_or_else(|| range_protocol_error("read_ranges reply must be a map"))?;
+            let expected_set = expected.iter().cloned().collect::<HashSet<_>>();
+            let mut seen = HashSet::with_capacity(expected.len());
+            let mut total = 0u64;
+            for (range_term, bytes_term) in iterator {
+                let range = decode_byte_range(range_term)?;
+                if !expected_set.contains(&range) || !seen.insert(range.clone()) {
+                    return Err(range_protocol_error(
+                        "read_ranges reply contains an unexpected or duplicate range",
+                    ));
+                }
+                let bytes = Binary::decode(bytes_term).map_err(|_| {
+                    range_protocol_error("read_ranges reply values must be binaries")
+                })?;
+                if bytes.len() as u64 != range.length {
+                    return Err(range_protocol_error(
+                        "read_ranges reply contains a short or over-long binary",
+                    ));
+                }
+                total = total.checked_add(bytes.len() as u64).ok_or_else(|| {
+                    range_protocol_error("read_ranges reply byte total overflows u64")
+                })?;
+                if total > request.max_reply_bytes {
+                    return Err(range_protocol_error(
+                        "read_ranges reply exceeds the requested byte total",
+                    ));
+                }
+            }
+            if seen.len() != expected_set.len() || total != request.max_reply_bytes {
+                return Err(range_protocol_error(
+                    "read_ranges reply is incomplete or has the wrong byte total",
+                ));
+            }
+
+            // Only after the complete map has passed the exact size/key
+            // preflight do we copy BEAM binaries into Rust-owned storage.
+            let iterator = MapIterator::new(tuple[1])
+                .ok_or_else(|| range_protocol_error("read_ranges reply must be a map"))?;
+            let mut decoded = HashMap::with_capacity(expected.len());
+            for (range_term, bytes_term) in iterator {
+                let range = decode_byte_range(range_term)?;
+                let bytes = Binary::decode(bytes_term).map_err(|_| {
+                    range_protocol_error("read_ranges reply values must be binaries")
+                })?;
+                decoded.insert(range, bytes.as_slice().to_vec());
+            }
+            let ordered = expected
+                .iter()
+                .map(|range| {
+                    decoded.remove(range).ok_or_else(|| {
+                        range_protocol_error("read_ranges reply omitted a requested range")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(RangePayload::Ranges(ordered))
+        }
+    }
+}
+
+fn decode_pack_manifest(term: Term<'_>) -> Result<PackManifest, Error> {
+    let version = term
+        .map_get(atoms::version())
+        .and_then(u32::decode)
+        .map_err(|_| range_protocol_error("pack manifest version is invalid"))?;
+    let generation = decode_utf8_map_binary(term, atoms::generation(), "generation")?;
+    let hash = term
+        .map_get(atoms::hash())
+        .and_then(Atom::decode)
+        .map_err(|_| range_protocol_error("pack manifest hash is invalid"))?;
+    let hash = if hash == atoms::sha1() {
+        HashKind::Sha1
+    } else if hash == atoms::sha256() {
+        HashKind::Sha256
+    } else {
+        return Err(range_protocol_error("pack manifest hash kind is unknown"));
+    };
+    let pack_terms = term
+        .map_get(atoms::packs())
+        .and_then(Vec::<Term<'_>>::decode)
+        .map_err(|_| range_protocol_error("pack manifest packs must be a list"))?;
+    let mut packs = Vec::with_capacity(pack_terms.len());
+    for pack in pack_terms {
+        packs.push(PackDescriptor {
+            id: decode_utf8_map_binary(pack, atoms::id(), "id")?,
+            pack_key: decode_utf8_map_binary(pack, atoms::pack_key(), "pack_key")?,
+            index_key: decode_utf8_map_binary(pack, atoms::index_key(), "index_key")?,
+            pack_size: pack
+                .map_get(atoms::pack_size())
+                .and_then(u64::decode)
+                .map_err(|_| range_protocol_error("pack_size is invalid"))?,
+            index_size: pack
+                .map_get(atoms::index_size())
+                .and_then(u64::decode)
+                .map_err(|_| range_protocol_error("index_size is invalid"))?,
+            etag: decode_optional_utf8_map_binary(pack, atoms::etag(), "etag")?,
+        });
+    }
+    let loose_terms = term
+        .map_get(atoms::loose())
+        .and_then(Vec::<Term<'_>>::decode)
+        .map_err(|_| range_protocol_error("pack manifest loose must be a list"))?;
+    let loose = loose_terms
+        .into_iter()
+        .map(|value| decode_utf8_binary(value, "loose key"))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PackManifest {
+        version,
+        generation,
+        hash,
+        packs,
+        loose,
+    })
+}
+
+fn decode_byte_range(term: Term<'_>) -> Result<CoreByteRange, Error> {
+    Ok(CoreByteRange {
+        key: decode_utf8_map_binary(term, atoms::key(), "range key")?,
+        offset: term
+            .map_get(atoms::offset())
+            .and_then(u64::decode)
+            .map_err(|_| range_protocol_error("range offset is invalid"))?,
+        length: term
+            .map_get(atoms::length())
+            .and_then(u64::decode)
+            .map_err(|_| range_protocol_error("range length is invalid"))?,
+    })
+}
+
+fn decode_utf8_map_binary(term: Term<'_>, key: Atom, name: &'static str) -> Result<String, Error> {
+    let value = term
+        .map_get(key)
+        .map_err(|_| range_protocol_error("pack manifest map is missing a field"))?;
+    decode_utf8_binary(value, name)
+}
+
+fn decode_optional_utf8_map_binary(
+    term: Term<'_>,
+    key: Atom,
+    name: &'static str,
+) -> Result<Option<String>, Error> {
+    let value = term
+        .map_get(key)
+        .map_err(|_| range_protocol_error("pack descriptor is missing etag"))?;
+    if value.is_atom()
+        && value
+            .decode::<Atom>()
+            .is_ok_and(|atom| atom == atoms::nil())
+    {
+        Ok(None)
+    } else {
+        decode_utf8_binary(value, name).map(Some)
+    }
+}
+
+fn decode_utf8_binary(term: Term<'_>, name: &'static str) -> Result<String, Error> {
+    let bytes = Binary::decode(term)
+        .map_err(|_| range_protocol_error("pack manifest strings must be binaries"))?;
+    std::str::from_utf8(bytes.as_slice())
+        .map(str::to_owned)
+        .map_err(|_| {
+            Error::new(
+                ErrorCode::ProviderProtocolError,
+                format!("{name} is not UTF-8"),
+            )
+        })
+}
+
+fn range_protocol_error(message: &'static str) -> Error {
+    Error::new(ErrorCode::ProviderProtocolError, message)
 }
 
 fn decode_provider_reply(
@@ -1415,6 +1803,59 @@ fn job_submit_odb_read_many<'a>(
 }
 
 #[rustler::nif]
+fn packfetch_hydrate<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    store: ResourceArc<StoreResource>,
+    limits: LimitsMap,
+) -> NifResult<Term<'a>> {
+    submit_packfetch_job(env, runtime, store, limits)
+}
+
+#[rustler::nif]
+fn packfetch_refresh<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    store: ResourceArc<StoreResource>,
+    limits: LimitsMap,
+) -> NifResult<Term<'a>> {
+    submit_packfetch_job(env, runtime, store, limits)
+}
+
+fn submit_packfetch_job<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    store: ResourceArc<StoreResource>,
+    limits: LimitsMap,
+) -> NifResult<Term<'a>> {
+    if store.0.as_packfetch().is_none() {
+        let error = Error::new(
+            ErrorCode::InvalidArgument,
+            "expected a PackFetch object store",
+        );
+        return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+    }
+    let task_store = store.clone();
+    let task = Box::new(move |budget: &Budget| {
+        task_store
+            .0
+            .as_packfetch()
+            .expect("store kind checked before submission")
+            .hydrate(budget)
+            .map(JobOutput::Hydration)
+    });
+    submit_job(
+        env,
+        runtime,
+        false,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Other,
+        task,
+    )
+}
+
+#[rustler::nif]
 fn job_submit_snapshot_open<'a>(
     env: Env<'a>,
     runtime: ResourceArc<RuntimeResource>,
@@ -1771,6 +2212,7 @@ fn encode_job_output<'a>(
             tree_oid: binary(env, snapshot.tree_oid.as_bytes()),
         }
         .encode(env),
+        JobOutput::Hydration(stats) => hydration_stats_map(stats).encode(env),
     };
     Ok(term)
 }
@@ -1809,6 +2251,7 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
         JobOutput::Oid(oid) => length(oid.as_bytes()),
         JobOutput::Snapshot(snapshot) => length(snapshot.commit_oid.as_bytes())
             .saturating_add(length(snapshot.tree_oid.as_bytes())),
+        JobOutput::Hydration(stats) => length(stats.generation.as_bytes()).saturating_add(96),
     }
 }
 
@@ -1906,6 +2349,23 @@ fn stats_map(
                 limit_atom(limit)
             }
         }),
+    }
+}
+
+fn hydration_stats_map(stats: HydrationStats) -> HydrationStatsMap {
+    HydrationStatsMap {
+        generation: stats.generation,
+        packs_hydrated: stats.packs_hydrated,
+        bytes_fetched: stats.bytes_fetched,
+        bytes_verified: stats.bytes_verified,
+        packs_skipped: stats.packs_skipped,
+        replaced_corrupt: stats.replaced_corrupt,
+        manifest_ms: stats.manifest_ms,
+        fetch_ms: stats.fetch_ms,
+        verify_ms: stats.verify_ms,
+        write_ms: stats.write_ms,
+        open_ms: stats.open_ms,
+        elapsed_ms: stats.elapsed_ms,
     }
 }
 
@@ -2086,6 +2546,7 @@ mod atoms {
         owner_ceiling,
         not_found,
         gitility_provider_request,
+        gitility_range_request,
         sha1,
         sha256,
         commit,
@@ -2099,6 +2560,23 @@ mod atoms {
         header,
         object,
         prefetch,
+        manifest,
+        read_ranges,
+        version,
+        generation,
+        hash,
+        packs,
+        loose,
+        id,
+        pack_key,
+        index_key,
+        pack_size,
+        index_size,
+        etag,
+        key,
+        offset,
+        length,
+        nil,
         algorithm,
         bytes,
         oid,

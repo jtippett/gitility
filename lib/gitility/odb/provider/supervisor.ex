@@ -18,51 +18,46 @@ defmodule Gitility.ODB.Provider.Supervisor do
     provider_name = {:global, {Provider, id}}
     task_name = {:global, {Provider, id, TaskSupervisor}}
     watchdog_name = {:global, {Provider, id, Gitility.ODB.Watchdog}}
-    caller = self()
-    handshake = make_ref()
+    {backend, init_arg} = Keyword.fetch!(opts, :backend)
 
-    configured_opts =
-      opts
-      |> Keyword.put(:provider_name, provider_name)
-      |> Keyword.put(:task_supervisor, task_name)
-      |> Keyword.put(:watchdog, watchdog_name)
+    # Run the backend's init/1 HERE, in the caller, before any process
+    # exists. A backend init failure must come back as {:error, reason} and
+    # must not kill the caller — but a child that fails init inside
+    # Supervisor.start_link exits the (linked, non-trapping) caller with
+    # {:shutdown, ...}, which is standard OTP. An earlier version isolated
+    # that with a bootstrap "starter" process that started the tree and then
+    # handed the link over. That broke a more fundamental contract: the tree's
+    # OTP parent was the starter, not the caller, so a parent supervisor's
+    # :shutdown exit signal (Supervisor.stop, stop_supervised!, orderly app
+    # shutdown) was ignored as a mere linked-process death and the tree never
+    # stopped — masked as a 5 s worker timeout until the child_spec was
+    # correctly typed :supervisor (shutdown: :infinity), at which point every
+    # supervised stop hung forever. Validating init up front keeps both
+    # properties: the caller starts the tree directly and IS its parent.
+    case run_backend_init(backend, init_arg) do
+      {:ok, backend_state} ->
+        configured_opts =
+          opts
+          |> Keyword.put(:provider_name, provider_name)
+          |> Keyword.put(:task_supervisor, task_name)
+          |> Keyword.put(:watchdog, watchdog_name)
+          |> Keyword.put(:backend_state, backend_state)
 
-    # Isolate child-init exits until Supervisor.start_link has a result. On
-    # success the caller links before this bootstrap process releases its own
-    # link, preserving normal start_link semantics without letting a backend
-    # init failure kill the caller instead of returning {:error, reason}.
-    starter =
-      spawn(fn ->
-        Process.flag(:trap_exit, true)
+        Supervisor.start_link(__MODULE__, configured_opts, name: supervisor_name)
 
-        case Supervisor.start_link(__MODULE__, configured_opts, name: supervisor_name) do
-          {:ok, supervisor} ->
-            send(caller, {handshake, {:ok, supervisor}, self()})
-
-            receive do
-              {^handshake, :caller_linked} -> Process.unlink(supervisor)
-            after
-              5_000 -> Supervisor.stop(supervisor)
-            end
-
-          {:error, reason} ->
-            send(caller, {handshake, {:error, reason}, self()})
-        end
-      end)
-
-    receive do
-      {^handshake, {:ok, supervisor}, ^starter} ->
-        Process.link(supervisor)
-        send(starter, {handshake, :caller_linked})
-        {:ok, supervisor}
-
-      {^handshake, {:error, reason}, ^starter} ->
-        {:error, reason}
-    after
-      5_000 ->
-        Process.exit(starter, :kill)
-        {:error, :timeout}
+      {:error, _reason} = error ->
+        error
     end
+  end
+
+  defp run_backend_init(backend, init_arg) do
+    case backend.init(init_arg) do
+      {:ok, backend_state} -> {:ok, backend_state}
+      {:error, reason} -> {:error, {:backend_init, reason}}
+      other -> {:error, {:backend_init, {:invalid_return, other}}}
+    end
+  rescue
+    exception -> {:error, {:backend_init, {:raised, Exception.message(exception)}}}
   end
 
   @impl Supervisor

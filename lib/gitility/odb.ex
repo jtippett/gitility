@@ -17,6 +17,8 @@ defmodule Gitility.ODB do
       generated repos, callers already holding objects.
     * **Provider** — objects served by your `Gitility.ODB.Backend`
       implementation (`start_link/1`): any storage, no filesystem.
+    * **PackFetch** — immutable packs eagerly hydrated through a
+      `Gitility.ODB.RangeBackend` (`Gitility.ODB.PackFetch.start_link/1`).
     * **Layered** — read-through composition (`layer/1`), typically a
       `cache/1` layer in front of a remote store.
 
@@ -51,7 +53,7 @@ defmodule Gitility.ODB do
   module's functions.
   """
   @opaque t :: %__MODULE__{
-            kind: :local | :static | :provider | :layered,
+            kind: :local | :static | :provider | :pack_fetch | :layered,
             ref: term(),
             hash: OID.algorithm(),
             runtime: Gitility.Runtime.t()
@@ -65,6 +67,7 @@ defmodule Gitility.ODB do
     :runtime,
     :provider,
     :supervisor,
+    :limits,
     providers: [],
     contains_cache: false
   ]
@@ -182,16 +185,20 @@ defmodule Gitility.ODB do
   @spec handle(pid() | GenServer.name()) :: {:ok, t()} | {:error, Error.t()}
   def handle(pid_or_name) do
     with {:ok, supervisor} <- resolve_provider_supervisor(pid_or_name),
-         {:ok, {resource, hash, provider, runtime, _request_timeout}} <-
+         {:ok,
+          {resource, hash, provider, runtime, _request_timeout, callback_kind, packfetch_limits}} <-
            provider_handle(supervisor) do
+      kind = if callback_kind == :range, do: :pack_fetch, else: :provider
+
       {:ok,
        %__MODULE__{
-         kind: :provider,
+         kind: kind,
          ref: resource,
          hash: hash,
          runtime: runtime,
          provider: provider,
          supervisor: supervisor,
+         limits: packfetch_limits,
          providers: [provider]
        }}
     else
@@ -205,7 +212,11 @@ defmodule Gitility.ODB do
   def child_spec(opts) do
     %{
       id: Keyword.get(opts, :name) || {__MODULE__, make_ref()},
-      start: {__MODULE__, :start_link, [opts]}
+      start: {__MODULE__, :start_link, [opts]},
+      # start_link/1 returns a supervisor: declare it so a parent supervisor
+      # gives the tree its own orderly shutdown (shutdown: :infinity) instead
+      # of a worker's 5 s deadline.
+      type: :supervisor
     }
   end
 
@@ -344,6 +355,24 @@ defmodule Gitility.ODB do
   Local and static handles return `:unsupported_operation` in this milestone.
   """
   @spec refresh(t()) :: :ok | {:error, Error.t()}
+  def refresh(%__MODULE__{kind: :pack_fetch, ref: resource, runtime: runtime, limits: limits}) do
+    limits = limits || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+
+    case NativeSupport.await_sync(
+           fn ->
+             NativeSupport.submit_job(runtime, :packfetch_refresh, fn runtime_resource ->
+               Native.packfetch_refresh(runtime_resource, resource, limits_map)
+             end)
+           end,
+           limits.timeout_ms,
+           :packfetch_refresh
+         ) do
+      {:ok, _stats} -> :ok
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
   def refresh(%__MODULE__{kind: :provider, ref: resource, provider: provider}) do
     with :ok <- provider_refresh(provider),
          {:ok, nil} <- native_provider_refresh(resource) do
@@ -362,8 +391,24 @@ defmodule Gitility.ODB do
     {:error,
      Error.new(
        :unsupported_operation,
-       "refresh is supported only for provider and layered object stores",
+       "refresh is supported only for provider, PackFetch, and layered object stores",
        operation: :odb_refresh
+     )}
+  end
+
+  @doc "Returns the last completed PackFetch hydration or refresh statistics."
+  @spec stats(t()) :: {:ok, map()} | {:error, Error.t()}
+  def stats(%__MODULE__{kind: :pack_fetch, ref: resource}) do
+    case Native.packfetch_stats(resource) do
+      {:ok, stats} -> {:ok, stats}
+      {:error, error} -> {:error, NativeSupport.nif_error(error, :odb_stats)}
+    end
+  end
+
+  def stats(%__MODULE__{}) do
+    {:error,
+     Error.new(:unsupported_operation, "store does not expose hydration statistics",
+       operation: :odb_stats
      )}
   end
 
@@ -661,6 +706,7 @@ defmodule Gitility.ODB do
     stores
     |> Enum.flat_map(fn
       %__MODULE__{kind: :provider, provider: provider} when is_pid(provider) -> [provider]
+      %__MODULE__{kind: :pack_fetch, provider: provider} when is_pid(provider) -> [provider]
       %__MODULE__{kind: :layered, providers: providers} when is_list(providers) -> providers
       %__MODULE__{} -> []
     end)
@@ -783,6 +829,11 @@ defmodule Gitility.ODB do
        operation: :odb_handle
      )}
   end
+
+  # backend.init/1 now runs in the caller before the tree starts, so its
+  # failure arrives directly; the failed_to_start_child shape is kept for the
+  # remaining in-child failures.
+  defp provider_start_error({:backend_init, reason}), do: {:error, reason}
 
   defp provider_start_error(
          {:shutdown, {:failed_to_start_child, Provider, {:backend_init, reason}}}

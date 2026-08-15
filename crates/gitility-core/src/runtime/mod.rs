@@ -24,6 +24,7 @@ use crate::budget::{Budget, BudgetLimits};
 use crate::error::{Error, ErrorCode};
 use crate::file::FileRead;
 use crate::object::{ObjectHeader, ObjectKind, Oid};
+use crate::packfetch::HydrationStats;
 use crate::snapshot::Snapshot;
 use crate::tree::TreePage;
 pub use observer::TestObserver;
@@ -73,6 +74,7 @@ pub enum JobOutput {
     ReadMany(ReadManyOutput),
     Oid(Oid),
     Snapshot(Snapshot),
+    Hydration(HydrationStats),
 }
 
 /// One ordered batch of object reads, retaining missing entries as `None` and

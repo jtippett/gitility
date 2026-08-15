@@ -12,7 +12,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 const INTEGRITY_CHECK_INTERVAL_CHUNKS: usize = 16;
 
@@ -49,8 +49,9 @@ pub struct LocalOdbOptions {
 /// the Milestone 1 execution refusal.
 pub struct LocalOdb {
     hash: HashKind,
-    store: Arc<gix_odb::Store>,
-    object_dirs: Vec<PathBuf>,
+    objects: PathBuf,
+    store: RwLock<Arc<gix_odb::Store>>,
+    object_dirs: RwLock<Vec<PathBuf>>,
     verify_pack_checksums: bool,
     integrity: Mutex<Option<Result<(), Error>>>,
 }
@@ -59,7 +60,10 @@ impl std::fmt::Debug for LocalOdb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalOdb")
             .field("hash", &self.hash)
-            .field("object_directories", &self.object_dirs.len())
+            .field(
+                "object_directories",
+                &self.object_dirs.read().map_or(0, |paths| paths.len()),
+            )
             .field("verify_pack_checksums", &self.verify_pack_checksums)
             .finish_non_exhaustive()
     }
@@ -84,28 +88,7 @@ impl LocalOdb {
             ));
         }
 
-        let mut replacements = std::iter::empty::<(gix_hash::ObjectId, gix_hash::ObjectId)>();
-        let store = gix_odb::Store::at_opts(
-            objects.clone(),
-            &mut replacements,
-            gix_odb::store::init::Options {
-                object_hash: to_gix_hash(hash),
-                ..gix_odb::store::init::Options::default()
-            },
-        )
-        .map_err(|_| {
-            Error::new(
-                ErrorCode::BackendError,
-                "could not open local object database",
-            )
-        })?;
-        let mut object_dirs = vec![objects];
-        object_dirs.extend(store.alternate_db_paths().map_err(|_| {
-            Error::new(
-                ErrorCode::BackendError,
-                "could not resolve local object database alternates",
-            )
-        })?);
+        let (store, object_dirs) = open_dynamic_store(&objects, hash)?;
 
         let layout = RepositoryLayout {
             bare,
@@ -114,13 +97,45 @@ impl LocalOdb {
         Ok((
             Self {
                 hash,
-                store: Arc::new(store),
-                object_dirs,
+                objects,
+                store: RwLock::new(store),
+                object_dirs: RwLock::new(object_dirs),
                 verify_pack_checksums: options.verify_pack_checksums,
                 integrity: Mutex::new(None),
             },
             layout,
         ))
+    }
+
+    /// Opens an object directory directly, without requiring a repository
+    /// skeleton, configuration, refs, or a fabricated `HEAD`.
+    ///
+    /// This is the acquisition seam used by [`crate::packfetch::PackFetchOdb`]:
+    /// hydrated files live below `<destination>/objects/pack`, and the hash
+    /// algorithm is already authenticated by the decoded pack manifest.
+    pub fn open_objects_dir(
+        objects: impl AsRef<Path>,
+        hash: HashKind,
+        options: LocalOdbOptions,
+    ) -> Result<Self, Error> {
+        let objects = objects.as_ref().to_path_buf();
+        if !objects.is_dir() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "local object database path is not a directory",
+            ));
+        }
+
+        let (store, object_dirs) = open_dynamic_store(&objects, hash)?;
+
+        Ok(Self {
+            hash,
+            objects,
+            store: RwLock::new(store),
+            object_dirs: RwLock::new(object_dirs),
+            verify_pack_checksums: options.verify_pack_checksums,
+            integrity: Mutex::new(None),
+        })
     }
 
     fn read_prologue(&self, oid: &Oid, budget: &Budget) -> Result<(), Error> {
@@ -145,7 +160,13 @@ impl LocalOdb {
             return result.clone();
         }
 
-        let result = verify_pack_files(&self.object_dirs, self.hash, budget);
+        let object_dirs = self.object_dirs.read().map_err(|_| {
+            Error::new(
+                ErrorCode::InternalError,
+                "local object database paths are unavailable",
+            )
+        })?;
+        let result = verify_pack_files(&object_dirs, self.hash, budget);
         let transient_budget_failure = matches!(
             result.as_ref().err().map(|error| error.code),
             Some(ErrorCode::Cancelled | ErrorCode::Timeout | ErrorCode::BudgetExceeded)
@@ -166,7 +187,8 @@ impl ObjectDb for LocalOdb {
         self.read_prologue(oid, budget)?;
         budget.charge_header()?;
         let engine_oid = to_gix_oid(oid)?;
-        let handle = self.store.to_handle_arc();
+        let store = self.store.read().map_err(|_| store_lock_error())?.clone();
+        let handle = store.to_handle_arc();
         let header = gix_object::FindHeader::try_header(&handle, engine_oid.as_ref())
             .map_err(map_find_error)?;
         Ok(header.map(|header| ObjectHeader {
@@ -185,7 +207,8 @@ impl ObjectDb for LocalOdb {
         self.read_prologue(oid, budget)?;
 
         let engine_oid = to_gix_oid(oid)?;
-        let handle = self.store.to_handle_arc();
+        let store = self.store.read().map_err(|_| store_lock_error())?.clone();
+        let handle = store.to_handle_arc();
         let Some(header) = gix_object::FindHeader::try_header(&handle, engine_oid.as_ref())
             .map_err(map_find_error)?
         else {
@@ -229,6 +252,9 @@ impl ObjectDb for LocalOdb {
 
     fn refresh(&self, budget: &Budget) -> Result<(), Error> {
         budget.check()?;
+        let (store, object_dirs) = open_dynamic_store(&self.objects, self.hash)?;
+        *self.store.write().map_err(|_| store_lock_error())? = store;
+        *self.object_dirs.write().map_err(|_| store_lock_error())? = object_dirs;
         let mut cached = self.integrity.lock().map_err(|_| {
             Error::new(
                 ErrorCode::InternalError,
@@ -238,6 +264,42 @@ impl ObjectDb for LocalOdb {
         *cached = None;
         Ok(())
     }
+}
+
+fn open_dynamic_store(
+    objects: &Path,
+    hash: HashKind,
+) -> Result<(Arc<gix_odb::Store>, Vec<PathBuf>), Error> {
+    let mut replacements = std::iter::empty::<(gix_hash::ObjectId, gix_hash::ObjectId)>();
+    let store = gix_odb::Store::at_opts(
+        objects.to_path_buf(),
+        &mut replacements,
+        gix_odb::store::init::Options {
+            object_hash: to_gix_hash(hash),
+            ..gix_odb::store::init::Options::default()
+        },
+    )
+    .map_err(|_| {
+        Error::new(
+            ErrorCode::BackendError,
+            "could not open local object database",
+        )
+    })?;
+    let mut object_dirs = vec![objects.to_path_buf()];
+    object_dirs.extend(store.alternate_db_paths().map_err(|_| {
+        Error::new(
+            ErrorCode::BackendError,
+            "could not resolve local object database alternates",
+        )
+    })?);
+    Ok((Arc::new(store), object_dirs))
+}
+
+fn store_lock_error() -> Error {
+    Error::new(
+        ErrorCode::InternalError,
+        "local object database store is unavailable",
+    )
 }
 
 fn verify_pack_files(
@@ -687,6 +749,77 @@ mod tests {
                 .0,
             ObjectKind::Blob
         );
+    }
+
+    #[test]
+    fn opens_an_objects_directory_without_repository_skeleton() {
+        let repository = fixture_repo("sha1-basic-packed.git");
+        let store = LocalOdb::open_objects_dir(
+            repository.join("objects"),
+            HashKind::Sha1,
+            LocalOdbOptions::default(),
+        )
+        .expect("objects-only store opens");
+        assert_eq!(
+            read(&store, &fixture_oid("sha1_basic_head"))
+                .expect("objects-only packed commit reads")
+                .0,
+            ObjectKind::Commit
+        );
+    }
+
+    #[test]
+    fn refresh_reopens_the_pack_inventory_without_disrupting_existing_reads() {
+        let repository = TempRepo::new(
+            b"[core]\n\tbare = true\n\trepositoryFormatVersion = 0\n",
+            None,
+        );
+        let destination = repository.0.join("objects/pack");
+        std::fs::create_dir_all(&destination).expect("pack directory is created");
+        copy_pack_pairs(&fixture_repo("sha1-basic-packed.git"), &destination);
+
+        let (store, _) = open(&repository.0).expect("initial pack inventory opens");
+        assert_eq!(
+            read(&store, &fixture_oid("sha1_basic_head"))
+                .expect("initial object remains readable")
+                .0,
+            ObjectKind::Commit
+        );
+
+        copy_pack_pairs(&fixture_repo("sha1-history-midx.git"), &destination);
+        store
+            .refresh(&Budget::unlimited())
+            .expect("refresh swaps in the enlarged pack inventory");
+        assert_eq!(
+            read(&store, &fixture_oid("sha1_history_head"))
+                .expect("newly published pack is readable after refresh")
+                .0,
+            ObjectKind::Commit
+        );
+        assert_eq!(
+            read(&store, &fixture_oid("sha1_basic_head"))
+                .expect("pre-refresh object remains readable")
+                .0,
+            ObjectKind::Commit
+        );
+    }
+
+    fn copy_pack_pairs(repository: &Path, destination: &Path) {
+        for entry in std::fs::read_dir(repository.join("objects/pack"))
+            .expect("fixture pack directory is readable")
+        {
+            let path = entry.expect("fixture pack entry is readable").path();
+            if matches!(
+                path.extension().and_then(OsStr::to_str),
+                Some("pack" | "idx")
+            ) {
+                std::fs::copy(
+                    &path,
+                    destination.join(path.file_name().expect("pack name")),
+                )
+                .expect("fixture pack artifact is copied");
+            }
+        }
     }
 
     #[test]

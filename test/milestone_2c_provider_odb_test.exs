@@ -185,8 +185,11 @@ defmodule Gitility.ProviderTestBackend do
 
   @impl true
   def terminate(_reason, agent) do
-    if Process.alive?(agent) do
-      case Agent.get(agent, & &1.terminate_observer) do
+    # Only the tests that pass `terminate_observer:` have that key; the
+    # conformance agent's state (provider_state/1) does not — and terminate/2
+    # genuinely runs now (Provider traps exits), so be tolerant.
+    if is_pid(agent) and Process.alive?(agent) do
+      case Agent.get(agent, &Map.get(&1, :terminate_observer)) do
         nil -> :ok
         observer -> send(observer, :provider_backend_terminated)
       end
@@ -440,7 +443,7 @@ defmodule Gitility.Milestone2cProviderOdbTest do
     assert_receive :provider_callback_entered, 1_000
 
     started = System.monotonic_time(:millisecond)
-    assert :ok = Supervisor.stop(odb.supervisor, :normal)
+    assert :ok = stop_provider(odb)
     assert {:error, %Error{code: :provider_down}} = Job.await(job, 1_000)
     assert System.monotonic_time(:millisecond) - started < 250
   end
@@ -465,7 +468,7 @@ defmodule Gitility.Milestone2cProviderOdbTest do
       reset_probe(agent, :hang, self())
       assert {:ok, job} = Gitility.async_list_tree(snapshot)
       assert_receive :provider_callback_entered, 1_000
-      assert :ok = Supervisor.stop(odb.supervisor, :normal)
+      assert :ok = stop_provider(odb)
       assert_receive :provider_backend_terminated, 500
       assert {:error, %Error{code: :provider_down}} = Job.await(job, 250)
     end
@@ -770,6 +773,24 @@ defmodule Gitility.Milestone2cProviderOdbTest do
              )
   end
 
+  # Stops a supervised provider for real (a plain Supervisor.stop on a
+  # :permanent test-supervisor child would RESTART it).
+  defp stop_provider(%ODB{} = odb) do
+    ref = Process.monitor(odb.supervisor)
+
+    {:ok, test_supervisor} = ExUnit.fetch_test_supervisor()
+
+    {id, _pid, _type, _modules} =
+      Enum.find(
+        Supervisor.which_children(test_supervisor),
+        fn {_id, pid, _type, _modules} -> pid == odb.supervisor end
+      )
+
+    :ok = stop_supervised!(id)
+    assert_receive {:DOWN, ^ref, :process, _, _}, 5_000
+    :ok
+  end
+
   defp start_provider(objects, opts \\ []) do
     agent = start_backend_agent(objects, opts)
 
@@ -786,33 +807,48 @@ defmodule Gitility.Milestone2cProviderOdbTest do
         ])
       )
 
-    assert {:ok, provider} = ODB.start_link(provider_opts)
+    provider =
+      start_supervised!(
+        Supervisor.child_spec({ODB, provider_opts},
+          id: {ODB, System.unique_integer([:positive])}
+        )
+      )
+
     assert {:ok, odb} = ODB.handle(provider)
 
     {odb, agent}
   end
 
+  # Backend agents and provider supervisors are started under the ExUnit test
+  # supervisor — never linked to the test process. A linked process's stop in
+  # on_exit races the test process's own exit signal (GenServer.stop sees
+  # :shutdown and the on_exit process exits) — ~1 in 12 full runs on Linux.
   defp start_backend_agent(objects, opts \\ []) do
-    {:ok, agent} =
-      Agent.start_link(fn ->
-        %{
-          objects: objects,
-          mode: Keyword.get(opts, :mode, :normal),
-          observer: Keyword.get(opts, :observer),
-          current: 0,
-          max: 0,
-          calls: 0,
-          header_kind: Keyword.get(opts, :header_kind),
-          header_size: Keyword.get(opts, :header_size),
-          prefetches: [],
-          refresh_mode: Keyword.get(opts, :refresh_mode, :normal),
-          refresh_calls: 0,
-          terminate_observer: Keyword.get(opts, :terminate_observer),
-          batches: []
-        }
-      end)
+    agent =
+      start_supervised!(
+        Supervisor.child_spec(
+          {Agent,
+           fn ->
+             %{
+               objects: objects,
+               mode: Keyword.get(opts, :mode, :normal),
+               observer: Keyword.get(opts, :observer),
+               current: 0,
+               max: 0,
+               calls: 0,
+               header_kind: Keyword.get(opts, :header_kind),
+               header_size: Keyword.get(opts, :header_size),
+               prefetches: [],
+               refresh_mode: Keyword.get(opts, :refresh_mode, :normal),
+               refresh_calls: 0,
+               terminate_observer: Keyword.get(opts, :terminate_observer),
+               batches: []
+             }
+           end},
+          id: {Agent, System.unique_integer([:positive])}
+        )
+      )
 
-    on_exit(fn -> if Process.alive?(agent), do: Agent.stop(agent) end)
     agent
   end
 

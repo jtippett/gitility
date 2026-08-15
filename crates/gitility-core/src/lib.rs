@@ -22,6 +22,7 @@ pub mod local_odb;
 pub mod lru;
 pub mod object;
 pub mod odb;
+pub mod packfetch;
 pub mod pathspec;
 pub mod provider_odb;
 pub mod refs;
@@ -46,6 +47,11 @@ pub use local_odb::{LocalOdb, LocalOdbOptions, RepositoryLayout};
 pub use object::{HashKind, ObjectHeader, ObjectKind, Oid};
 pub use odb::{
     CacheStats, HeaderProvenance, HeaderRead, ObjectDb, ObjectReadResult, ReadManyBudget,
+};
+pub use packfetch::{
+    ByteRange, CallbackRangeTransport, HydrationStats, PackDescriptor, PackFetchOdb,
+    PackFetchOptions, PackManifest, RangePayload, RangePendingTable, RangeReplySlot, RangeRequest,
+    RangeRequestKind, RangeRequestSender, RangeTransport,
 };
 pub use provider_odb::{
     PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions,

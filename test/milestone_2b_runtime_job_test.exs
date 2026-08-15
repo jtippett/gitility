@@ -20,15 +20,13 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
   end
 
   test "named runtimes execute attached-store queries and expose moving counters", context do
-    {:ok, runtime} =
-      Runtime.start_link(
+    _runtime =
+      start_runtime(
         name: Gitility.Milestone2bNamedRuntime,
         workers: 1,
         max_queue: 8,
         max_jobs_per_owner: 4
       )
-
-    on_exit(fn -> stop_runtime(runtime) end)
 
     snapshot =
       snapshot(context.small_objects, context.small_commit, Gitility.Milestone2bNamedRuntime)
@@ -280,7 +278,10 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
     assert eventually(
              fn -> Runtime.stats().thread_budget_used == thread_budget_before_soak end,
              @shutdown_join_timeout_ms + @supervisor_shutdown_margin_ms
-           )
+           ),
+           "thread budget did not return to its pre-soak value: before=#{thread_budget_before_soak} " <>
+             "after=#{Runtime.stats().thread_budget_used} " <>
+             "(runtimes alive? #{inspect(Enum.map(runtimes, &Process.alive?/1))})"
   end
 
   defp soak_loop(snapshots, deadline, iteration) do
@@ -334,24 +335,36 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
 
   defp submit_from_process(snapshot, opts), do: submit_then_exit(snapshot, opts)
 
+  # Runtimes are started under the ExUnit test supervisor, never linked to
+  # the test process: a linked runtime cannot be stopped cleanly from
+  # `on_exit` (the test process has already exited and its exit signal
+  # reaches the runtime first, so `GenServer.stop` sees `:shutdown`) — the
+  # old helper's `catch :exit` was hiding exactly that.
+  #
+  # Stopping goes through the supervisor too. `GenServer.stop` on a
+  # `:permanent` supervised child is a RESTART, not a stop — the first Linux
+  # soak run "leaked" exactly one restarted runtime's worth of thread-budget
+  # slots that way (see docs/reports/2026-08-14-kernel-panic-thread-leak.md
+  # for why the budget assertion exists). `stop_supervised!` terminates and
+  # deletes the child through the real `child_spec/1` shutdown window from
+  # the incident hardening — a wedged shutdown surfaces as an ExUnit failure
+  # here instead of being swallowed.
   defp start_runtime(opts) do
-    {:ok, runtime} = Runtime.start_link(opts)
-    shutdown_join_timeout_ms =
-      Keyword.get(opts, :shutdown_join_timeout_ms, @shutdown_join_timeout_ms)
-
-    on_exit(fn -> stop_runtime(runtime, shutdown_join_timeout_ms) end)
-    runtime
+    id = {Runtime, System.unique_integer([:positive])}
+    pid = start_supervised!(Supervisor.child_spec({Runtime, opts}, id: id))
+    Process.put({:runtime_child_id, pid}, id)
+    pid
   end
 
-  defp stop_runtime(runtime, shutdown_join_timeout_ms \\ @shutdown_join_timeout_ms) do
+  defp stop_runtime(runtime, _shutdown_join_timeout_ms \\ @shutdown_join_timeout_ms) do
     if Process.alive?(runtime) do
-      stopper = Task.async(fn -> GenServer.stop(runtime) end)
+      id =
+        Process.get({:runtime_child_id, runtime}) ||
+          raise "runtime #{inspect(runtime)} was not started via start_runtime/1"
 
-      assert :ok =
-               Task.await(
-                 stopper,
-                 shutdown_join_timeout_ms + @supervisor_shutdown_margin_ms
-               )
+      ref = Process.monitor(runtime)
+      :ok = stop_supervised!(id)
+      assert_receive {:DOWN, ^ref, :process, ^runtime, _reason}, @supervisor_shutdown_margin_ms
     end
 
     :ok

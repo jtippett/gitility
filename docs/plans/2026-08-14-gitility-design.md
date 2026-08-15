@@ -927,6 +927,25 @@ RAM-backed tmpfs. `refresh/1` re-reads the manifest and fetches only packs it
 has not seen; packs removed from the manifest remain on disk during the 0.2
 publisher grace period and are never deleted by refresh.
 
+Hydration has its own `max_hydration_bytes` ceiling (4 GiB by default),
+separate from `Gitility.Limits.max_provider_bytes` (the 256 MiB per-job
+query-time safety ceiling). This is deliberate: hydration is a one-time bulk
+load explicitly requested by the caller. PackFetch verifies existing pairs
+and computes its acquisition plan first, then charges only missing or corrupt
+pairs plus manifest metadata against the hydration ceiling; a fully warm
+volume is not rejected for the manifest's total size. Hydration ends with an
+open-time probe of one object header per pack: acquisition checksums prove
+bytes, while the probe proves gix can read them. A failed probe removes that destination pair so the
+next attempt fetches it again.
+
+Verification caching is process-local and intentionally leaves no trusted
+marker on disk: refresh is O(new packs) within a store's lifetime, while open
+is O(store) because a new store instance re-verifies the reused volume once.
+If a later pack in a multi-pack hydration fails, earlier checksum-verified
+pairs remain under their final names and are reused on retry; no unverified
+artifact is published under a final name. Queries and prior packs remain
+readable while refresh builds and verifies the replacement local-store handle.
+
 ### Single-file bundles — `Gitility.Bundle`
 
 A repository published for querying is naturally several artifacts: packs,

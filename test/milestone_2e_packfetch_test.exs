@@ -119,8 +119,16 @@ defmodule Gitility.TrackingRangeBackend do
 
   @impl true
   def init({delegate, arg, tracker, mode}) do
-    with {:ok, state} <- delegate.init(arg) do
-      {:ok, %{delegate: delegate, state: state, tracker: tracker, mode: mode}}
+    with {:ok, state} <- delegate.init(arg),
+         {:ok, manifest} <- delegate.manifest(state) do
+      {:ok,
+       %{
+         delegate: delegate,
+         state: state,
+         tracker: tracker,
+         mode: mode,
+         second_pack_key: manifest.packs |> Enum.at(1) |> then(&if(&1, do: &1.pack_key))
+       }}
     end
   end
 
@@ -154,6 +162,16 @@ defmodule Gitility.TrackingRangeBackend do
         pack = hd(manifest.packs)
         {:ok, %{manifest | packs: [%{pack | pack_size: 50 * 1024 * 1024 * 1024}]}}
 
+      :synthetic_300m_manifest ->
+        pack = hd(manifest.packs)
+        {:ok, %{manifest | packs: [%{pack | pack_size: 300 * 1024 * 1024}]}}
+
+      :non_empty_loose ->
+        {:ok, %{manifest | loose: ["objects/00/not-supported"]}}
+
+      :too_many_manifest_entries ->
+        {:ok, %{manifest | loose: List.duplicate("x", 100_001)}}
+
       _other ->
         {:ok, manifest}
     end
@@ -166,7 +184,7 @@ defmodule Gitility.TrackingRangeBackend do
     try do
       maybe_block(config.mode, tracking, ranges)
       result = config.delegate.read_ranges(ranges, config.state)
-      mutate(result, ranges, config.mode)
+      mutate(result, ranges, config)
     after
       leave(config.tracker)
     end
@@ -192,7 +210,7 @@ defmodule Gitility.TrackingRangeBackend do
           read_calls: state.read_calls + 1
       }
 
-      {next, next}
+      {next, %{next | block_once: false}}
     end)
   end
 
@@ -218,27 +236,46 @@ defmodule Gitility.TrackingRangeBackend do
     end
   end
 
+  defp maybe_block({:controlled_latch, observer}, %{block_once: true}, _ranges) do
+    send(observer, {:range_backend_waiting, self()})
+
+    receive do
+      :release -> :ok
+    end
+  end
+
   defp maybe_block(_mode, _tracking, _ranges), do: :ok
 
-  defp mutate({:ok, replies}, ranges, :short) do
+  defp mutate({:ok, replies}, ranges, %{mode: :short}) do
     target = Enum.find(ranges, &(&1.length > 0))
     {:ok, Map.update!(replies, target, &binary_part(&1, 0, byte_size(&1) - 1))}
   end
 
-  defp mutate({:ok, replies}, ranges, :overlong) do
+  defp mutate({:ok, replies}, ranges, %{mode: :overlong}) do
     target = Enum.find(ranges, &(&1.length > 0))
     {:ok, Map.update!(replies, target, &(&1 <> <<0>>))}
   end
 
-  defp mutate({:ok, replies}, ranges, :corrupt_pack) do
+  defp mutate({:ok, replies}, ranges, %{mode: :corrupt_pack}) do
     corrupt_matching(replies, ranges, ".pack")
   end
 
-  defp mutate({:ok, replies}, ranges, :corrupt_index) do
+  defp mutate({:ok, replies}, ranges, %{mode: :corrupt_index}) do
     corrupt_matching(replies, ranges, ".idx")
   end
 
-  defp mutate(result, _ranges, _mode), do: result
+  defp mutate({:ok, replies}, ranges, %{mode: :corrupt_second_pack} = config) do
+    corrupt_key(replies, ranges, config.second_pack_key)
+  end
+
+  defp mutate({:ok, replies}, ranges, %{mode: :forged_index}) do
+    case Enum.find(ranges, &String.ends_with?(&1.key, ".idx")) do
+      nil -> {:ok, replies}
+      range -> {:ok, Map.update!(replies, range, &forge_index_offsets/1)}
+    end
+  end
+
+  defp mutate(result, _ranges, _config), do: result
 
   defp corrupt_matching(replies, ranges, suffix) do
     case Enum.find(ranges, &(&1.length > 0 and String.ends_with?(&1.key, suffix))) do
@@ -248,6 +285,46 @@ defmodule Gitility.TrackingRangeBackend do
   end
 
   defp flip_first(<<first, rest::binary>>), do: <<Bitwise.bxor(first, 1), rest::binary>>
+
+  defp corrupt_key(replies, ranges, key) do
+    case Enum.find(ranges, &(&1.length > 0 and &1.key == key)) do
+      nil -> {:ok, replies}
+      range -> {:ok, Map.update!(replies, range, &flip_first/1)}
+    end
+  end
+
+  defp forge_index_offsets(bytes) do
+    <<count::unsigned-big-32>> = binary_part(bytes, 8 + 255 * 4, 4)
+    offset_table = 8 + 256 * 4 + count * 20 + count * 4
+    prefix_size = byte_size(bytes) - 20
+
+    forged = replace_binary_part(bytes, offset_table, <<0x7FFF_FFFF::unsigned-big-32>>)
+    prefix = binary_part(forged, 0, prefix_size)
+    prefix <> :crypto.hash(:sha, prefix)
+  end
+
+  defp replace_binary_part(bytes, offset, replacement) do
+    replacement_size = byte_size(replacement)
+    <<head::binary-size(offset), _old::binary-size(replacement_size), tail::binary>> = bytes
+    head <> replacement <> tail
+  end
+end
+
+defmodule Gitility.InitRangeBackend do
+  @behaviour Gitility.ODB.RangeBackend
+
+  @impl true
+  def init({:error, reason}), do: {:error, reason}
+  def init(:raise), do: raise("range init exploded")
+  def init(:throw), do: throw(:range_init_thrown)
+  def init(:exit), do: exit(:range_init_exited)
+  def init(:invalid), do: :invalid_init_return
+
+  @impl true
+  def manifest(_state), do: {:error, :unused}
+
+  @impl true
+  def read_ranges(_ranges, _state), do: {:error, :unused}
 end
 
 defmodule Gitility.BrokenRangeBackend do
@@ -302,6 +379,12 @@ defmodule Gitility.LocalDirectoryRangeConformanceTest do
 
   def backend_init_arg, do: :persistent_term.get({__MODULE__, :directory})
   def backend_artifacts, do: Gitility.RangeTestSupport.artifacts(backend_init_arg())
+
+  def backend_publish_artifact(directory, key, bytes) do
+    path = Path.join(directory, key)
+    :ok = File.mkdir_p(Path.dirname(path))
+    File.write(path, bytes)
+  end
 end
 
 defmodule Gitility.BrokenRangeConformanceTest do
@@ -375,19 +458,106 @@ defmodule Gitility.Milestone2ePackFetchTest do
     end
   end
 
+  test "publish preserves packed plus loose inventory and unreachable loose objects" do
+    published = publish("sha1-basic-mixed.git", "mixed")
+    destination = temp_dir("mixed-hydrated")
+
+    on_exit(fn ->
+      File.rm_rf(published)
+      File.rm_rf(destination)
+    end)
+
+    {:ok, state} = LocalDirectory.init(published)
+    {:ok, manifest} = LocalDirectory.manifest(state)
+    assert length(manifest.packs) == 2
+
+    [loose_path] =
+      fixture("sha1-basic-mixed.git")
+      |> Path.join("objects/??/*")
+      |> Path.wildcard()
+
+    loose_oid =
+      Path.basename(Path.dirname(loose_path)) <> Path.basename(loose_path)
+
+    {:ok, supervisor, odb} = start_packfetch(published, {:dir, destination})
+    assert {:ok, %Gitility.Object{oid: %Gitility.OID{} = oid}} = ODB.read(odb, loose_oid)
+    assert Gitility.OID.to_string(oid) == loose_oid
+    stop(supervisor)
+
+    repository_copy = temp_dir("unreachable-source.git")
+    payload = temp_dir("unreachable-payload")
+    published_copy = temp_dir("unreachable-published")
+    hydrated_copy = temp_dir("unreachable-hydrated")
+    File.cp_r!(fixture("sha1-basic.git"), repository_copy)
+    File.write!(payload, "unreachable but deliberately published\n")
+
+    on_exit(fn ->
+      File.rm_rf(repository_copy)
+      File.rm(payload)
+      File.rm_rf(published_copy)
+      File.rm_rf(hydrated_copy)
+    end)
+
+    {oid_text, 0} =
+      System.cmd("git", ["--git-dir", repository_copy, "hash-object", "-w", payload])
+
+    unreachable_oid = String.trim(oid_text)
+    :ok = LocalDirectory.publish(repository_copy, published_copy)
+
+    {:ok, copy_supervisor, copy_odb} =
+      start_packfetch(published_copy, {:dir, hydrated_copy})
+
+    assert {:ok, %Gitility.Object{data: "unreachable but deliberately published\n"}} =
+             ODB.read(copy_odb, unreachable_oid)
+
+    stop(copy_supervisor)
+  end
+
+  test "loose-object publishing reports a read-only source clearly" do
+    repository_copy = temp_dir("readonly-source.git")
+    destination = temp_dir("readonly-published")
+    payload = temp_dir("readonly-loose-payload")
+    File.cp_r!(fixture("sha1-basic.git"), repository_copy)
+    File.write!(payload, "force one loose object\n")
+
+    {_oid, 0} =
+      System.cmd("git", ["--git-dir", repository_copy, "hash-object", "-w", payload])
+
+    objects = Path.join(repository_copy, "objects")
+    original_mode = File.stat!(objects).mode
+    :ok = File.chmod(objects, 0o555)
+
+    on_exit(fn ->
+      File.chmod(objects, original_mode)
+      File.rm_rf(repository_copy)
+      File.rm_rf(destination)
+      File.rm(payload)
+    end)
+
+    assert {:error, :source_repository_read_only} =
+             LocalDirectory.publish(repository_copy, destination)
+  end
+
   test "Linux memory destination works and other platforms refuse it explicitly" do
-    published = publish("sha1-basic.git", "memory")
-    on_exit(fn -> File.rm_rf(published) end)
-
     if PackFetch.memory_supported?() do
-      {:ok, local} = Repository.open(fixture("sha1-basic.git"))
+      for {fixture_name, head, paths} <- [
+            {"sha1-basic.git", :sha1_basic_head, @basic_paths},
+            {"sha1-history-midx.git", :sha1_history_head, []}
+          ] do
+        published = publish(fixture_name, "memory-#{fixture_name}")
+        on_exit(fn -> File.rm_rf(published) end)
+        {:ok, local} = Repository.open(fixture(fixture_name))
 
-      {:ok, supervisor, remote} =
-        start_packfetch(published, :memory, max_bytes: 64 * 1024 * 1024)
+        {:ok, supervisor, remote} =
+          start_packfetch(published, :memory, max_bytes: 64 * 1024 * 1024)
 
-      parity!(local, remote, fixture_oid(:sha1_basic_head), @basic_paths)
-      stop(supervisor)
+        parity!(local, remote, fixture_oid(head), paths)
+        stop(supervisor)
+      end
     else
+      published = publish("sha1-basic.git", "memory-unsupported")
+      on_exit(fn -> File.rm_rf(published) end)
+
       assert {:error, %Error{code: :unsupported_operation, message: message}} =
                PackFetch.start_link(
                  backend: {LocalDirectory, published},
@@ -395,6 +565,46 @@ defmodule Gitility.Milestone2ePackFetchTest do
                )
 
       assert message =~ "{:dir, path}"
+    end
+  end
+
+  test "memory destinations are removed after orderly stop and supervisor kill" do
+    if PackFetch.memory_supported?() do
+      published = publish("sha1-basic.git", "memory-cleanup")
+      on_exit(fn -> File.rm_rf(published) end)
+
+      for mode <- [:stop, :kill] do
+        before = MapSet.new(Path.wildcard("/dev/shm/gitility-packfetch-*"))
+        name = {:global, {__MODULE__, :memory_cleanup, mode, make_ref()}}
+
+        {:ok, supervisor} =
+          PackFetch.start_link(
+            name: name,
+            backend: {LocalDirectory, published},
+            into: :memory,
+            max_bytes: 64 * 1024 * 1024
+          )
+
+        [destination] =
+          "/dev/shm/gitility-packfetch-*"
+          |> Path.wildcard()
+          |> MapSet.new()
+          |> MapSet.difference(before)
+          |> MapSet.to_list()
+
+        case mode do
+          :stop ->
+            stop(supervisor)
+
+          :kill ->
+            Process.unlink(supervisor)
+            monitor = Process.monitor(supervisor)
+            Process.exit(supervisor, :kill)
+            assert_receive {:DOWN, ^monitor, :process, ^supervisor, :killed}, 5_000
+        end
+
+        assert eventually(fn -> not File.exists?(destination) end, 5_000)
+      end
     end
   end
 
@@ -411,6 +621,65 @@ defmodule Gitility.Milestone2ePackFetchTest do
     assert message =~ "Gitility.Bundle"
   end
 
+  test "PackFetch is a supervisor child and stops promptly under a tree" do
+    published = publish("sha1-basic.git", "supervised")
+    destination = temp_dir("supervised")
+    id = {PackFetch, System.unique_integer([:positive])}
+
+    on_exit(fn ->
+      File.rm_rf(published)
+      File.rm_rf(destination)
+    end)
+
+    supervisor =
+      start_supervised!(
+        Supervisor.child_spec(
+          {PackFetch, backend: {LocalDirectory, published}, into: {:dir, destination}},
+          id: id
+        )
+      )
+
+    {:ok, test_supervisor} = ExUnit.fetch_test_supervisor()
+
+    assert {^id, ^supervisor, :supervisor, _modules} =
+             Enum.find(Supervisor.which_children(test_supervisor), fn {child_id, _, _, _} ->
+               child_id == id
+             end)
+
+    started = System.monotonic_time(:millisecond)
+    assert :ok = stop_supervised!(id)
+    assert System.monotonic_time(:millisecond) - started < 1_000
+  end
+
+  test "backend init errors, raises, throws, exits, and invalid returns stay distinguishable" do
+    options = fn mode ->
+      [
+        backend: {Gitility.InitRangeBackend, mode},
+        into: {:dir, temp_dir("init-#{inspect(mode)}")}
+      ]
+    end
+
+    assert {:error, :init_refused} = PackFetch.start_link(options.({:error, :init_refused}))
+
+    assert {:error, {:backend_init_raised, "range init exploded"}} =
+             PackFetch.start_link(options.(:raise))
+
+    assert {:error, {:backend_init_raised, throw_message}} =
+             PackFetch.start_link(options.(:throw))
+
+    assert throw_message =~ "throw"
+    assert throw_message =~ "range_init_thrown"
+
+    assert {:error, {:backend_init_raised, exit_message}} =
+             PackFetch.start_link(options.(:exit))
+
+    assert exit_message =~ "exit"
+    assert exit_message =~ "range_init_exited"
+
+    assert {:error, {:invalid_return, :invalid_init_return}} =
+             PackFetch.start_link(options.(:invalid))
+  end
+
   test "a reused destination verifies and skips every existing pack" do
     published = publish("sha1-history-midx.git", "reuse")
     destination = temp_dir("reuse")
@@ -424,7 +693,19 @@ defmodule Gitility.Milestone2ePackFetchTest do
     {:ok, first_stats} = ODB.stats(first_odb)
     stop(first)
 
-    {:ok, second, second_odb} = start_packfetch(published, {:dir, destination})
+    {:ok, backend_state} = LocalDirectory.init(published)
+    {:ok, manifest} = LocalDirectory.manifest(backend_state)
+
+    manifest_total =
+      manifest.packs
+      |> Enum.map(fn pack -> pack.pack_size + pack.index_size end)
+      |> Enum.sum()
+
+    warm_ceiling = manifest_total - 1
+
+    {:ok, second, second_odb} =
+      start_packfetch(published, {:dir, destination}, max_hydration_bytes: warm_ceiling)
+
     {:ok, second_stats} = ODB.stats(second_odb)
     assert second_stats.packs_hydrated == 0
     assert second_stats.packs_skipped == first_stats.packs_hydrated
@@ -456,6 +737,85 @@ defmodule Gitility.Milestone2ePackFetchTest do
     stop(second)
   end
 
+  test "a corrupt pre-existing destination index is replaced" do
+    published = publish("sha1-basic.git", "replace-index")
+    destination = temp_dir("replace-index")
+
+    on_exit(fn ->
+      File.rm_rf(published)
+      File.rm_rf(destination)
+    end)
+
+    {:ok, first, _odb} = start_packfetch(published, {:dir, destination})
+    stop(first)
+    [index_path] = Path.wildcard(Path.join(destination, "objects/pack/*.idx"))
+    bytes = File.read!(index_path)
+    <<first_byte, rest::binary>> = bytes
+    File.write!(index_path, <<Bitwise.bxor(first_byte, 1), rest::binary>>)
+
+    {:ok, second, odb} = start_packfetch(published, {:dir, destination})
+    {:ok, stats} = ODB.stats(odb)
+    assert stats.replaced_corrupt == 1
+    assert {:ok, %Snapshot{}} = Snapshot.open(odb, fixture_oid(:sha1_basic_head))
+    stop(second)
+  end
+
+  test "a checksum-consistent forged index fails the open-time gix probe and is removed" do
+    published = publish("sha1-basic.git", "forged-index")
+    destination = temp_dir("forged-index")
+    {:ok, tracker} = tracker()
+
+    on_exit(fn ->
+      File.rm_rf(published)
+      File.rm_rf(destination)
+      if Process.alive?(tracker), do: Agent.stop(tracker)
+    end)
+
+    assert {:error, %Error{code: :malformed_object, message: message}} =
+             PackFetch.start_link(
+               backend:
+                 {Gitility.TrackingRangeBackend,
+                  {LocalDirectory, published, tracker, :forged_index}},
+               into: {:dir, destination}
+             )
+
+    assert message =~ "failed the open-time probe"
+    assert Path.wildcard(Path.join(destination, "objects/pack/*.pack")) == []
+    assert Path.wildcard(Path.join(destination, "objects/pack/*.idx")) == []
+  end
+
+  test "failed start_link leaves no registered tree, app child, or native thread budget change" do
+    published = publish("sha1-basic.git", "failed-start-cleanup")
+    destination = temp_dir("failed-start-cleanup")
+    {:ok, tracker} = tracker()
+    name = {:global, {__MODULE__, :failed_start_cleanup, make_ref()}}
+    app_children = Supervisor.which_children(Gitility.Supervisor)
+    thread_budget = Gitility.Runtime.stats().thread_budget_used
+
+    on_exit(fn ->
+      File.rm_rf(published)
+      File.rm_rf(destination)
+      if Process.alive?(tracker), do: Agent.stop(tracker)
+    end)
+
+    assert {:error, %Error{code: :malformed_object}} =
+             PackFetch.start_link(
+               name: name,
+               backend:
+                 {Gitility.TrackingRangeBackend,
+                  {LocalDirectory, published, tracker, :forged_index}},
+               into: {:dir, destination}
+             )
+
+    assert GenServer.whereis(name) == nil
+    assert Supervisor.which_children(Gitility.Supervisor) == app_children
+
+    assert eventually(
+             fn -> Gitility.Runtime.stats().thread_budget_used == thread_budget end,
+             5_000
+           )
+  end
+
   test "corrupt backend pack and index bytes fail without final-named files" do
     published = publish("sha1-basic.git", "backend-corrupt")
     on_exit(fn -> File.rm_rf(published) end)
@@ -481,6 +841,38 @@ defmodule Gitility.Milestone2ePackFetchTest do
       Agent.stop(tracker)
       File.rm_rf(destination)
     end
+  end
+
+  test "multi-pack failure retains only earlier verified pairs for retry" do
+    published = publish("sha1-history-midx.git", "partial-multi-pack")
+    destination = temp_dir("partial-multi-pack")
+    {:ok, tracker} = tracker()
+
+    on_exit(fn ->
+      File.rm_rf(published)
+      File.rm_rf(destination)
+      if Process.alive?(tracker), do: Agent.stop(tracker)
+    end)
+
+    assert {:error, %Error{code: :pack_checksum_mismatch}} =
+             PackFetch.start_link(
+               backend:
+                 {Gitility.TrackingRangeBackend,
+                  {LocalDirectory, published, tracker, :corrupt_second_pack}},
+               into: {:dir, destination},
+               limits: generous_limits()
+             )
+
+    assert length(Path.wildcard(Path.join(destination, "objects/pack/*.pack"))) == 1
+    assert length(Path.wildcard(Path.join(destination, "objects/pack/*.idx"))) == 1
+    assert Path.wildcard(Path.join(destination, "objects/pack/.*.tmp-*")) == []
+
+    {:ok, retry, odb} = start_packfetch(published, {:dir, destination})
+    {:ok, stats} = ODB.stats(odb)
+    assert stats.packs_skipped == 1
+    assert stats.packs_hydrated == 1
+    assert {:ok, %Snapshot{}} = Snapshot.open(odb, fixture_oid(:sha1_history_head))
+    stop(retry)
   end
 
   test "an index paired with another pack fails at the pack checksum boundary" do
@@ -530,7 +922,7 @@ defmodule Gitility.Milestone2ePackFetchTest do
     published = publish("sha1-basic.git", "manifest-errors")
     on_exit(fn -> File.rm_rf(published) end)
 
-    for mode <- [:bad_version, :duplicate_id, :wrong_length_id] do
+    for mode <- [:bad_version, :duplicate_id, :wrong_length_id, :non_empty_loose] do
       {:ok, tracker} = tracker()
 
       assert {:error, %Error{code: :provider_protocol_error}} =
@@ -547,17 +939,54 @@ defmodule Gitility.Milestone2ePackFetchTest do
 
     {:ok, tracker} = tracker()
 
-    assert {:error, %Error{code: :budget_exceeded, details: %{limit: :max_provider_bytes}}} =
+    assert {:error, %Error{code: :budget_exceeded, details: %{limit: :max_hydration_bytes}}} =
              PackFetch.start_link(
                backend:
                  {Gitility.TrackingRangeBackend,
                   {LocalDirectory, published, tracker, :oversized_manifest}},
                into: {:dir, temp_dir("oversized")},
-               limits: Limits.new(max_provider_bytes: 1024)
+               max_hydration_bytes: 1024
              )
 
     assert Agent.get(tracker, & &1.read_calls) == 0
     Agent.stop(tracker)
+
+    {:ok, entry_tracker} = tracker()
+
+    assert {:error, %Error{code: :provider_protocol_error, message: entry_message}} =
+             PackFetch.start_link(
+               backend:
+                 {Gitility.TrackingRangeBackend,
+                  {LocalDirectory, published, entry_tracker, :too_many_manifest_entries}},
+               into: {:dir, temp_dir("too-many-manifest-entries")}
+             )
+
+    assert entry_message =~ "100000-entry"
+    assert Agent.get(entry_tracker, & &1.read_calls) == 0
+    Agent.stop(entry_tracker)
+  end
+
+  test "the default hydration ceiling admits a synthetic 300 MiB plan" do
+    published = publish("sha1-basic.git", "default-hydration-ceiling")
+    {:ok, tracker} = tracker()
+
+    on_exit(fn ->
+      File.rm_rf(published)
+      if Process.alive?(tracker), do: Agent.stop(tracker)
+    end)
+
+    # The synthetic descriptor deliberately points at the small fixture pack:
+    # the first range fails short, proving planning admitted 300 MiB without
+    # allocating or fetching the advertised artifact.
+    assert {:error, %Error{code: :backend_error}} =
+             PackFetch.start_link(
+               backend:
+                 {Gitility.TrackingRangeBackend,
+                  {LocalDirectory, published, tracker, :synthetic_300m_manifest}},
+               into: {:dir, temp_dir("synthetic-300m")}
+             )
+
+    assert Agent.get(tracker, & &1.read_calls) > 0
   end
 
   test "range request window obeys concurrency" do
@@ -671,29 +1100,74 @@ defmodule Gitility.Milestone2ePackFetchTest do
   test "refresh fetches only the new generation and keeps old objects" do
     published = publish("sha1-basic.git", "refresh")
     destination = temp_dir("refresh")
+    {:ok, tracker} = tracker()
 
     on_exit(fn ->
       File.rm_rf(published)
       File.rm_rf(destination)
+      if Process.alive?(tracker), do: Agent.stop(tracker)
     end)
 
-    {:ok, supervisor, odb} = start_packfetch(published, {:dir, destination})
+    {:ok, supervisor} =
+      PackFetch.start_link(
+        backend:
+          {Gitility.TrackingRangeBackend,
+           {LocalDirectory, published, tracker, {:controlled_latch, self()}}},
+        into: {:dir, destination},
+        concurrency: 1,
+        limits: generous_limits()
+      )
+
+    {:ok, odb} = ODB.handle(supervisor)
     basic = fixture_oid(:sha1_basic_head)
     assert {:ok, %Snapshot{commit_oid: ^basic}} = Snapshot.open(odb, basic)
 
     :ok = LocalDirectory.publish(fixture("sha1-history-midx.git"), published)
-    assert :ok = ODB.refresh(odb)
+    Agent.update(tracker, &%{&1 | block_once: true})
+    refresh = Task.async(fn -> ODB.refresh(odb) end)
+    assert_receive {:range_backend_waiting, callback}, 5_000
+
+    # The old Arc<LocalOdb> remains live until the fully verified replacement
+    # is swapped in, so reads continue throughout acquisition.
+    assert {:ok, %Snapshot{commit_oid: ^basic}} = Snapshot.open(odb, basic)
+    send(callback, :release)
+    assert :ok = Task.await(refresh, 30_000)
+
     {:ok, stats} = ODB.stats(odb)
     assert stats.packs_hydrated > 0
     assert stats.packs_skipped == 0
     history = fixture_oid(:sha1_history_head)
     assert {:ok, %Snapshot{commit_oid: ^history}} = Snapshot.open(odb, history)
     assert {:ok, %Snapshot{commit_oid: ^basic}} = Snapshot.open(odb, basic)
+
+    assert :ok = ODB.refresh(odb)
+    {:ok, second_stats} = ODB.stats(odb)
+    assert second_stats.bytes_verified == 0
+    assert second_stats.packs_hydrated == 0
+    assert second_stats.packs_skipped == 2
     stop(supervisor)
   end
 
   defp tracker do
-    Agent.start_link(fn -> %{current: 0, max: 0, read_calls: 0} end)
+    Agent.start_link(fn -> %{current: 0, max: 0, read_calls: 0, block_once: false} end)
+  end
+
+  defp eventually(fun, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    eventually_until(fun, deadline)
+  end
+
+  defp eventually_until(fun, deadline) do
+    if fun.() do
+      true
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        false
+      else
+        Process.sleep(20)
+        eventually_until(fun, deadline)
+      end
+    end
   end
 
   defp generous_limits do
@@ -712,7 +1186,7 @@ if System.get_env("GITILITY_TEST_POSTGRES_URL") do
 
     def init(:conformance) do
       Gitility.ODB.RangeBackend.Postgres.init(
-        url: System.fetch_env!("GITILITY_TEST_POSTGRES_URL"),
+        connection: :persistent_term.get({Gitility.PostgresRangeConformanceTest, :connection}),
         prefix: "gitility_pack_conformance"
       )
     end
@@ -720,6 +1194,9 @@ if System.get_env("GITILITY_TEST_POSTGRES_URL") do
     defdelegate manifest(state), to: Gitility.ODB.RangeBackend.Postgres
     defdelegate read_ranges(ranges, state), to: Gitility.ODB.RangeBackend.Postgres
     defdelegate terminate(reason, state), to: Gitility.ODB.RangeBackend.Postgres
+
+    defdelegate publish_conformance_artifact(state, key, bytes),
+      to: Gitility.ODB.RangeBackend.Postgres
   end
 
   defmodule Gitility.PostgresRangeConformanceTest do
@@ -728,19 +1205,29 @@ if System.get_env("GITILITY_TEST_POSTGRES_URL") do
       concurrency: 4
 
     setup_all do
+      connection =
+        start_supervised!(
+          {Postgrex,
+           Gitility.ODB.RangeBackend.Postgres.url_to_postgrex_options(
+             System.fetch_env!("GITILITY_TEST_POSTGRES_URL")
+           )}
+        )
+
       directory = Gitility.RangeTestSupport.publish("sha1-basic.git", "postgres-conformance")
 
       :ok =
         Gitility.ODB.RangeBackend.Postgres.publish(
           Gitility.RangeTestSupport.fixture("sha1-basic.git"),
-          System.fetch_env!("GITILITY_TEST_POSTGRES_URL"),
+          connection,
           prefix: "gitility_pack_conformance"
         )
 
       :persistent_term.put({__MODULE__, :directory}, directory)
+      :persistent_term.put({__MODULE__, :connection}, connection)
 
       on_exit(fn ->
         :persistent_term.erase({__MODULE__, :directory})
+        :persistent_term.erase({__MODULE__, :connection})
         File.rm_rf(directory)
       end)
 
@@ -751,6 +1238,14 @@ if System.get_env("GITILITY_TEST_POSTGRES_URL") do
 
     def backend_artifacts do
       Gitility.RangeTestSupport.artifacts(:persistent_term.get({__MODULE__, :directory}))
+    end
+
+    def backend_publish_artifact(state, key, bytes) do
+      Gitility.PostgresRangeConformanceBackend.publish_conformance_artifact(
+        state,
+        key,
+        bytes
+      )
     end
 
     test "Postgres hydrates a query-equivalent PackFetch store" do

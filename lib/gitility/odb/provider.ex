@@ -40,6 +40,7 @@ defmodule Gitility.ODB.Provider do
           store: store,
           callback_kind: callback_kind,
           packfetch_limits: Keyword.get(opts, :packfetch_limits),
+          packfetch_cleanup_destination: Keyword.get(opts, :packfetch_cleanup_destination),
           queue: :queue.new(),
           running: %{},
           refreshes: %{}
@@ -219,7 +220,23 @@ defmodule Gitility.ODB.Provider do
       end
     end
 
+    cleanup_packfetch_destination(state.packfetch_cleanup_destination)
+
     :ok
+  end
+
+  defp cleanup_packfetch_destination(nil), do: :ok
+
+  defp cleanup_packfetch_destination(path) do
+    case File.rm_rf(path) do
+      {:ok, _removed} ->
+        :ok
+
+      {:error, reason, failed_path} ->
+        Logger.error(
+          "Gitility could not clean memory PackFetch destination #{inspect(failed_path)}: #{inspect(reason)}"
+        )
+    end
   end
 
   defp dispatch_or_queue(item, state) when map_size(state.running) < state.concurrency do

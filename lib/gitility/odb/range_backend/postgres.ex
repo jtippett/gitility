@@ -20,7 +20,14 @@ defmodule Gitility.ODB.RangeBackend.Postgres do
         )
 
   `init/1` accepts `connection: pid` or Postgrex connection options such as
-  `url:`. The optional `prefix:` (default `"gitility_pack"`) is restricted to
+  `url:`. A pid is treated as an existing supervised pool and is never
+  stopped by this backend. URL/options make `init/1` call
+  `Postgrex.start_link/1`; that pool is owned and stopped by `terminate/2`,
+  but because backend init runs in the `PackFetch.start_link/1` caller it is
+  linked to that caller rather than the provider tree. Production callers
+  should therefore start Postgrex under their own supervisor and pass its
+  name or pid (a pid today); URL/options are a convenience for scripts and
+  tests. The optional `prefix:` (default `"gitility_pack"`) is restricted to
   SQL identifier characters. `publish/3` takes a repository, either a pid,
   URL, or Postgrex options, and backend options such as `prefix:`.
   """
@@ -127,6 +134,24 @@ defmodule Gitility.ODB.RangeBackend.Postgres do
 
   def publish(_repository, _connection, _opts), do: {:error, :invalid_postgres_options}
 
+  @doc false
+  def publish_conformance_artifact(
+        %{conn: conn, prefix: prefix},
+        key,
+        bytes
+      )
+      when is_binary(key) and is_binary(bytes) do
+    with {:ok, pack_id, artifact} <- parse_key(key),
+         {:ok, _result} <-
+           Postgrex.query(
+             conn,
+             "DELETE FROM #{chunks_table(prefix)} WHERE pack_id = $1 AND artifact = $2",
+             [pack_id, artifact]
+           ) do
+      publish_artifact_bytes(conn, prefix, pack_id, artifact, bytes)
+    end
+  end
+
   defp publish_chunks(conn, prefix, temp, manifest) do
     Enum.each(manifest["packs"], fn pack ->
       publish_artifact(conn, prefix, temp, pack["id"], "pack", pack["pack_key"])
@@ -147,6 +172,32 @@ defmodule Gitility.ODB.RangeBackend.Postgres do
     |> Stream.with_index()
     |> Enum.each(fn {bytes, index} ->
       {:ok, _result} = Postgrex.query(conn, sql, [pack_id, artifact, index, bytes])
+    end)
+  end
+
+  defp publish_artifact_bytes(conn, prefix, pack_id, artifact, bytes) do
+    sql = """
+    INSERT INTO #{chunks_table(prefix)} (pack_id, artifact, chunk_index, bytes)
+    VALUES ($1, $2, $3, $4)
+    """
+
+    bytes
+    |> Stream.unfold(fn
+      <<>> ->
+        nil
+
+      remaining ->
+        size = min(byte_size(remaining), @chunk_bytes)
+
+        {binary_part(remaining, 0, size),
+         binary_part(remaining, size, byte_size(remaining) - size)}
+    end)
+    |> Stream.with_index()
+    |> Enum.reduce_while(:ok, fn {chunk, index}, :ok ->
+      case Postgrex.query(conn, sql, [pack_id, artifact, index, chunk]) do
+        {:ok, _result} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
     end)
   end
 
@@ -218,13 +269,19 @@ defmodule Gitility.ODB.RangeBackend.Postgres do
     with {:ok, pack_id, artifact} <- parse_key(range.key),
          first = div(range.offset, @chunk_bytes),
          last = div(range.offset + range.length - 1, @chunk_bytes),
+         table = chunks_table(prefix),
          sql =
-           "SELECT chunk_index, bytes FROM #{chunks_table(prefix)} " <>
-             "WHERE pack_id = $1 AND artifact = $2 AND chunk_index BETWEEN $3 AND $4 " <>
-             "ORDER BY chunk_index",
+           "SELECT c.chunk_index, c.bytes, " <>
+             "NOT EXISTS (SELECT 1 FROM #{table} AS n " <>
+             "WHERE n.pack_id = c.pack_id AND n.artifact = c.artifact " <>
+             "AND n.chunk_index > c.chunk_index) " <>
+             "FROM #{table} AS c " <>
+             "WHERE c.pack_id = $1 AND c.artifact = $2 " <>
+             "AND c.chunk_index BETWEEN $3 AND $4 ORDER BY c.chunk_index",
          {:ok, %{rows: rows}} <- Postgrex.query(conn, sql, [pack_id, artifact, first, last]),
          true <- length(rows) == last - first + 1,
-         combined = IO.iodata_to_binary(Enum.map(rows, fn [_index, bytes] -> bytes end)),
+         true <- valid_chunk_rows?(rows, first),
+         combined = IO.iodata_to_binary(Enum.map(rows, fn [_index, bytes, _final?] -> bytes end)),
          inner = rem(range.offset, @chunk_bytes),
          true <- byte_size(combined) >= inner + range.length do
       {:ok, binary_part(combined, inner, range.length)}
@@ -235,6 +292,22 @@ defmodule Gitility.ODB.RangeBackend.Postgres do
   end
 
   defp read_range(_conn, _prefix, _range), do: {:error, :invalid_range}
+
+  defp valid_chunk_rows?(rows, first) do
+    rows
+    |> Enum.with_index()
+    |> Enum.all?(fn
+      {[chunk_index, bytes, final?], position}
+      when is_integer(chunk_index) and is_binary(bytes) and is_boolean(final?) ->
+        size = byte_size(bytes)
+
+        chunk_index == first + position and size > 0 and size <= @chunk_bytes and
+          (size == @chunk_bytes or final?)
+
+      _row ->
+        false
+    end)
+  end
 
   defp parse_key(key) when is_binary(key) do
     case Regex.run(~r/^packs\/pack-([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\.(pack|idx)$/, key) do

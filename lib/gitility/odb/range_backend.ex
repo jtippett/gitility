@@ -26,6 +26,11 @@ defmodule Gitility.ODB.RangeBackend do
   Builds the backend state from the configuration term given to the
   adapter (`Gitility.ODB.PackFetch.start_link/1` or
   `Gitility.ODB.PackRange.start_link/1`).
+
+  This callback runs in the process calling `start_link/1`, before the
+  provider tree exists. Processes it starts are linked to that caller unless
+  the backend supervises them itself. Start long-lived resources under your
+  own supervisor and pass their registered name or pid in the init argument.
   """
   @callback init(term()) :: {:ok, state()} | {:error, term()}
 

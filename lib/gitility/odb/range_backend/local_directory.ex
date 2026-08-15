@@ -7,10 +7,17 @@ defmodule Gitility.ODB.RangeBackend.LocalDirectory do
   content-addressed artifacts are present. `read_ranges/2` uses positional
   reads and never shares or advances a mutable file offset.
 
-  `publish/2` copies existing pack/index pairs from a bare or normal local
-  repository. If the repository contains only loose objects, it invokes the
-  configured Git executable's `pack-objects` plumbing against a temporary
-  staging directory without modifying the source repository.
+  `publish/2` captures every object the repository stores — packed and
+  loose, reachable or not; it never garbage-collects. Existing packs are
+  copied as-is. When loose objects exist, it feeds their complete object-ID
+  list to the configured Git executable's `pack-objects` plumbing, adding
+  that new pack beside the existing packs in the published manifest.
+
+  Packing loose objects briefly stages a temporary directory below the
+  source repository's `objects/` directory so Git can rename its output on
+  the same filesystem; the directory is always removed afterward. A source
+  that cannot create this staging directory returns
+  `{:error, :source_repository_read_only}`.
 
       :ok =
         Gitility.ODB.RangeBackend.LocalDirectory.publish(
@@ -67,9 +74,10 @@ defmodule Gitility.ODB.RangeBackend.LocalDirectory do
   Publishes the pack inventory of a local repository into `destination`.
 
   Pack and index files are written through same-directory temporary files;
-  `manifest.json` is the final atomic rename. The optional `:git_executable` application
-  environment setting (`Application.put_env(:gitility, :git_executable, …)`)
-  selects the Git executable used only when loose objects need packing.
+  `manifest.json` is the final atomic rename. Existing source packs are never
+  repacked. The optional `:git_executable` application environment setting
+  (`Application.put_env(:gitility, :git_executable, …)`) selects the Git
+  executable used only when loose objects need packing.
   """
   @spec publish(Path.t(), Path.t()) :: :ok | {:error, term()}
   def publish(repository, destination)
@@ -113,11 +121,36 @@ defmodule Gitility.ODB.RangeBackend.LocalDirectory do
         |> Enum.map(&{&1, Path.rootname(&1) <> ".idx"})
         |> Enum.filter(fn {_pack, index} -> File.regular?(index) end)
 
-      if pairs == [], do: pack_loose_repository(repository, objects, staging), else: {:ok, pairs}
+      loose_ids = loose_object_ids(objects)
+
+      cond do
+        loose_ids != [] ->
+          with {:ok, loose_pairs} <-
+                 pack_loose_objects(repository, objects, staging, loose_ids) do
+            {:ok, pairs ++ loose_pairs}
+          end
+
+        pairs != [] ->
+          {:ok, pairs}
+
+        true ->
+          {:error, :repository_has_no_objects}
+      end
     end
   end
 
-  defp pack_loose_repository(repository, objects, staging) do
+  defp loose_object_ids(objects) do
+    objects
+    |> Path.join("??/*")
+    |> Path.wildcard()
+    |> Enum.filter(&File.regular?/1)
+    |> Enum.map(fn path -> Path.basename(Path.dirname(path)) <> Path.basename(path) end)
+    |> Enum.filter(&String.match?(&1, ~r/\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\z/))
+    |> Enum.map(&String.downcase/1)
+    |> Enum.sort()
+  end
+
+  defp pack_loose_objects(repository, objects, staging, loose_ids) do
     git = Application.get_env(:gitility, :git_executable, "git")
 
     # git pack-objects builds its temp file under the repository's objects
@@ -132,24 +165,27 @@ defmodule Gitility.ODB.RangeBackend.LocalDirectory do
       Path.join(objects, ".gitility-publish-#{System.unique_integer([:positive, :monotonic])}")
 
     prefix = Path.join(git_staging, "pack")
+    object_list = Path.join(git_staging, "loose-object-ids")
 
     git_args =
       if File.dir?(Path.join(repository, ".git")) do
-        ["-C", repository, "pack-objects", "--all", prefix]
+        ["-C", repository, "pack-objects", prefix]
       else
-        ["--git-dir", repository, "pack-objects", "--all", prefix]
+        ["--git-dir", repository, "pack-objects", prefix]
       end
 
-    # `git pack-objects` reads an object list from stdin until EOF even with
-    # `--all`. An Erlang port never closes the child's stdin, so a plain
-    # System.cmd hangs forever (the first M2e BEAM run sat 10+ minutes in
-    # setup_all). Redirecting stdin from /dev/null through the shell delivers
-    # the EOF; `exec` keeps git as the process the port owns.
+    # An Erlang port never closes the child's stdin, so write the exact loose
+    # object inventory to a file and redirect it through the shell. This is
+    # Git's own reachability-independent pack-objects idiom; no --all walk can
+    # silently omit unreachable loose objects.
     shell_command =
-      Enum.map_join(["exec", git | git_args], " ", &shell_escape/1) <> " < /dev/null"
+      Enum.map_join(["exec", git | git_args], " ", &shell_escape/1) <>
+        " < " <> shell_escape(object_list)
 
     result =
-      with :ok <- File.mkdir_p(git_staging),
+      with :ok <- ensure_source_writable(objects),
+           :ok <- create_source_staging(git_staging),
+           :ok <- write_loose_object_list(object_list, loose_ids),
            {_output, 0} <- System.cmd("/bin/sh", ["-c", shell_command], stderr_to_stdout: true) do
         git_staging
         |> Path.join("pack-*.pack")
@@ -185,6 +221,44 @@ defmodule Gitility.ODB.RangeBackend.LocalDirectory do
 
       {output, status} when is_binary(output) and is_integer(status) ->
         {:error, {:git_pack_objects_failed, status, String.slice(output, 0, 512)}}
+    end
+  end
+
+  defp ensure_source_writable(objects) do
+    case File.stat(objects) do
+      {:ok, %{mode: mode}} ->
+        if Bitwise.band(mode, 0o222) == 0,
+          do: {:error, :source_repository_read_only},
+          else: :ok
+
+      {:error, reason} ->
+        {:error, {:source_staging_failed, reason}}
+    end
+  end
+
+  defp create_source_staging(path) do
+    case File.mkdir(path) do
+      :ok ->
+        :ok
+
+      {:error, reason} when reason in [:eacces, :erofs] ->
+        {:error, :source_repository_read_only}
+
+      {:error, reason} ->
+        {:error, {:source_staging_failed, reason}}
+    end
+  end
+
+  defp write_loose_object_list(path, loose_ids) do
+    case File.write(path, Enum.join(loose_ids, "\n") <> "\n") do
+      :ok ->
+        :ok
+
+      {:error, reason} when reason in [:eacces, :erofs] ->
+        {:error, :source_repository_read_only}
+
+      {:error, reason} ->
+        {:error, {:source_staging_failed, reason}}
     end
   end
 

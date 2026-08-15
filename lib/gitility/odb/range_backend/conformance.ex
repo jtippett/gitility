@@ -2,12 +2,17 @@ defmodule Gitility.ODB.RangeBackend.Conformance do
   @moduledoc """
   Reusable ExUnit conformance case for `Gitility.ODB.RangeBackend` modules.
 
-  The using test module supplies `backend_init_arg/0` and
-  `backend_artifacts/0`. The latter returns a map of manifest keys to complete
-  artifact binaries. Generated tests validate the manifest protocol, exact
-  byte counts (including arbitrary offsets, last-byte reads, and zero-length
-  reads), reply completeness, concurrent callback safety, and tolerant
-  termination.
+  The using test module supplies `backend_init_arg/0`, `backend_artifacts/0`,
+  and `backend_publish_artifact/3`. The last callback publishes the supplied
+  key and bytes into the initialized test backend. The kit uses it to add a
+  deterministic 2 MiB-plus-17-byte artifact, guaranteeing that its range
+  matrix crosses the Postgres backend's 1 MiB chunk seam without enlarging a
+  repository fixture.
+
+  Generated tests validate the manifest protocol, whole/first/last-byte
+  reads, zero-length reads at zero and EOF, a chunk-boundary crossing,
+  multiple keys in one request, out-of-bounds short reads, concurrent
+  callback safety, and tolerant termination.
 
       defmodule MyApp.PackStoreConformanceTest do
         use Gitility.ODB.RangeBackend.Conformance,
@@ -16,6 +21,8 @@ defmodule Gitility.ODB.RangeBackend.Conformance do
 
         def backend_init_arg, do: [bucket: "test-packs"]
         def backend_artifacts, do: MyApp.PackFixtures.artifacts()
+        def backend_publish_artifact(state, key, bytes),
+          do: MyApp.PackFixtures.publish_artifact(state, key, bytes)
       end
 
   A deliberately broken backend can set `expected_failure: :short_read`; the
@@ -43,17 +50,26 @@ defmodule Gitility.ODB.RangeBackend.Conformance do
       setup do
         {:ok, state} = @range_backend.init(backend_init_arg())
 
+        artifacts =
+          if @range_expected_failure do
+            backend_artifacts()
+          else
+            {key, bytes} = Gitility.ODB.RangeBackend.Conformance.synthetic_artifact()
+            :ok = apply(__MODULE__, :backend_publish_artifact, [state, key, bytes])
+            Map.put(backend_artifacts(), key, bytes)
+          end
+
         on_exit(fn ->
           if function_exported?(@range_backend, :terminate, 2) do
             try do
-              @range_backend.terminate(:normal, state)
+              apply(@range_backend, :terminate, [:normal, state])
             catch
               _kind, _reason -> :ok
             end
           end
         end)
 
-        %{state: state, artifacts: backend_artifacts()}
+        %{state: state, artifacts: artifacts}
       end
 
       test "manifest has the versioned, content-addressed protocol shape", context do
@@ -82,6 +98,13 @@ defmodule Gitility.ODB.RangeBackend.Conformance do
           end)
         end
 
+        test "out-of-bounds reads fail as short reads", context do
+          range =
+            Gitility.ODB.RangeBackend.Conformance.out_of_bounds_range(context.artifacts)
+
+          assert {:error, :short_read} = @range_backend.read_ranges([range], context.state)
+        end
+
         test "callbacks are safe under configured concurrency", context do
           ranges = Gitility.ODB.RangeBackend.Conformance.probe_ranges(context.artifacts)
 
@@ -100,8 +123,9 @@ defmodule Gitility.ODB.RangeBackend.Conformance do
         end
 
         if function_exported?(@range_backend, :terminate, 2) do
-          test "terminate tolerates ordinary shutdown", context do
-            assert @range_backend.terminate(:shutdown, context.state) != :raise
+          test "terminate does not poison shared backend state", context do
+            _result = apply(@range_backend, :terminate, [:shutdown, context.state])
+            assert {:ok, %Gitility.PackManifest{}} = @range_backend.manifest(context.state)
           end
         else
           @tag skip: ":skipped — backend does not export optional terminate/2"
@@ -178,13 +202,37 @@ defmodule Gitility.ODB.RangeBackend.Conformance do
 
   @doc false
   def probe_ranges(artifacts) when is_map(artifacts) and map_size(artifacts) > 0 do
-    {key, bytes} = Enum.find(artifacts, fn {_key, bytes} -> byte_size(bytes) >= 2 end)
-    middle = div(byte_size(bytes), 2)
+    {key, bytes} = Enum.max_by(artifacts, fn {_key, bytes} -> byte_size(bytes) end)
+    size = byte_size(bytes)
+    boundary = 1024 * 1024
+
+    {other_key, other_bytes} =
+      artifacts
+      |> Enum.reject(fn {candidate, _bytes} -> candidate == key end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> hd()
 
     [
-      %Gitility.ByteRange{key: key, offset: middle, length: 1},
-      %Gitility.ByteRange{key: key, offset: byte_size(bytes) - 1, length: 1},
-      %Gitility.ByteRange{key: key, offset: 0, length: 0}
+      %Gitility.ByteRange{key: key, offset: 0, length: size},
+      %Gitility.ByteRange{key: key, offset: 0, length: 1},
+      %Gitility.ByteRange{key: key, offset: size - 1, length: 1},
+      %Gitility.ByteRange{key: key, offset: 0, length: 0},
+      %Gitility.ByteRange{key: key, offset: size, length: 0},
+      %Gitility.ByteRange{key: key, offset: boundary - 3, length: 11},
+      %Gitility.ByteRange{key: other_key, offset: 0, length: min(byte_size(other_bytes), 7)}
     ]
+  end
+
+  @doc false
+  def out_of_bounds_range(artifacts) do
+    {key, bytes} = Enum.max_by(artifacts, fn {_key, bytes} -> byte_size(bytes) end)
+    %Gitility.ByteRange{key: key, offset: byte_size(bytes), length: 1}
+  end
+
+  @doc false
+  def synthetic_artifact do
+    pattern = :binary.list_to_bin(Enum.to_list(0..255))
+    bytes = :binary.copy(pattern, 8_192) <> binary_part(pattern, 0, 17)
+    {"packs/pack-#{String.duplicate("e", 40)}.pack", bytes}
   end
 end

@@ -10,6 +10,7 @@ defmodule Gitility.NativeSupport do
     "max_total_object_bytes" => :max_total_object_bytes,
     "max_provider_requests" => :max_provider_requests,
     "max_provider_bytes" => :max_provider_bytes,
+    "max_hydration_bytes" => :max_hydration_bytes,
     "max_tree_entries" => :max_tree_entries,
     "max_results" => :max_results,
     "max_diff_files" => :max_diff_files,

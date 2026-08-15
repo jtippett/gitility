@@ -96,6 +96,29 @@ impl PackManifest {
                 .ok_or_else(|| protocol_error("pack manifest byte total overflows u64"))
         })
     }
+
+    fn reply_bytes(&self) -> Result<u64, Error> {
+        let mut total = 16u64
+            .checked_add(self.generation.len() as u64)
+            .ok_or_else(|| protocol_error("pack manifest reply byte total overflows u64"))?;
+        for pack in &self.packs {
+            total = total
+                .checked_add(pack.id.len() as u64)
+                .and_then(|value| value.checked_add(pack.pack_key.len() as u64))
+                .and_then(|value| value.checked_add(pack.index_key.len() as u64))
+                .and_then(|value| {
+                    value.checked_add(pack.etag.as_ref().map_or(0, |etag| etag.len()) as u64)
+                })
+                .and_then(|value| value.checked_add(32))
+                .ok_or_else(|| protocol_error("pack manifest reply byte total overflows u64"))?;
+        }
+        for key in &self.loose {
+            total = total
+                .checked_add(key.len() as u64)
+                .ok_or_else(|| protocol_error("pack manifest reply byte total overflows u64"))?;
+        }
+        Ok(total)
+    }
 }
 
 /// One exact byte range in a manifest artifact. Zero-length ranges are valid
@@ -425,8 +448,8 @@ pub struct PackFetchOptions {
     pub destination: PathBuf,
     pub chunk_bytes: u64,
     pub concurrency: usize,
+    pub max_hydration_bytes: u64,
     pub max_bytes: Option<u64>,
-    pub cleanup_destination: bool,
 }
 
 impl PackFetchOptions {
@@ -449,6 +472,12 @@ impl PackFetchOptions {
                 "PackFetch destination must not be empty",
             ));
         }
+        if self.max_hydration_bytes == 0 {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "max_hydration_bytes must be greater than zero",
+            ));
+        }
         Ok(())
     }
 }
@@ -459,8 +488,8 @@ impl Default for PackFetchOptions {
             destination: PathBuf::new(),
             chunk_bytes: DEFAULT_CHUNK_BYTES,
             concurrency: 8,
+            max_hydration_bytes: 4 * 1024 * 1024 * 1024,
             max_bytes: None,
-            cleanup_destination: false,
         }
     }
 }
@@ -490,6 +519,12 @@ pub struct PackFetchOdb<T: RangeTransport> {
     local: RwLock<Option<Arc<LocalOdb>>>,
     stats: Mutex<HydrationStats>,
     hydration: Mutex<()>,
+    verified_packs: Mutex<HashSet<String>>,
+}
+
+struct HydrationPlanItem<'a> {
+    descriptor: &'a PackDescriptor,
+    fetch: bool,
 }
 
 impl<T: RangeTransport> PackFetchOdb<T> {
@@ -502,6 +537,7 @@ impl<T: RangeTransport> PackFetchOdb<T> {
             local: RwLock::new(None),
             stats: Mutex::new(HydrationStats::default()),
             hydration: Mutex::new(()),
+            verified_packs: Mutex::new(HashSet::new()),
         })
     }
 
@@ -513,18 +549,16 @@ impl<T: RangeTransport> PackFetchOdb<T> {
         let manifest = self.transport.manifest(budget)?;
         let manifest_ms = elapsed_ms(manifest_started);
         manifest.validate(self.hash)?;
-        let described_bytes = manifest.described_bytes()?;
-        let provider_remaining = budget
-            .limits()
-            .max_provider_bytes
-            .saturating_sub(budget.spent().3);
-        if described_bytes > provider_remaining {
-            return Err(Error::new(
-                ErrorCode::BudgetExceeded,
-                "pack manifest exceeds max_provider_bytes before hydration",
-            )
-            .with_limit("max_provider_bytes"));
+        manifest.described_bytes()?;
+        let manifest_bytes = manifest.reply_bytes()?;
+        if manifest_bytes > self.options.max_hydration_bytes {
+            return Err(hydration_budget_error(
+                "pack manifest reply exceeds max_hydration_bytes",
+            ));
         }
+        budget
+            .charge_provider_bytes(manifest_bytes)
+            .map_err(|error| remap_hydration_budget(error, "pack manifest reply"))?;
         let object_dir = self.options.destination.join("objects");
         let pack_dir = object_dir.join("pack");
         std::fs::create_dir_all(&pack_dir).map_err(|_| {
@@ -549,42 +583,39 @@ impl<T: RangeTransport> PackFetchOdb<T> {
             manifest_ms,
             ..HydrationStats::default()
         };
-        for descriptor in &manifest.packs {
+        let plan = self.plan_hydration(&manifest, &pack_dir, budget, &mut stats)?;
+        let bytes_to_fetch = plan.iter().try_fold(0u64, |total, item| {
+            if item.fetch {
+                total
+                    .checked_add(item.descriptor.pack_size)
+                    .and_then(|value| value.checked_add(item.descriptor.index_size))
+                    .ok_or_else(|| protocol_error("pack hydration byte total overflows u64"))
+            } else {
+                Ok(total)
+            }
+        })?;
+        if bytes_to_fetch
+            > self
+                .options
+                .max_hydration_bytes
+                .saturating_sub(manifest_bytes)
+        {
+            return Err(hydration_budget_error(
+                "pack hydration plan exceeds max_hydration_bytes before fetching",
+            ));
+        }
+
+        for item in &plan {
+            let descriptor = item.descriptor;
+            if !item.fetch {
+                continue;
+            }
             budget.check()?;
             let id = Oid::parse_hex(&descriptor.id)
                 .map_err(|_| protocol_error("validated pack ID could not be parsed"))?;
             let stem = format!("pack-{}", id.to_hex());
             let pack_path = pack_dir.join(format!("{stem}.pack"));
             let index_path = pack_dir.join(format!("{stem}.idx"));
-            let pack_exists = pack_path.is_file();
-            let index_exists = index_path.is_file();
-
-            if pack_exists && index_exists {
-                let verify_started = Instant::now();
-                match verify_pair_paths(&pack_path, &index_path, descriptor, self.hash, budget) {
-                    Ok(bytes) => {
-                        stats.bytes_verified = stats.bytes_verified.saturating_add(bytes);
-                        stats.verify_ms =
-                            stats.verify_ms.saturating_add(elapsed_ms(verify_started));
-                        stats.packs_skipped += 1;
-                        continue;
-                    }
-                    Err(error)
-                        if matches!(
-                            error.code,
-                            ErrorCode::PackChecksumMismatch | ErrorCode::IndexChecksumMismatch
-                        ) =>
-                    {
-                        stats.verify_ms =
-                            stats.verify_ms.saturating_add(elapsed_ms(verify_started));
-                        stats.replaced_corrupt += 1;
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else if pack_exists || index_exists {
-                stats.replaced_corrupt += 1;
-            }
-
             let fetch_started = Instant::now();
             let index = self.fetch_artifact(
                 &descriptor.index_key,
@@ -615,6 +646,7 @@ impl<T: RangeTransport> PackFetchOdb<T> {
             write_pair_atomically(&pack_path, &index_path, &pack, &index)?;
             stats.write_ms = stats.write_ms.saturating_add(elapsed_ms(write_started));
             stats.packs_hydrated += 1;
+            lock(&self.verified_packs).insert(descriptor.id.clone());
         }
 
         let open_started = Instant::now();
@@ -627,6 +659,7 @@ impl<T: RangeTransport> PackFetchOdb<T> {
                 verify_pack_checksums: false,
             },
         )?;
+        self.probe_hydrated_packs(&local, &manifest, &pack_dir, budget)?;
         *write_lock(&self.local) = Some(Arc::new(local));
         stats.open_ms = elapsed_ms(open_started);
         stats.elapsed_ms = elapsed_ms(total_started);
@@ -640,6 +673,96 @@ impl<T: RangeTransport> PackFetchOdb<T> {
 
     pub fn provider_down(&self) {
         self.transport.fail_all(provider_down());
+    }
+
+    fn plan_hydration<'a>(
+        &self,
+        manifest: &'a PackManifest,
+        pack_dir: &Path,
+        budget: &Budget,
+        stats: &mut HydrationStats,
+    ) -> Result<Vec<HydrationPlanItem<'a>>, Error> {
+        let mut plan = Vec::with_capacity(manifest.packs.len());
+        for descriptor in &manifest.packs {
+            budget.check()?;
+            let stem = format!("pack-{}", descriptor.id.to_ascii_lowercase());
+            let pack_path = pack_dir.join(format!("{stem}.pack"));
+            let index_path = pack_dir.join(format!("{stem}.idx"));
+            let pack_exists = pack_path.is_file();
+            let index_exists = index_path.is_file();
+            let verified_here = lock(&self.verified_packs).contains(&descriptor.id);
+
+            if pack_exists && index_exists {
+                let verify_started = Instant::now();
+                let verification = if verified_here {
+                    verify_pair_sizes(&pack_path, &index_path, descriptor).map(|()| 0)
+                } else {
+                    verify_pair_paths(&pack_path, &index_path, descriptor, self.hash, budget)
+                };
+                match verification {
+                    Ok(bytes) => {
+                        stats.bytes_verified = stats.bytes_verified.saturating_add(bytes);
+                        stats.verify_ms =
+                            stats.verify_ms.saturating_add(elapsed_ms(verify_started));
+                        stats.packs_skipped += 1;
+                        lock(&self.verified_packs).insert(descriptor.id.clone());
+                        plan.push(HydrationPlanItem {
+                            descriptor,
+                            fetch: false,
+                        });
+                        continue;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            ErrorCode::PackChecksumMismatch | ErrorCode::IndexChecksumMismatch
+                        ) =>
+                    {
+                        stats.verify_ms =
+                            stats.verify_ms.saturating_add(elapsed_ms(verify_started));
+                        stats.replaced_corrupt += 1;
+                        lock(&self.verified_packs).remove(&descriptor.id);
+                        remove_destination_pair(pack_dir, &descriptor.id);
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if pack_exists || index_exists {
+                stats.replaced_corrupt += 1;
+                lock(&self.verified_packs).remove(&descriptor.id);
+                remove_destination_pair(pack_dir, &descriptor.id);
+            }
+
+            plan.push(HydrationPlanItem {
+                descriptor,
+                fetch: true,
+            });
+        }
+        Ok(plan)
+    }
+
+    fn probe_hydrated_packs(
+        &self,
+        local: &LocalOdb,
+        manifest: &PackManifest,
+        pack_dir: &Path,
+        budget: &Budget,
+    ) -> Result<(), Error> {
+        for descriptor in &manifest.packs {
+            budget.check()?;
+            let index_path =
+                pack_dir.join(format!("pack-{}.idx", descriptor.id.to_ascii_lowercase()));
+            let probe = first_index_oid(&index_path, self.hash)
+                .and_then(|oid| local.try_header(&oid, budget).map(|header| (oid, header)));
+            if !matches!(probe, Ok((_oid, Some(_header)))) {
+                remove_destination_pair(pack_dir, &descriptor.id);
+                lock(&self.verified_packs).remove(&descriptor.id);
+                return Err(Error::new(
+                    ErrorCode::MalformedObject,
+                    format!("hydrated pack {} failed the open-time probe", descriptor.id),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn fetch_artifact(
@@ -718,21 +841,6 @@ impl<T: RangeTransport> PackFetchOdb<T> {
     }
 }
 
-impl<T: RangeTransport> Drop for PackFetchOdb<T> {
-    fn drop(&mut self) {
-        if self.options.cleanup_destination {
-            if let Err(error) = std::fs::remove_dir_all(&self.options.destination) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "gitility: could not clean memory PackFetch destination {}: {error}",
-                        self.options.destination.display()
-                    );
-                }
-            }
-        }
-    }
-}
-
 impl<T: RangeTransport> ObjectDb for PackFetchOdb<T> {
     fn hash_kind(&self) -> HashKind {
         self.hash
@@ -801,6 +909,92 @@ fn verify_pair_paths(
     budget.check()?;
     verify_pair_bytes(&pack, &index, descriptor, hash)?;
     Ok(bytes)
+}
+
+fn verify_pair_sizes(
+    pack_path: &Path,
+    index_path: &Path,
+    descriptor: &PackDescriptor,
+) -> Result<(), Error> {
+    let pack_size = pack_path
+        .metadata()
+        .map_err(|_| checksum_error(ErrorCode::PackChecksumMismatch, "could not inspect"))?
+        .len();
+    if pack_size != descriptor.pack_size {
+        return Err(checksum_error(
+            ErrorCode::PackChecksumMismatch,
+            "size does not match manifest",
+        ));
+    }
+    let index_size = index_path
+        .metadata()
+        .map_err(|_| checksum_error(ErrorCode::IndexChecksumMismatch, "could not inspect"))?
+        .len();
+    if index_size != descriptor.index_size {
+        return Err(checksum_error(
+            ErrorCode::IndexChecksumMismatch,
+            "size does not match manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn first_index_oid(index_path: &Path, hash: HashKind) -> Result<Oid, Error> {
+    const FANOUT_BYTES: usize = 256 * 4;
+    const V2_HEADER_BYTES: usize = 8;
+    const V1_ENTRY_OFFSET_BYTES: usize = 4;
+
+    let mut file = File::open(index_path).map_err(|_| {
+        Error::new(
+            ErrorCode::MalformedObject,
+            "could not open hydrated index for its open-time probe",
+        )
+    })?;
+    let mut prefix = vec![0u8; V2_HEADER_BYTES + FANOUT_BYTES + hash.digest_len()];
+    file.read_exact(&mut prefix).map_err(|_| {
+        Error::new(
+            ErrorCode::MalformedObject,
+            "hydrated index is too short for its open-time probe",
+        )
+    })?;
+
+    let (fanout_start, oid_start) = if prefix.starts_with(b"\xfftOc") {
+        if prefix[4..8] != [0, 0, 0, 2] {
+            return Err(Error::new(
+                ErrorCode::MalformedObject,
+                "hydrated index version is unsupported",
+            ));
+        }
+        (V2_HEADER_BYTES, V2_HEADER_BYTES + FANOUT_BYTES)
+    } else {
+        (0, FANOUT_BYTES + V1_ENTRY_OFFSET_BYTES)
+    };
+    let count_offset = fanout_start + FANOUT_BYTES - 4;
+    let count = u32::from_be_bytes(
+        prefix[count_offset..count_offset + 4]
+            .try_into()
+            .expect("fanout count has four bytes"),
+    );
+    if count == 0 {
+        return Err(Error::new(
+            ErrorCode::MalformedObject,
+            "hydrated index contains no objects",
+        ));
+    }
+    let oid_end = oid_start + hash.digest_len();
+    Oid::new(hash, &prefix[oid_start..oid_end]).map_err(|_| {
+        Error::new(
+            ErrorCode::MalformedObject,
+            "hydrated index contains an invalid first object ID",
+        )
+    })
+}
+
+fn remove_destination_pair(pack_dir: &Path, id: &str) {
+    let stem = format!("pack-{}", id.to_ascii_lowercase());
+    for extension in ["pack", "idx"] {
+        let _ = std::fs::remove_file(pack_dir.join(format!("{stem}.{extension}")));
+    }
 }
 
 fn projected_destination_bytes(pack_dir: &Path, manifest: &PackManifest) -> Result<u64, Error> {
@@ -1022,6 +1216,21 @@ fn protocol_error(message: &'static str) -> Error {
     Error::new(ErrorCode::ProviderProtocolError, message)
 }
 
+fn hydration_budget_error(message: &'static str) -> Error {
+    Error::new(ErrorCode::BudgetExceeded, message).with_limit("max_hydration_bytes")
+}
+
+fn remap_hydration_budget(error: Error, context: &'static str) -> Error {
+    if error.code == ErrorCode::BudgetExceeded && error.limit == Some("max_provider_bytes") {
+        hydration_budget_error(match context {
+            "pack manifest reply" => "pack manifest reply exceeds max_hydration_bytes",
+            _ => "pack hydration exceeds max_hydration_bytes",
+        })
+    } else {
+        error
+    }
+}
+
 fn backend_error() -> Error {
     Error::retryable(ErrorCode::BackendError, "range backend callback failed")
 }
@@ -1059,6 +1268,69 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Clone)]
+    struct MemoryTransport {
+        manifest: PackManifest,
+        artifacts: Arc<BTreeMap<String, Vec<u8>>>,
+        read_calls: Arc<AtomicUsize>,
+        short_reply: bool,
+    }
+
+    impl RangeTransport for MemoryTransport {
+        fn manifest(&self, _budget: &Budget) -> Result<PackManifest, Error> {
+            Ok(self.manifest.clone())
+        }
+
+        fn read_ranges(
+            &self,
+            ranges: &[ByteRange],
+            _budget: &Budget,
+        ) -> Result<Vec<Vec<u8>>, Error> {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            ranges
+                .iter()
+                .map(|range| {
+                    let source = self.artifacts.get(&range.key).ok_or_else(backend_error)?;
+                    let start = usize::try_from(range.offset)
+                        .map_err(|_| protocol_error("test range offset is too large"))?;
+                    let length = usize::try_from(range.length)
+                        .map_err(|_| protocol_error("test range length is too large"))?;
+                    let end = start
+                        .checked_add(length)
+                        .ok_or_else(|| protocol_error("test range overflows"))?;
+                    let mut bytes = source.get(start..end).ok_or_else(backend_error)?.to_vec();
+                    if self.short_reply && !bytes.is_empty() {
+                        bytes.pop();
+                    }
+                    Ok(bytes)
+                })
+                .collect()
+        }
+
+        fn fail_all(&self, _error: Error) {}
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "gitility-packfetch-{label}-{}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("test directory is created");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn descriptor(id: &str) -> PackDescriptor {
         PackDescriptor {
@@ -1078,6 +1350,74 @@ mod tests {
             hash: HashKind::Sha1,
             packs: vec![descriptor(&"1".repeat(40))],
             loose: Vec::new(),
+        }
+    }
+
+    fn fixture_pair() -> (PackManifest, BTreeMap<String, Vec<u8>>) {
+        let pack_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/generated/sha1-basic-mixed.git/objects/pack");
+        let pack_path = std::fs::read_dir(&pack_dir)
+            .expect("fixture pack directory exists")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("pack"))
+            .expect("fixture has a pack");
+        let index_path = pack_path.with_extension("idx");
+        let id = pack_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_prefix("pack-"))
+            .expect("fixture pack is content-addressed")
+            .to_owned();
+        let pack = std::fs::read(&pack_path).expect("fixture pack is readable");
+        let index = std::fs::read(&index_path).expect("fixture index is readable");
+        let descriptor = PackDescriptor {
+            id: id.clone(),
+            pack_key: format!("packs/pack-{id}.pack"),
+            index_key: format!("packs/pack-{id}.idx"),
+            pack_size: pack.len() as u64,
+            index_size: index.len() as u64,
+            etag: None,
+        };
+        let artifacts = BTreeMap::from([
+            (descriptor.pack_key.clone(), pack),
+            (descriptor.index_key.clone(), index),
+        ]);
+        (
+            PackManifest {
+                version: 1,
+                generation: "fixture-generation".to_owned(),
+                hash: HashKind::Sha1,
+                packs: vec![descriptor],
+                loose: Vec::new(),
+            },
+            artifacts,
+        )
+    }
+
+    fn transport(
+        manifest: PackManifest,
+        artifacts: BTreeMap<String, Vec<u8>>,
+    ) -> (MemoryTransport, Arc<AtomicUsize>) {
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        (
+            MemoryTransport {
+                manifest,
+                artifacts: Arc::new(artifacts),
+                read_calls: read_calls.clone(),
+                short_reply: false,
+            },
+            read_calls,
+        )
+    }
+
+    fn options(destination: &Path) -> PackFetchOptions {
+        PackFetchOptions {
+            destination: destination.to_path_buf(),
+            chunk_bytes: 257,
+            concurrency: 3,
+            max_hydration_bytes: 4 * 1024 * 1024 * 1024,
+            max_bytes: None,
         }
     }
 
@@ -1130,5 +1470,235 @@ mod tests {
             value.described_bytes().unwrap_err().code,
             ErrorCode::ProviderProtocolError
         );
+    }
+
+    #[test]
+    fn fetch_artifact_windows_exact_bytes_and_rejects_short_replies() {
+        let directory = TestDir::new("fetch-artifact");
+        let (manifest, artifacts) = fixture_pair();
+        let expected = artifacts[&manifest.packs[0].pack_key].clone();
+        let (exact_transport, _) = transport(manifest.clone(), artifacts.clone());
+        let store = PackFetchOdb::new(HashKind::Sha1, options(&directory.0), exact_transport)
+            .expect("store is valid");
+        let actual = store
+            .fetch_artifact(
+                &manifest.packs[0].pack_key,
+                expected.len() as u64,
+                113,
+                &Budget::unlimited(),
+            )
+            .expect("exact transport succeeds");
+        assert_eq!(actual, expected);
+
+        let (mut transport, _) = transport(manifest.clone(), artifacts);
+        transport.short_reply = true;
+        let store = PackFetchOdb::new(HashKind::Sha1, options(&directory.0), transport)
+            .expect("store is valid");
+        assert_eq!(
+            store
+                .fetch_artifact(
+                    &manifest.packs[0].pack_key,
+                    manifest.packs[0].pack_size,
+                    113,
+                    &Budget::unlimited(),
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::ProviderProtocolError
+        );
+    }
+
+    #[test]
+    fn verify_pair_bytes_checks_pack_index_and_pairing_boundaries() {
+        let (manifest, artifacts) = fixture_pair();
+        let descriptor = &manifest.packs[0];
+        let pack = &artifacts[&descriptor.pack_key];
+        let index = &artifacts[&descriptor.index_key];
+        verify_pair_bytes(pack, index, descriptor, HashKind::Sha1).expect("fixture pair verifies");
+
+        let mut bad_pack = pack.clone();
+        bad_pack[0] ^= 1;
+        assert_eq!(
+            verify_pair_bytes(&bad_pack, index, descriptor, HashKind::Sha1)
+                .unwrap_err()
+                .code,
+            ErrorCode::PackChecksumMismatch
+        );
+
+        let mut bad_index = index.clone();
+        bad_index[0] ^= 1;
+        assert_eq!(
+            verify_pair_bytes(pack, &bad_index, descriptor, HashKind::Sha1)
+                .unwrap_err()
+                .code,
+            ErrorCode::IndexChecksumMismatch
+        );
+
+        let mut wrong_pair = descriptor.clone();
+        wrong_pair.id = "0".repeat(40);
+        assert_eq!(
+            verify_pair_bytes(pack, index, &wrong_pair, HashKind::Sha1)
+                .unwrap_err()
+                .code,
+            ErrorCode::PackChecksumMismatch
+        );
+    }
+
+    #[test]
+    fn warm_open_skips_fetch_and_refresh_uses_in_memory_verification_marker() {
+        let directory = TestDir::new("warm-skip");
+        let (manifest, artifacts) = fixture_pair();
+        let (first_transport, _) = transport(manifest.clone(), artifacts.clone());
+        let first = PackFetchOdb::new(HashKind::Sha1, options(&directory.0), first_transport)
+            .expect("store is valid");
+        assert_eq!(
+            first
+                .hydrate(&Budget::unlimited())
+                .expect("cold hydration succeeds")
+                .packs_hydrated,
+            1
+        );
+        let refresh = first
+            .hydrate(&Budget::unlimited())
+            .expect("warm refresh succeeds");
+        assert_eq!(refresh.packs_skipped, 1);
+        assert_eq!(refresh.bytes_fetched, 0);
+        assert_eq!(refresh.bytes_verified, 0);
+
+        assert!(manifest.described_bytes().unwrap() > 1024);
+        let mut warm_options = options(&directory.0);
+        warm_options.max_hydration_bytes = 1024;
+        let (warm_transport, warm_reads) = transport(manifest, artifacts);
+        let warm = PackFetchOdb::new(HashKind::Sha1, warm_options, warm_transport)
+            .expect("store is valid");
+        let warm_budget = Budget::unlimited();
+        let stats = warm
+            .hydrate(&warm_budget)
+            .expect("restart re-verifies but fetches nothing");
+        assert_eq!(stats.packs_skipped, 1);
+        assert_eq!(stats.bytes_fetched, 0);
+        assert!(stats.bytes_verified > 0);
+        assert_eq!(warm_reads.load(Ordering::Relaxed), 0);
+        assert!(warm_budget.spent().3 > 0);
+    }
+
+    #[test]
+    fn corrupt_preexisting_pair_is_removed_replaced_and_reopened() {
+        let directory = TestDir::new("replace-corrupt");
+        let (manifest, artifacts) = fixture_pair();
+        let (first_transport, _) = transport(manifest.clone(), artifacts.clone());
+        PackFetchOdb::new(HashKind::Sha1, options(&directory.0), first_transport)
+            .expect("store is valid")
+            .hydrate(&Budget::unlimited())
+            .expect("cold hydration succeeds");
+
+        let descriptor = &manifest.packs[0];
+        let index_path = directory
+            .0
+            .join("objects/pack")
+            .join(format!("pack-{}.idx", descriptor.id));
+        let mut corrupt = std::fs::read(&index_path).expect("hydrated index exists");
+        corrupt[0] ^= 1;
+        std::fs::write(&index_path, corrupt).expect("index is corrupted in place");
+
+        let (replacement_transport, _) = transport(manifest.clone(), artifacts.clone());
+        let replacement =
+            PackFetchOdb::new(HashKind::Sha1, options(&directory.0), replacement_transport)
+                .expect("store is valid");
+        let stats = replacement
+            .hydrate(&Budget::unlimited())
+            .expect("corrupt pair is replaced");
+        assert_eq!(stats.replaced_corrupt, 1);
+        assert_eq!(stats.packs_hydrated, 1);
+        assert_eq!(
+            std::fs::read(index_path).expect("replacement index exists"),
+            artifacts[&descriptor.index_key]
+        );
+    }
+
+    #[test]
+    fn hydration_ceiling_rejects_cold_plan_before_any_range_read() {
+        let directory = TestDir::new("cold-ceiling");
+        let (manifest, artifacts) = fixture_pair();
+        let (transport, reads) = transport(manifest, artifacts);
+        let mut options = options(&directory.0);
+        options.max_hydration_bytes = 1;
+        let error = PackFetchOdb::new(HashKind::Sha1, options, transport)
+            .expect("store is valid")
+            .hydrate(&Budget::unlimited())
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BudgetExceeded);
+        assert_eq!(error.limit, Some("max_hydration_bytes"));
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        assert!(PackFetchOptions::default().max_hydration_bytes > 300 * 1024 * 1024);
+    }
+
+    #[test]
+    fn checksum_consistent_forged_index_fails_probe_and_cleans_pair() {
+        let directory = TestDir::new("forged-probe");
+        let (manifest, mut artifacts) = fixture_pair();
+        let descriptor = &manifest.packs[0];
+        let mut index = artifacts[&descriptor.index_key].clone();
+        let count = u32::from_be_bytes(index[8 + 255 * 4..8 + 256 * 4].try_into().unwrap());
+        let offset_table = 8 + 256 * 4 + count as usize * 20 + count as usize * 4;
+        index[offset_table..offset_table + 4].copy_from_slice(&0x7fff_ffffu32.to_be_bytes());
+        let checksum_start = index.len() - HashKind::Sha1.digest_len();
+        let checksum = hash_bytes(
+            HashKind::Sha1,
+            &index[..checksum_start],
+            ErrorCode::IndexChecksumMismatch,
+        )
+        .expect("forged index checksum is computed");
+        index[checksum_start..].copy_from_slice(checksum.as_bytes());
+        verify_pair_bytes(
+            &artifacts[&descriptor.pack_key],
+            &index,
+            descriptor,
+            HashKind::Sha1,
+        )
+        .expect("acquisition checksums alone accept the forgery");
+        artifacts.insert(descriptor.index_key.clone(), index);
+
+        let (transport, _) = transport(manifest.clone(), artifacts);
+        let error = PackFetchOdb::new(HashKind::Sha1, options(&directory.0), transport)
+            .expect("store is valid")
+            .hydrate(&Budget::unlimited())
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::MalformedObject);
+        assert!(error.message.contains("failed the open-time probe"));
+        let pack_dir = directory.0.join("objects/pack");
+        assert!(!pack_dir
+            .join(format!("pack-{}.pack", descriptor.id))
+            .exists());
+        assert!(!pack_dir
+            .join(format!("pack-{}.idx", descriptor.id))
+            .exists());
+    }
+
+    #[test]
+    fn pair_publication_replaces_through_temp_files_and_leaves_no_temps() {
+        let directory = TestDir::new("temp-rename");
+        let pack_path = directory.0.join("pack-deadbeef.pack");
+        let index_path = directory.0.join("pack-deadbeef.idx");
+        std::fs::write(&pack_path, b"old-pack").unwrap();
+        std::fs::write(&index_path, b"old-index").unwrap();
+
+        write_pair_atomically(&pack_path, &index_path, b"new-pack", b"new-index")
+            .expect("pair is atomically published");
+        assert_eq!(std::fs::read(&pack_path).unwrap(), b"new-pack");
+        assert_eq!(std::fs::read(&index_path).unwrap(), b"new-index");
+        assert!(std::fs::read_dir(&directory.0).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+
+        let temp = TempFile::write(&pack_path, b"never-published").unwrap();
+        let temp_path = temp.path.clone().expect("temp path exists");
+        drop(temp);
+        assert!(!temp_path.exists());
+        assert_eq!(std::fs::read(pack_path).unwrap(), b"new-pack");
     }
 }

@@ -45,6 +45,8 @@ enum StoreImpl {
 
 type NifPackFetch = PackFetchOdb<CallbackRangeTransport<NifRangeRequestSender>>;
 
+const MAX_PACK_MANIFEST_ENTRIES: usize = 100_000;
+
 #[derive(Clone)]
 struct NifProviderTransport {
     provider: LocalPid,
@@ -595,8 +597,8 @@ struct PackFetchStoreOptions<'a> {
     destination: Binary<'a>,
     chunk_bytes: u64,
     concurrency: u64,
+    max_hydration_bytes: u64,
     max_bytes: Option<u64>,
-    cleanup_destination: bool,
 }
 
 #[derive(Clone, Copy, NifMap)]
@@ -1080,8 +1082,8 @@ fn packfetch_store_new<'a>(
         destination: Path::new(OsStr::from_bytes(opts.destination.as_slice())).to_path_buf(),
         chunk_bytes: opts.chunk_bytes,
         concurrency,
+        max_hydration_bytes: opts.max_hydration_bytes,
         max_bytes: opts.max_bytes,
-        cleanup_destination: opts.cleanup_destination,
     };
     match PackFetchOdb::new(hash, options, transport) {
         Ok(store) => Ok(Result::<_, ErrorMap>::Ok((
@@ -1326,9 +1328,27 @@ fn decode_pack_manifest(term: Term<'_>) -> Result<PackManifest, Error> {
     } else {
         return Err(range_protocol_error("pack manifest hash kind is unknown"));
     };
-    let pack_terms = term
+    let pack_list = term
         .map_get(atoms::packs())
-        .and_then(Vec::<Term<'_>>::decode)
+        .map_err(|_| range_protocol_error("pack manifest packs must be a list"))?;
+    let loose_list = term
+        .map_get(atoms::loose())
+        .map_err(|_| range_protocol_error("pack manifest loose must be a list"))?;
+    let pack_count = pack_list
+        .list_length()
+        .map_err(|_| range_protocol_error("pack manifest packs must be a list"))?;
+    let loose_count = loose_list
+        .list_length()
+        .map_err(|_| range_protocol_error("pack manifest loose must be a list"))?;
+    if pack_count
+        .checked_add(loose_count)
+        .is_none_or(|count| count > MAX_PACK_MANIFEST_ENTRIES)
+    {
+        return Err(range_protocol_error(
+            "pack manifest exceeds the 100000-entry protocol ceiling",
+        ));
+    }
+    let pack_terms = Vec::<Term<'_>>::decode(pack_list)
         .map_err(|_| range_protocol_error("pack manifest packs must be a list"))?;
     let mut packs = Vec::with_capacity(pack_terms.len());
     for pack in pack_terms {
@@ -1347,9 +1367,7 @@ fn decode_pack_manifest(term: Term<'_>) -> Result<PackManifest, Error> {
             etag: decode_optional_utf8_map_binary(pack, atoms::etag(), "etag")?,
         });
     }
-    let loose_terms = term
-        .map_get(atoms::loose())
-        .and_then(Vec::<Term<'_>>::decode)
+    let loose_terms = Vec::<Term<'_>>::decode(loose_list)
         .map_err(|_| range_protocol_error("pack manifest loose must be a list"))?;
     let loose = loose_terms
         .into_iter()
@@ -2512,6 +2530,7 @@ fn limit_atom(limit: &str) -> Option<Atom> {
         "max_total_object_bytes" => Some(atoms::max_total_object_bytes()),
         "max_provider_requests" => Some(atoms::max_provider_requests()),
         "max_provider_bytes" => Some(atoms::max_provider_bytes()),
+        "max_hydration_bytes" => Some(atoms::max_hydration_bytes()),
         "max_tree_entries" => Some(atoms::max_tree_entries()),
         "max_results" => Some(atoms::max_results()),
         "max_diff_files" => Some(atoms::max_diff_files()),
@@ -2590,6 +2609,7 @@ mod atoms {
         max_total_object_bytes,
         max_provider_requests,
         max_provider_bytes,
+        max_hydration_bytes,
         max_tree_entries,
         max_results,
         max_diff_files,

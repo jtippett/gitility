@@ -835,6 +835,9 @@ defmodule Gitility.ODB do
   # remaining in-child failures.
   defp provider_start_error({:backend_init, reason}), do: {:error, reason}
 
+  defp provider_start_error({:backend_init_raised, message}),
+    do: {:error, {:backend_init_raised, message}}
+
   defp provider_start_error(
          {:shutdown, {:failed_to_start_child, Provider, {:backend_init, reason}}}
        ),

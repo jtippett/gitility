@@ -57,8 +57,12 @@ defmodule Gitility.ODB.Provider.Supervisor do
       other -> {:error, {:backend_init, {:invalid_return, other}}}
     end
   rescue
-    exception -> {:error, {:backend_init, {:raised, Exception.message(exception)}}}
+    exception -> {:error, {:backend_init_raised, Exception.message(exception)}}
+  catch
+    kind, value -> {:error, {:backend_init_raised, "#{kind}: #{safe_inspect(value)}"}}
   end
+
+  defp safe_inspect(term), do: inspect(term, limit: 20, printable_limit: 256)
 
   @impl Supervisor
   def init(opts) do

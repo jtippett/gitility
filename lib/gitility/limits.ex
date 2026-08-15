@@ -10,7 +10,11 @@ defmodule Gitility.Limits do
 
   A job's full budget includes cache misses and provider work: bytes fetched
   from a backend on your behalf count against `max_provider_bytes` even when
-  a later cache hit would have been free.
+  a later cache hit would have been free. That 256 MiB default is a
+  query-time, per-job safety ceiling. Explicit `Gitility.ODB.PackFetch`
+  hydration is a one-time bulk load and uses its separate
+  `:max_hydration_bytes` option (4 GiB by default) without changing these
+  query defaults.
 
   When a limit stops work early, the operation still succeeds: the result
   carries `truncated: true`, a cursor when continuation is possible, and the

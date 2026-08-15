@@ -22,13 +22,21 @@ defmodule Gitility.ODB.PackFetch do
   `into: {:dir, path}` writes only beneath the explicit path, using
   `objects/pack/pack-<checksum>.{pack,idx}`. Existing valid pairs are reused;
   corrupt pairs are replaced. Removed manifest entries are retained in 0.2 —
-  refresh never deletes packs during the publisher's grace period.
+  refresh never deletes packs during the publisher's grace period. If a
+  later pack fails, earlier verified pairs remain for the next attempt; no
+  unverified file is left under a final name. Within one store lifetime,
+  refresh size-checks already verified pairs and is O(new packs). A restart
+  re-hashes the whole reused volume once because trust is never persisted to
+  disk.
 
   `into: :memory` is available only on Linux. It uses a caller-invisible
   directory below `/dev/shm`, which is a RAM-backed tmpfs, enforces
-  `max_bytes`, and removes the directory when the native store is released.
-  This is not a bytes-in-Rust gix store: stock gix-pack is path-only and
-  mmap-based (design finding F7). macOS and other platforms return
+  `max_bytes`, and removes the directory during orderly provider shutdown.
+  Native resource destruction never performs filesystem work on a BEAM
+  scheduler. An abnormal death can leave this bounded tmpfs directory; the
+  next `start_link/1` with the same `:name` sweeps it before starting. This is
+  not a bytes-in-Rust gix store: stock gix-pack is path-only and mmap-based
+  (design finding F7). macOS and other platforms return
   `:unsupported_operation`; use an explicit directory there.
 
   `into: {:bundle, path}` is reserved for `Gitility.Bundle` later in 0.2 and
@@ -49,8 +57,14 @@ defmodule Gitility.ODB.PackFetch do
       `15_000`).
     * `:verify` — only `:always` is accepted.
     * `:runtime` — query runtime (default shared).
-    * `:limits` — hydration `Gitility.Limits`; the whole manifest is checked
-      against `max_provider_bytes` before the first range read.
+    * `:max_hydration_bytes` — bytes the hydration plan may actually fetch
+      (default 4 GiB). This one-time bulk-load ceiling is distinct from
+      query-time `Gitility.Limits.max_provider_bytes` (default 256 MiB).
+      Existing pairs are verified before planning, so a warm volume is
+      charged only for manifest metadata plus missing or corrupt pairs.
+    * `:limits` — the other hydration-job ceilings and timeout. Hydration
+      always replaces this struct's `max_provider_bytes` with
+      `max_hydration_bytes`; query-time limits are unchanged.
     * `:max_bytes` — RAM destination ceiling (default 256 MiB); used only by
       `into: :memory`.
   """
@@ -59,6 +73,7 @@ defmodule Gitility.ODB.PackFetch do
 
   @default_chunk_bytes 8 * 1024 * 1024
   @default_memory_bytes 256 * 1024 * 1024
+  @default_hydration_bytes 4 * 1024 * 1024 * 1024
 
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) do
@@ -74,6 +89,7 @@ defmodule Gitility.ODB.PackFetch do
         verify: :always,
         runtime: :default,
         limits: nil,
+        max_hydration_bytes: @default_hydration_bytes,
         max_bytes: @default_memory_bytes
       )
 
@@ -86,8 +102,11 @@ defmodule Gitility.ODB.PackFetch do
          {:ok, concurrency} <- positive(opts[:concurrency], :concurrency),
          {:ok, chunk_bytes} <- positive(opts[:chunk_bytes], :chunk_bytes),
          {:ok, request_timeout} <- positive(opts[:request_timeout], :request_timeout),
-         {:ok, destination, cleanup?, max_bytes} <- destination(opts[:into], opts[:max_bytes]),
-         {:ok, limits} <- hydration_limits(opts[:limits], max_bytes),
+         {:ok, max_hydration_bytes} <-
+           positive(opts[:max_hydration_bytes], :max_hydration_bytes),
+         {:ok, destination, cleanup?, max_bytes} <-
+           destination(opts[:into], opts[:max_bytes], name),
+         {:ok, limits} <- hydration_limits(opts[:limits], max_hydration_bytes),
          {:ok, runtime, _runtime_resource} <- NativeSupport.runtime_and_resource(opts[:runtime]),
          {:ok, supervisor} <-
            Gitility.ODB.Provider.Supervisor.start_link(
@@ -99,13 +118,14 @@ defmodule Gitility.ODB.PackFetch do
              request_timeout: request_timeout,
              runtime: runtime,
              packfetch_limits: limits,
+             packfetch_cleanup_destination: if(cleanup?, do: destination),
              packfetch_options: %{
                request_timeout_ms: request_timeout,
                destination: destination,
                chunk_bytes: chunk_bytes,
                concurrency: concurrency,
-               max_bytes: max_bytes,
-               cleanup_destination: cleanup?
+               max_hydration_bytes: max_hydration_bytes,
+               max_bytes: max_bytes
              }
            ),
          {:ok, _stats} <- hydrate_supervisor(supervisor, limits) do
@@ -117,6 +137,12 @@ defmodule Gitility.ODB.PackFetch do
 
       {:error, %Error{} = error} ->
         {:error, error}
+
+      {:error, {:backend_init, reason}} ->
+        {:error, reason}
+
+      {:error, {:backend_init_raised, message}} ->
+        {:error, {:backend_init_raised, message}}
 
       {:error, reason} ->
         {:error,
@@ -133,7 +159,8 @@ defmodule Gitility.ODB.PackFetch do
   def child_spec(opts) do
     %{
       id: Keyword.get(opts, :name) || {__MODULE__, make_ref()},
-      start: {__MODULE__, :start_link, [opts]}
+      start: {__MODULE__, :start_link, [opts]},
+      type: :supervisor
     }
   end
 
@@ -165,14 +192,19 @@ defmodule Gitility.ODB.PackFetch do
     end
   end
 
-  defp destination({:dir, path}, _max_bytes) when is_binary(path) and byte_size(path) > 0 do
+  defp destination({:dir, path}, _max_bytes, _name)
+       when is_binary(path) and byte_size(path) > 0 do
     {:ok, Path.expand(path), false, nil}
   end
 
-  defp destination(:memory, max_bytes) when is_integer(max_bytes) and max_bytes > 0 do
+  defp destination(:memory, max_bytes, name) when is_integer(max_bytes) and max_bytes > 0 do
     if memory_supported?() do
-      unique = System.unique_integer([:positive, :monotonic])
-      {:ok, "/dev/shm/gitility-packfetch-#{unique}", true, max_bytes}
+      key = memory_destination_key(name)
+
+      with :ok <- sweep_memory_leftovers(name, key) do
+        unique = System.unique_integer([:positive, :monotonic])
+        {:ok, "/dev/shm/gitility-packfetch-#{key}-#{unique}", true, max_bytes}
+      end
     else
       {:error,
        Error.new(
@@ -183,10 +215,10 @@ defmodule Gitility.ODB.PackFetch do
     end
   end
 
-  defp destination(:memory, _max_bytes),
+  defp destination(:memory, _max_bytes, _name),
     do: NativeSupport.invalid_argument(":max_bytes must be a positive integer for into: :memory")
 
-  defp destination({:bundle, path}, _max_bytes) when is_binary(path) do
+  defp destination({:bundle, path}, _max_bytes, _name) when is_binary(path) do
     {:error,
      Error.new(
        :unsupported_operation,
@@ -195,23 +227,50 @@ defmodule Gitility.ODB.PackFetch do
      )}
   end
 
-  defp destination(_into, _max_bytes) do
+  defp destination(_into, _max_bytes, _name) do
     NativeSupport.invalid_argument(":into must be :memory, {:dir, path}, or {:bundle, path}")
   end
 
-  defp hydration_limits(nil, max_bytes) when is_integer(max_bytes) do
-    {:ok, Limits.new(max_provider_bytes: max_bytes)}
+  defp hydration_limits(nil, max_hydration_bytes) do
+    {:ok, Limits.new(max_provider_bytes: max_hydration_bytes)}
   end
 
-  defp hydration_limits(nil, nil), do: {:ok, Limits.new()}
-
-  defp hydration_limits(%Limits{} = limits, _max_bytes) do
+  defp hydration_limits(%Limits{} = limits, max_hydration_bytes) do
     NativeSupport.limits_map!(limits)
-    {:ok, limits}
+    {:ok, %{limits | max_provider_bytes: max_hydration_bytes}}
   end
 
-  defp hydration_limits(_limits, _max_bytes) do
+  defp hydration_limits(_limits, _max_hydration_bytes) do
     NativeSupport.invalid_argument(":limits must be a Gitility.Limits struct")
+  end
+
+  defp memory_destination_key(name) do
+    name
+    |> :erlang.term_to_binary()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, 16)
+  end
+
+  defp sweep_memory_leftovers(name, key) do
+    if registered?(name) do
+      :ok
+    else
+      "/dev/shm/gitility-packfetch-#{key}-*"
+      |> Path.wildcard()
+      |> Enum.reduce_while(:ok, fn path, :ok ->
+        case File.rm_rf(path) do
+          {:ok, _removed} -> {:cont, :ok}
+          {:error, _reason, _file} -> {:halt, {:error, :memory_cleanup_failed}}
+        end
+      end)
+    end
+  end
+
+  defp registered?(name) do
+    is_pid(GenServer.whereis(name))
+  catch
+    :exit, _reason -> false
   end
 
   defp validate_backend({module, _arg}) when is_atom(module) do

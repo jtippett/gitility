@@ -14,6 +14,6 @@ defmodule Gitility.ByteRange do
   @type t :: %__MODULE__{
           key: binary(),
           offset: non_neg_integer(),
-          length: pos_integer()
+          length: non_neg_integer()
         }
 end

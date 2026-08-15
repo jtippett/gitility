@@ -36,6 +36,8 @@ defmodule Gitility.MixProject do
     [
       {:rustler, "~> 0.38", optional: true},
       {:rustler_precompiled, "~> 0.9"},
+      {:jason, "~> 1.4"},
+      {:postgrex, "~> 0.22.4", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end

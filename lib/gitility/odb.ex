@@ -130,12 +130,15 @@ defmodule Gitility.ODB do
       true ->
         native_objects = Enum.map(objects, &native_object!/1)
 
-        case Native.static_from_objects(native_objects, hash) do
-          {:ok, {resource, ^hash}} ->
-            {:ok, %__MODULE__{kind: :static, ref: resource, hash: hash, runtime: :default}}
+        with {:ok, runtime, _runtime_resource} <-
+               NativeSupport.runtime_and_resource(opts[:runtime]) do
+          case Native.static_from_objects(native_objects, hash) do
+            {:ok, {resource, ^hash}} ->
+              {:ok, %__MODULE__{kind: :static, ref: resource, hash: hash, runtime: runtime}}
 
-          {:error, error} ->
-            {:error, NativeSupport.nif_error(error, :odb_from_objects)}
+            {:error, error} ->
+              {:error, NativeSupport.nif_error(error, :odb_from_objects)}
+          end
         end
     end
   end
@@ -179,17 +182,25 @@ defmodule Gitility.ODB do
   """
   @spec header(t(), OID.t() | String.t(), keyword()) ::
           {:ok, ObjectHeader.t()} | {:error, Error.t()}
-  def header(%__MODULE__{ref: resource} = _odb, oid, opts \\ []) do
+  def header(%__MODULE__{ref: resource, runtime: runtime} = _odb, oid, opts \\ []) do
     opts = Keyword.validate!(opts, limits: nil)
     limits = opts[:limits] || Limits.new()
     limits_map = NativeSupport.limits_map!(limits)
 
     with {:ok, oid} <- NativeSupport.parse_oid(oid),
-         {:ok, header} <- Native.odb_header(resource, oid.bytes, limits_map) do
+         {:ok, header} <-
+           NativeSupport.await_sync(
+             fn ->
+               NativeSupport.submit_job(runtime, :odb_header, fn runtime_resource ->
+                 Native.job_submit_odb_header(runtime_resource, resource, oid.bytes, limits_map)
+               end)
+             end,
+             limits.timeout_ms,
+             :odb_header
+           ) do
       {:ok, %ObjectHeader{oid: oid, type: header.kind, size: header.size}}
     else
       {:error, %Error{} = error} -> {:error, error}
-      {:error, error} -> {:error, NativeSupport.nif_error(error, :odb_header)}
     end
   end
 
@@ -202,18 +213,32 @@ defmodule Gitility.ODB do
   """
   @spec read(t(), OID.t() | String.t(), keyword()) ::
           {:ok, Object.t()} | {:error, Error.t()}
-  def read(%__MODULE__{ref: resource} = _odb, oid, opts \\ []) do
+  def read(%__MODULE__{ref: resource, runtime: runtime} = _odb, oid, opts \\ []) do
     opts = Keyword.validate!(opts, max_bytes: nil, limits: nil)
     limits = opts[:limits] || Limits.new()
     limits_map = NativeSupport.limits_map!(limits)
 
     with {:ok, max_bytes} <- effective_cap(opts[:max_bytes], limits.max_object_bytes, :max_bytes),
          {:ok, oid} <- NativeSupport.parse_oid(oid),
-         {:ok, object} <- Native.odb_read(resource, oid.bytes, max_bytes, limits_map) do
+         {:ok, object} <-
+           NativeSupport.await_sync(
+             fn ->
+               NativeSupport.submit_job(runtime, :odb_read, fn runtime_resource ->
+                 Native.job_submit_odb_read(
+                   runtime_resource,
+                   resource,
+                   oid.bytes,
+                   max_bytes,
+                   limits_map
+                 )
+               end)
+             end,
+             limits.timeout_ms,
+             :odb_read
+           ) do
       {:ok, %Object{oid: oid, type: object.kind, data: object.data}}
     else
       {:error, %Error{} = error} -> {:error, error}
-      {:error, error} -> {:error, NativeSupport.nif_error(error, :odb_read)}
     end
   end
 
@@ -226,7 +251,7 @@ defmodule Gitility.ODB do
   """
   @spec read_many(t(), [OID.t() | String.t()], keyword()) ::
           {:ok, %{OID.t() => Object.t() | :not_found}} | {:error, Error.t()}
-  def read_many(%__MODULE__{ref: resource, hash: hash} = _odb, oids, opts \\ []) do
+  def read_many(%__MODULE__{ref: resource, hash: hash, runtime: runtime} = _odb, oids, opts \\ []) do
     opts = Keyword.validate!(opts, max_total_bytes: nil, limits: nil)
     limits = opts[:limits] || Limits.new()
     limits_map = NativeSupport.limits_map!(limits)
@@ -239,11 +264,20 @@ defmodule Gitility.ODB do
            ),
          {:ok, parsed_oids} <- parse_oids(oids),
          {:ok, objects} <-
-           Native.odb_read_many(
-             resource,
-             Enum.map(parsed_oids, & &1.bytes),
-             max_total_bytes,
-             limits_map
+           NativeSupport.await_sync(
+             fn ->
+               NativeSupport.submit_job(runtime, :odb_read_many, fn runtime_resource ->
+                 Native.job_submit_odb_read_many(
+                   runtime_resource,
+                   resource,
+                   Enum.map(parsed_oids, & &1.bytes),
+                   max_total_bytes,
+                   limits_map
+                 )
+               end)
+             end,
+             limits.timeout_ms,
+             :odb_read_many
            ) do
       {:ok,
        Map.new(objects, fn
@@ -256,7 +290,6 @@ defmodule Gitility.ODB do
        end)}
     else
       {:error, %Error{} = error} -> {:error, error}
-      {:error, error} -> {:error, NativeSupport.nif_error(error, :odb_read_many)}
     end
   end
 

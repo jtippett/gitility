@@ -32,4 +32,4 @@ IO.puts(
     "(pinned #{pinned_git_version})"
 )
 
-ExUnit.start()
+ExUnit.start(exclude: [soak: true])

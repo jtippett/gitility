@@ -34,8 +34,17 @@ defmodule Gitility.Runtime do
   Queue admission can refuse with `{:error, %Gitility.Error{code: :busy}}`
   carrying `retry_after_ms` in `details`. Per-owner ceilings keep one
   process from monopolizing a runtime; internal parallelism (search, diff)
-  stays within a job's assigned permit count.
+  stays within a job's assigned permit count. Asynchronous functions surface
+  `:busy` immediately. Synchronous query wrappers wait `retry_after_ms` and
+  retry admission once before returning `:busy`.
   """
+
+  use GenServer
+
+  alias Gitility.{Error, Native}
+
+  @default_name Gitility.DefaultRuntime
+  @default_key {__MODULE__, :default}
 
   @typedoc "A runtime identifier: a registered name or pid."
   @type t :: atom() | pid()
@@ -52,8 +61,30 @@ defmodule Gitility.Runtime do
   """
   @spec start_link([option()]) :: {:ok, pid()} | {:error, term()}
   def start_link(opts \\ []) do
-    _ = opts
-    Gitility.NotImplementedError.stub!(:"Runtime.start_link/1", "Milestone 2")
+    opts =
+      Keyword.validate!(opts,
+        name: nil,
+        workers: default_workers(),
+        max_queue: 1_000,
+        max_jobs_per_owner: 16
+      )
+
+    name = opts[:name]
+
+    if not is_nil(name) and not is_atom(name) do
+      raise ArgumentError, ":name must be an atom or nil"
+    end
+
+    config = %{
+      workers: positive_option!(opts, :workers),
+      max_queue: positive_option!(opts, :max_queue),
+      max_jobs_per_owner: positive_option!(opts, :max_jobs_per_owner)
+    }
+
+    case name do
+      nil -> GenServer.start_link(__MODULE__, {config, nil})
+      name -> GenServer.start_link(__MODULE__, {config, name}, name: name)
+    end
   end
 
   @doc false
@@ -70,6 +101,113 @@ defmodule Gitility.Runtime do
   """
   @spec default() :: t()
   def default do
-    Gitility.NotImplementedError.stub!(:"Runtime.default/0", "Milestone 2")
+    case :persistent_term.get(@default_key, nil) do
+      pid when is_pid(pid) ->
+        if Process.alive?(pid), do: pid, else: start_default()
+
+      _ ->
+        start_default()
+    end
+  end
+
+  @doc "Returns a runtime's current native admission and lifecycle counters."
+  @spec stats(t()) :: map() | {:error, Error.t()}
+  def stats(runtime \\ default()) do
+    with {:ok, resource} <- resource(runtime) do
+      Native.runtime_stats(resource)
+    end
+  end
+
+  @doc false
+  @spec resource(t()) :: {:ok, term()} | {:error, Error.t()}
+  def resource(runtime) when is_pid(runtime) or is_atom(runtime) do
+    try do
+      GenServer.call(runtime, :resource)
+    catch
+      :exit, _reason ->
+        {:error, Error.new(:cancelled, "runtime shut down")}
+    end
+  end
+
+  def resource(_runtime),
+    do: {:error, Error.new(:invalid_argument, "expected a runtime name or pid")}
+
+  @impl GenServer
+  def init({config, name}) do
+    Process.flag(:trap_exit, true)
+    resource = Native.runtime_start(config)
+
+    if name == @default_name do
+      :persistent_term.put(@default_key, self())
+    end
+
+    {:ok, %{resource: resource, default?: name == @default_name}}
+  end
+
+  @impl GenServer
+  def handle_call(:resource, _from, state), do: {:reply, {:ok, state.resource}, state}
+
+  @impl GenServer
+  def terminate(_reason, state) do
+    if state.default? and :persistent_term.get(@default_key, nil) == self() do
+      :persistent_term.erase(@default_key)
+    end
+
+    Native.runtime_shutdown(state.resource)
+    :ok
+  end
+
+  defp start_default do
+    child = {__MODULE__, name: @default_name}
+
+    case Supervisor.start_child(Gitility.Supervisor, child) do
+      {:ok, pid} ->
+        pid
+
+      {:error, {:already_started, pid}} ->
+        pid
+
+      {:error, :already_present} ->
+        Process.whereis(@default_name) || retry_default()
+
+      {:error, {:already_present, _child}} ->
+        Process.whereis(@default_name) || retry_default()
+    end
+  end
+
+  defp retry_default do
+    await_default(System.monotonic_time(:millisecond) + 5_000)
+  end
+
+  defp await_default(deadline) do
+    case :persistent_term.get(@default_key, nil) do
+      pid when is_pid(pid) ->
+        pid
+
+      _ ->
+        case Process.whereis(@default_name) do
+          pid when is_pid(pid) ->
+            pid
+
+          nil ->
+            if System.monotonic_time(:millisecond) >= deadline do
+              raise "default Gitility runtime failed to start"
+            else
+              receive do
+              after
+                1 -> await_default(deadline)
+              end
+            end
+        end
+    end
+  end
+
+  defp default_workers, do: max(div(System.schedulers_online(), 2), 1)
+
+  defp positive_option!(opts, key) do
+    case Keyword.fetch!(opts, key) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> raise ArgumentError, ":#{key} must be a positive integer"
+    end
   end
 end

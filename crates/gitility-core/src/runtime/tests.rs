@@ -862,3 +862,100 @@ fn deterministic_four_worker_mixed_stress_reconciles_counters() {
     assert_eq!(runtime.running_count(), 0);
     assert_eq!(runtime.queue_len(), 0);
 }
+
+mod thread_budget_tests {
+    use super::super::thread_budget::{BudgetExhausted, ThreadBudget};
+    use super::super::{Runtime, RuntimeConfig};
+
+    fn leaked_budget(limit: usize) -> &'static ThreadBudget {
+        Box::leak(Box::new(ThreadBudget::new(limit)))
+    }
+
+    fn config(workers: usize) -> RuntimeConfig {
+        RuntimeConfig {
+            workers,
+            max_queue: 4,
+            max_jobs_per_owner: 4,
+            retry_after_ms: 1,
+        }
+    }
+
+    #[test]
+    fn reservations_release_on_drop() {
+        let budget = leaked_budget(8);
+        let first = budget.try_reserve(3).expect("3 of 8 fits");
+        assert_eq!(budget.used(), 3);
+        let second = budget.try_reserve(5).expect("8 of 8 fits");
+        assert_eq!(budget.used(), 8);
+        drop(first);
+        assert_eq!(budget.used(), 5);
+        drop(second);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn exhaustion_reports_observed_state() {
+        let budget = leaked_budget(4);
+        let _held = budget.try_reserve(3).expect("3 of 4 fits");
+        let error = budget.try_reserve(2).expect_err("2 more exceeds 4");
+        assert_eq!(
+            error,
+            BudgetExhausted {
+                requested: 2,
+                used: 3,
+                limit: 4
+            }
+        );
+    }
+
+    #[test]
+    fn split_reservations_release_independently() {
+        let budget = leaked_budget(4);
+        let mut reservation = budget.try_reserve(2).expect("2 of 4 fits");
+        let split = reservation.split_one();
+        assert_eq!(reservation.count(), 1);
+        assert_eq!(split.count(), 1);
+        drop(reservation);
+        assert_eq!(budget.used(), 1);
+        drop(split);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn start_fails_before_spawning_when_budget_is_exhausted() {
+        let budget = leaked_budget(4);
+        let _held = budget.try_reserve(2).expect("2 of 4 fits");
+        let error = Runtime::start_with_budget(config(3), budget).expect_err("3 more exceeds 4");
+        assert_eq!(error.requested, 3);
+        assert_eq!(error.used, 2);
+        assert_eq!(error.limit, 4);
+        assert_eq!(budget.used(), 2, "a refused start reserves nothing");
+    }
+
+    #[test]
+    fn shutdown_returns_every_worker_slot() {
+        let budget = leaked_budget(4);
+        let runtime = Runtime::start_with_budget(config(3), budget).expect("3 of 4 fits");
+        assert_eq!(budget.used(), 3);
+        runtime.shutdown();
+        // shutdown() joins the workers, and each worker's reservation drops
+        // when its loop returns, so the release is observable here.
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn zero_workers_reserves_the_normalized_single_worker() {
+        let budget = leaked_budget(4);
+        let runtime = Runtime::start_with_budget(config(0), budget).expect("1 of 4 fits");
+        assert_eq!(budget.used(), 1);
+        runtime.shutdown();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn global_budget_has_a_positive_limit() {
+        let budget = super::super::thread_budget::global();
+        assert!(budget.limit() > 0);
+        assert!(budget.used() <= budget.limit());
+    }
+}

@@ -16,21 +16,52 @@ defmodule Gitility.Native do
     force_build: System.get_env("GITILITY_BUILD") in ["1", "true"]
 
   def ping(), do: :erlang.nif_error(:nif_not_loaded)
+  def runtime_start(_config), do: :erlang.nif_error(:nif_not_loaded)
+  def runtime_shutdown(_runtime), do: :erlang.nif_error(:nif_not_loaded)
+  def runtime_stats(_runtime), do: :erlang.nif_error(:nif_not_loaded)
   def open_local(_path, _opts), do: :erlang.nif_error(:nif_not_loaded)
   def static_from_objects(_objects, _hash), do: :erlang.nif_error(:nif_not_loaded)
   def snapshot_open(_resource, _oid, _limits), do: :erlang.nif_error(:nif_not_loaded)
-  def odb_header(_resource, _oid, _limits), do: :erlang.nif_error(:nif_not_loaded)
-  def odb_read(_resource, _oid, _max_bytes, _limits), do: :erlang.nif_error(:nif_not_loaded)
 
-  def odb_read_many(_resource, _oids, _max_total_bytes, _limits),
+  def job_submit_odb_header(_runtime, _resource, _oid, _limits),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  def list_tree(_resource, _commit_oid, _tree_oid, _opts, _limits),
+  def job_submit_odb_read(_runtime, _resource, _oid, _max_bytes, _limits),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  def read_file(_resource, _commit_oid, _tree_oid, _path, _opts, _limits),
+  def job_submit_odb_read_many(_runtime, _resource, _oids, _max_total_bytes, _limits),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  def peel(_resource, _oid, _to, _limits), do: :erlang.nif_error(:nif_not_loaded)
+  def job_submit_list_tree(
+        _runtime,
+        _resource,
+        _commit_oid,
+        _tree_oid,
+        _opts,
+        _limits,
+        _detach
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def job_submit_read_file(
+        _runtime,
+        _resource,
+        _commit_oid,
+        _tree_oid,
+        _path,
+        _opts,
+        _limits,
+        _detach
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def job_submit_peel(_runtime, _resource, _oid, _to, _limits),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def job_register_waiter(_job), do: :erlang.nif_error(:nif_not_loaded)
+  def job_deregister_waiter(_job), do: :erlang.nif_error(:nif_not_loaded)
+  def job_cancel(_job), do: :erlang.nif_error(:nif_not_loaded)
+  def job_state(_job), do: :erlang.nif_error(:nif_not_loaded)
+  def job_take_result(_job), do: :erlang.nif_error(:nif_not_loaded)
   def error_codes(), do: :erlang.nif_error(:nif_not_loaded)
 end

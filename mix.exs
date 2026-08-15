@@ -27,6 +27,7 @@ defmodule Gitility.MixProject do
 
   def application do
     [
+      mod: {Gitility.Application, []},
       extra_applications: [:logger]
     ]
   end

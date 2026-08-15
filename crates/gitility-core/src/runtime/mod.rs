@@ -15,6 +15,7 @@
 
 mod observer;
 mod sync;
+pub mod thread_budget;
 
 use crate::budget::{Budget, BudgetLimits};
 use crate::error::{Error, ErrorCode};
@@ -30,6 +31,7 @@ use std::sync::atomic::{AtomicBool as StdAtomicBool, Ordering as StdOrdering};
 use std::sync::Arc as StdArc;
 use std::time::{Duration, Instant};
 use sync::{Arc, AtomicBool, AtomicU64, AtomicU8, Condvar, Mutex, Ordering};
+pub use thread_budget::BudgetExhausted;
 
 /// Opaque identity assigned by the eventual NIF layer to a job owner.
 pub type OwnerKey = u64;
@@ -488,7 +490,33 @@ impl Runtime {
     /// Since the infallible API cannot report an invalid zero-worker
     /// configuration, `workers: 0` is normalized to one worker so accepted
     /// jobs can never be stranded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process-wide [`thread_budget`] cannot admit the
+    /// requested workers. Callers that must handle exhaustion gracefully —
+    /// the NIF layer in particular — use [`Runtime::try_start`].
     pub fn start(config: RuntimeConfig) -> Arc<Self> {
+        match Self::try_start(config) {
+            Ok(runtime) => runtime,
+            Err(error) => panic!("gitility thread budget exhausted: {error}"),
+        }
+    }
+
+    /// Starts an independent worker pool if the process-wide
+    /// [`thread_budget`] admits `config.workers` more threads; otherwise
+    /// reports the budget state without spawning anything.
+    pub fn try_start(config: RuntimeConfig) -> Result<Arc<Self>, BudgetExhausted> {
+        Self::start_with_budget(config, thread_budget::global())
+    }
+
+    pub(crate) fn start_with_budget(
+        config: RuntimeConfig,
+        budget: &'static thread_budget::ThreadBudget,
+    ) -> Result<Arc<Self>, BudgetExhausted> {
+        let worker_count = config.workers.max(1);
+        let mut reservation = budget.try_reserve(worker_count)?;
+
         let runtime = Arc::new(Self {
             shared: Arc::new(Shared::new(config)),
             workers: Mutex::new(Vec::new()),
@@ -501,13 +529,17 @@ impl Runtime {
         });
 
         let mut spawn_failed = false;
-        for worker_index in 0..config.workers.max(1) {
+        for worker_index in 0..worker_count {
             let shared = Arc::clone(&runtime.shared);
+            // Each worker owns exactly its slot, releasing it when the loop
+            // returns — including by unwind — so joins are never required
+            // for the budget to recover.
+            let worker_reservation = reservation.split_one();
             let name = format!("gitility-worker-{worker_index}");
-            match sync::thread::Builder::new()
-                .name(name)
-                .spawn(move || worker_loop(shared))
-            {
+            match sync::thread::Builder::new().name(name).spawn(move || {
+                let _budget_reservation = worker_reservation;
+                worker_loop(shared)
+            }) {
                 Ok(handle) => {
                     sync::lock(&runtime.worker_ids).push(handle.thread().id());
                     sync::lock(&runtime.workers).push(handle);
@@ -518,10 +550,11 @@ impl Runtime {
                 }
             }
         }
+        drop(reservation);
         if spawn_failed {
             runtime.shutdown();
         }
-        runtime
+        Ok(runtime)
     }
 
     /// Admits one job or returns bounded-backpressure metadata.

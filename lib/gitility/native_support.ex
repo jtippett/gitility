@@ -1,7 +1,7 @@
 defmodule Gitility.NativeSupport do
   @moduledoc false
 
-  alias Gitility.{Error, Limits, ODB, OID, Repository}
+  alias Gitility.{Error, File, Job, Limits, ODB, OID, Page, Repository, Runtime, Stats, TreeEntry}
 
   @known_limit_names %{
     "timeout_ms" => :timeout_ms,
@@ -61,6 +61,15 @@ defmodule Gitility.NativeSupport do
     {:error, Error.new(:invalid_argument, "expected a Gitility.Repository or Gitility.ODB")}
   end
 
+  def store_runtime(%Repository{odb: odb}), do: store_runtime(odb)
+
+  def store_runtime(%ODB{ref: resource, hash: hash, runtime: runtime}),
+    do: {:ok, resource, hash, runtime}
+
+  def store_runtime(_value) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Repository or Gitility.ODB")}
+  end
+
   def boolean_option!(opts, key) do
     value = Keyword.fetch!(opts, key)
 
@@ -73,13 +82,98 @@ defmodule Gitility.NativeSupport do
 
   def nif_error(%{code: code, message: message, retryable: retryable} = error, operation) do
     details =
-      case Map.get(error, :limit) do
-        nil -> %{}
-        limit -> %{limit: Map.get(@known_limit_names, limit, limit)}
-      end
+      %{}
+      |> maybe_put(:limit, normalize_limit(Map.get(error, :limit)))
+      |> maybe_put(:retry_after_ms, Map.get(error, :retry_after_ms))
+      |> maybe_put(:reason, Map.get(error, :reason))
 
     Error.new(code, message, retryable: retryable, operation: operation, details: details)
   end
+
+  def runtime_and_resource(:default), do: runtime_and_resource(Runtime.default())
+
+  def runtime_and_resource(runtime) do
+    case Runtime.resource(runtime) do
+      {:ok, resource} -> {:ok, runtime, resource}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  def submit_job(runtime, operation, submit) when is_function(submit, 1) do
+    with {:ok, runtime, runtime_resource} <- runtime_and_resource(runtime) do
+      case submit.(runtime_resource) do
+        {:ok, {ref, id}} ->
+          {:ok, %Job{ref: ref, id: id, owner: self(), runtime: runtime}}
+
+        {:error, error} ->
+          {:error, nif_error(error, operation)}
+      end
+    end
+  end
+
+  def await_sync(submit, timeout_ms, operation) when is_function(submit, 0) do
+    result =
+      case submit.() do
+        {:error, %Error{code: :busy, details: %{retry_after_ms: retry_after_ms}}}
+        when is_integer(retry_after_ms) ->
+          Process.sleep(retry_after_ms)
+          submit.()
+
+        other ->
+          other
+      end
+
+    case result do
+      {:ok, job} ->
+        case Job.await(job, timeout_ms + 500) do
+          {:error, %Error{} = error} -> {:error, %{error | operation: operation}}
+          success -> success
+        end
+
+      error ->
+        error
+    end
+  end
+
+  def job_payload(%{entries: entries, next_cursor: cursor, stats: stats} = page) do
+    items =
+      Enum.map(entries, fn entry ->
+        %TreeEntry{
+          path: entry.path,
+          name: entry.name,
+          oid: job_oid(entry.oid),
+          type: entry.kind,
+          mode: entry.mode,
+          size: entry.size
+        }
+      end)
+
+    %Page{
+      items: items,
+      next_cursor: if(cursor, do: Base.url_encode64(cursor, padding: false)),
+      truncated: page.truncated,
+      stats: struct!(Stats, Map.to_list(stats)),
+      warnings: page_warnings(page.truncated, stats.stopped_by)
+    }
+  end
+
+  def job_payload(%{blob_oid: blob_oid, path: path, data: data} = file)
+      when is_binary(blob_oid) and is_binary(path) and is_binary(data) do
+    %File{
+      path: path,
+      blob_oid: job_oid(blob_oid),
+      mode: file.mode,
+      kind: file.kind,
+      data: data,
+      start_line: file.start_line,
+      end_line: file.end_line,
+      total_lines: file.total_lines,
+      truncated: file.truncated,
+      lfs_pointer: file.lfs_pointer
+    }
+  end
+
+  def job_payload(payload), do: payload
 
   def invalid_argument(message), do: {:error, Error.new(:invalid_argument, message)}
 
@@ -90,4 +184,19 @@ defmodule Gitility.NativeSupport do
        "ref selectors arrive with the ref adapter milestone (0.2 / Milestone 4)"
      )}
   end
+
+  defp job_oid(bytes) when byte_size(bytes) == 20, do: oid_from_bytes(:sha1, bytes)
+  defp job_oid(bytes) when byte_size(bytes) == 32, do: oid_from_bytes(:sha256, bytes)
+
+  defp page_warnings(false, _stopped_by), do: []
+
+  defp page_warnings(true, stopped_by) do
+    [%{code: :truncated, message: "page truncated by #{stopped_by || "an unknown limit"}"}]
+  end
+
+  defp normalize_limit(nil), do: nil
+  defp normalize_limit(limit), do: Map.get(@known_limit_names, limit, limit)
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

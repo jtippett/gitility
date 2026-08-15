@@ -76,19 +76,20 @@ defmodule Gitility.Repository do
     verify_pack_checksums = NativeSupport.boolean_option!(opts, :verify_pack_checksums)
 
     _object_cache_bytes = opts[:object_cache_bytes]
-    # cache wiring lands with the M2 runtime
-    _runtime = opts[:runtime]
 
-    case Native.open_local(path, %{
-           require_bare: require_bare,
-           verify_pack_checksums: verify_pack_checksums
-         }) do
-      {:ok, {resource, hash}} ->
-        odb = %ODB{kind: :local, ref: resource, hash: hash, runtime: :default}
-        {:ok, %__MODULE__{odb: odb, refs: nil}}
+    with {:ok, runtime, _runtime_resource} <-
+           NativeSupport.runtime_and_resource(opts[:runtime]) do
+      case Native.open_local(path, %{
+             require_bare: require_bare,
+             verify_pack_checksums: verify_pack_checksums
+           }) do
+        {:ok, {resource, hash}} ->
+          odb = %ODB{kind: :local, ref: resource, hash: hash, runtime: runtime}
+          {:ok, %__MODULE__{odb: odb, refs: nil}}
 
-      {:error, error} ->
-        {:error, NativeSupport.nif_error(error, :repository_open)}
+        {:error, error} ->
+          {:error, NativeSupport.nif_error(error, :repository_open)}
+      end
     end
   end
 

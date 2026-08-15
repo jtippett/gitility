@@ -29,13 +29,18 @@ defmodule Gitility.Job do
   walks, scans, diffs, blame, provider waits, and pack decoding.
   """
 
-  alias Gitility.{Error, NotImplementedError}
+  alias Gitility.{Error, Native, NativeSupport}
 
   @typedoc "An opaque job handle."
-  @opaque t :: %__MODULE__{ref: term(), owner: pid()}
+  @opaque t :: %__MODULE__{
+            ref: term(),
+            id: pos_integer(),
+            owner: pid(),
+            runtime: Gitility.Runtime.t()
+          }
 
-  @enforce_keys [:ref, :owner]
-  defstruct [:ref, :owner]
+  @enforce_keys [:ref, :id, :owner, :runtime]
+  defstruct [:ref, :id, :owner, :runtime]
 
   @typedoc "Job lifecycle states."
   @type status :: :queued | :running | :completed | :failed | :cancelled
@@ -45,25 +50,72 @@ defmodule Gitility.Job do
   (`retryable: true`); all other errors are the job's own outcome.
   """
   @spec await(t(), timeout()) :: {:ok, term()} | {:error, Error.t()}
-  def await(job, timeout \\ 30_000) do
-    _ = {job, timeout}
-    NotImplementedError.stub!(:"Job.await/2", "Milestone 2")
+  def await(job, timeout \\ 5_000)
+
+  def await(%__MODULE__{} = job, timeout)
+      when timeout == :infinity or (is_integer(timeout) and timeout >= 0) do
+    case Native.job_register_waiter(job.ref) do
+      :terminal ->
+        take(job)
+
+      :registered ->
+        receive do
+          {:gitility_job, id, :done} when id == job.id ->
+            flush_notifications(job.id)
+            take(job)
+        after
+          timeout ->
+            :ok = Native.job_deregister_waiter(job.ref)
+            flush_notifications(job.id)
+
+            {:error,
+             Error.new(:await_timeout, "timed out awaiting job",
+               retryable: true,
+               operation: :job_await
+             )}
+        end
+    end
   end
+
+  def await(%__MODULE__{}, _timeout), do: raise(ArgumentError, "timeout must be non-negative")
 
   @doc """
   Cancels the job. Idempotent; a completed job is unaffected. Cancellation
   latency is bounded — native work checks the interrupt at every loop.
   """
   @spec cancel(t()) :: :ok
-  def cancel(job) do
-    _ = job
-    NotImplementedError.stub!(:"Job.cancel/1", "Milestone 2")
-  end
+  def cancel(%__MODULE__{ref: ref}), do: Native.job_cancel(ref)
 
   @doc "The job's current lifecycle state."
   @spec status(t()) :: status()
-  def status(job) do
-    _ = job
-    NotImplementedError.stub!(:"Job.status/1", "Milestone 2")
+  def status(%__MODULE__{ref: ref}), do: Native.job_state(ref)
+
+  # Taking a terminal result also demonitor its original owner in the NIF.
+  # The monitor has completed its abandonment-safety job at that point.
+  defp take(job) do
+    case Native.job_take_result(job.ref) do
+      {:ok, payload} ->
+        {:ok, NativeSupport.job_payload(payload)}
+
+      {:error, error} ->
+        {:error, NativeSupport.nif_error(error, :job)}
+
+      :already_taken ->
+        {:error, Error.new(:invalid_argument, "result already taken", operation: :job_await)}
+
+      :not_terminal ->
+        {:error,
+         Error.new(:invalid_argument, "job notification arrived before terminal state",
+           operation: :job_await
+         )}
+    end
+  end
+
+  defp flush_notifications(id) do
+    receive do
+      {:gitility_job, ^id, :done} -> flush_notifications(id)
+    after
+      0 -> :ok
+    end
   end
 end

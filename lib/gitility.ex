@@ -59,9 +59,7 @@ defmodule Gitility do
     OID,
     Page,
     Repository,
-    Snapshot,
-    Stats,
-    TreeEntry
+    Snapshot
   }
 
   @typedoc "Any handle that can answer plumbing queries: a repository or ODB."
@@ -92,75 +90,14 @@ defmodule Gitility do
   """
   @spec list_tree(Snapshot.t(), binary(), keyword()) ::
           {:ok, Page.t(Gitility.TreeEntry.t())} | {:error, Error.t()}
-  def list_tree(
-        %Snapshot{odb: %ODB{ref: resource, hash: hash}} = snapshot,
-        path \\ "",
-        opts \\ []
-      ) do
-    opts =
-      Keyword.validate!(opts,
-        recursive: false,
-        depth: nil,
-        types: [:blob, :tree, :symlink, :gitlink],
-        pathspecs: [],
-        include: [],
-        limit: 1_000,
-        cursor: nil,
-        limits: nil
-      )
+  def list_tree(%Snapshot{} = snapshot, path \\ "", opts \\ []) do
+    {opts, limits} = list_tree_options!(opts)
 
-    limits = opts[:limits] || Limits.new()
-    limits_map = NativeSupport.limits_map!(limits)
-    recursive = NativeSupport.boolean_option!(opts, :recursive)
-
-    with :ok <- validate_binary(path, "tree path"),
-         {:ok, depth} <- validate_depth(opts[:depth]),
-         {:ok, types} <- validate_tree_types(opts[:types]),
-         {:ok, pathspecs} <- validate_pathspecs(opts[:pathspecs]),
-         {:ok, include_size} <- validate_include(opts[:include]),
-         {:ok, limit} <- effective_page_limit(opts[:limit], limits.max_results),
-         {:ok, cursor} <- decode_cursor(opts[:cursor]),
-         {:ok, page} <-
-           Native.list_tree(
-             resource,
-             snapshot.commit_oid.bytes,
-             snapshot.tree_oid.bytes,
-             %{
-               path: path,
-               recursive: recursive,
-               depth: depth,
-               types: types,
-               pathspecs: pathspecs,
-               include_size: include_size,
-               limit: limit,
-               cursor: cursor
-             },
-             limits_map
-           ) do
-      entries =
-        Enum.map(page.entries, fn entry ->
-          %TreeEntry{
-            path: entry.path,
-            name: entry.name,
-            oid: NativeSupport.oid_from_bytes(hash, entry.oid),
-            type: entry.kind,
-            mode: entry.mode,
-            size: entry.size
-          }
-        end)
-
-      {:ok,
-       %Page{
-         items: entries,
-         next_cursor: encode_cursor(page.next_cursor),
-         truncated: page.truncated,
-         stats: struct!(Stats, Map.to_list(page.stats)),
-         warnings: page_warnings(page.truncated, page.stats.stopped_by)
-       }}
-    else
-      {:error, %Error{} = error} -> {:error, error}
-      {:error, error} -> {:error, NativeSupport.nif_error(error, :list_tree)}
-    end
+    NativeSupport.await_sync(
+      fn -> submit_list_tree(snapshot, path, opts, limits, false) end,
+      limits.timeout_ms,
+      :list_tree
+    )
   end
 
   @doc """
@@ -179,40 +116,14 @@ defmodule Gitility do
   (`lfs_pointer`) but never resolved.
   """
   @spec read_file(Snapshot.t(), binary(), keyword()) :: {:ok, File.t()} | {:error, Error.t()}
-  def read_file(%Snapshot{odb: %ODB{ref: resource, hash: hash}} = snapshot, path, opts \\ []) do
-    opts = Keyword.validate!(opts, lines: nil, max_bytes: 256_000, limits: nil)
-    limits = opts[:limits] || Limits.new()
-    limits_map = NativeSupport.limits_map!(limits)
+  def read_file(%Snapshot{} = snapshot, path, opts \\ []) do
+    {opts, limits} = read_file_options!(opts)
 
-    with :ok <- validate_binary(path, "file path"),
-         {:ok, lines} <- validate_lines(opts[:lines]),
-         {:ok, max_bytes} <- effective_max_bytes(opts[:max_bytes], limits.max_object_bytes),
-         {:ok, file} <-
-           Native.read_file(
-             resource,
-             snapshot.commit_oid.bytes,
-             snapshot.tree_oid.bytes,
-             path,
-             %{lines: lines, max_bytes: max_bytes},
-             limits_map
-           ) do
-      {:ok,
-       %File{
-         path: file.path,
-         blob_oid: NativeSupport.oid_from_bytes(hash, file.blob_oid),
-         mode: file.mode,
-         kind: file.kind,
-         data: file.data,
-         start_line: file.start_line,
-         end_line: file.end_line,
-         total_lines: file.total_lines,
-         truncated: file.truncated,
-         lfs_pointer: file.lfs_pointer
-       }}
-    else
-      {:error, %Error{} = error} -> {:error, error}
-      {:error, error} -> {:error, NativeSupport.nif_error(error, :read_file)}
-    end
+    NativeSupport.await_sync(
+      fn -> submit_read_file(snapshot, path, opts, limits, false) end,
+      limits.timeout_ms,
+      :read_file
+    )
   end
 
   ## ————————————————————————————————————————————————————————————————
@@ -384,14 +295,28 @@ defmodule Gitility do
     limits = opts[:limits] || Limits.new()
     limits_map = NativeSupport.limits_map!(limits)
 
-    with {:ok, resource, hash} <- NativeSupport.store(store),
+    with {:ok, resource, hash, runtime} <- NativeSupport.store_runtime(store),
          {:ok, oid} <- NativeSupport.parse_oid(oid),
          {:ok, target} <- validate_peel_target(opts[:to]),
-         {:ok, peeled} <- Native.peel(resource, oid.bytes, target, limits_map) do
+         {:ok, peeled} <-
+           NativeSupport.await_sync(
+             fn ->
+               NativeSupport.submit_job(runtime, :peel, fn runtime_resource ->
+                 Native.job_submit_peel(
+                   runtime_resource,
+                   resource,
+                   oid.bytes,
+                   target,
+                   limits_map
+                 )
+               end)
+             end,
+             limits.timeout_ms,
+             :peel
+           ) do
       {:ok, NativeSupport.oid_from_bytes(hash, peeled)}
     else
       {:error, %Error{} = error} -> {:error, error}
-      {:error, error} -> {:error, NativeSupport.nif_error(error, :peel)}
     end
   end
 
@@ -477,9 +402,6 @@ defmodule Gitility do
   defp decode_cursor(_cursor),
     do: raise(ArgumentError, ":cursor must be a binary or nil")
 
-  defp encode_cursor(nil), do: nil
-  defp encode_cursor(bytes), do: Base.url_encode64(bytes, padding: false)
-
   defp validate_lines(nil), do: {:ok, nil}
 
   defp validate_lines(%Range{first: first, last: last, step: step})
@@ -511,12 +433,6 @@ defmodule Gitility do
   defp validate_peel_target(_target),
     do: NativeSupport.invalid_argument(":to must be :commit, :tree, or :blob")
 
-  defp page_warnings(false, _stopped_by), do: []
-
-  defp page_warnings(true, stopped_by) do
-    [%{code: :truncated, message: "page truncated by #{stopped_by || "an unknown limit"}"}]
-  end
-
   ## ————————————————————————————————————————————————————————————————
   ## Async variants
   ## ————————————————————————————————————————————————————————————————
@@ -529,17 +445,125 @@ defmodule Gitility do
   @doc "Asynchronous `list_tree/3`; returns the `Gitility.Job`."
   @spec async_list_tree(Snapshot.t(), binary(), keyword()) ::
           {:ok, Job.t()} | {:error, Error.t()}
-  def async_list_tree(snapshot, path \\ "", opts \\ []) do
-    _ = {snapshot, path, opts}
-    NotImplementedError.stub!(:"async_list_tree/3", "Milestone 2")
+  def async_list_tree(%Snapshot{} = snapshot, path \\ "", opts \\ []) do
+    opts =
+      Keyword.validate!(opts,
+        recursive: false,
+        depth: nil,
+        types: [:blob, :tree, :symlink, :gitlink],
+        pathspecs: [],
+        include: [],
+        limit: 1_000,
+        cursor: nil,
+        limits: nil,
+        detach: false
+      )
+
+    detach = NativeSupport.boolean_option!(opts, :detach)
+    {opts, limits} = opts |> Keyword.delete(:detach) |> list_tree_options!()
+    submit_list_tree(snapshot, path, opts, limits, detach)
   end
 
   @doc "Asynchronous `read_file/3`; returns the `Gitility.Job`."
   @spec async_read_file(Snapshot.t(), binary(), keyword()) ::
           {:ok, Job.t()} | {:error, Error.t()}
-  def async_read_file(snapshot, path, opts \\ []) do
-    _ = {snapshot, path, opts}
-    NotImplementedError.stub!(:"async_read_file/3", "Milestone 2")
+  def async_read_file(%Snapshot{} = snapshot, path, opts \\ []) do
+    opts = Keyword.validate!(opts, lines: nil, max_bytes: 256_000, limits: nil, detach: false)
+    detach = NativeSupport.boolean_option!(opts, :detach)
+    {opts, limits} = opts |> Keyword.delete(:detach) |> read_file_options!()
+    submit_read_file(snapshot, path, opts, limits, detach)
+  end
+
+  defp list_tree_options!(opts) do
+    opts =
+      Keyword.validate!(opts,
+        recursive: false,
+        depth: nil,
+        types: [:blob, :tree, :symlink, :gitlink],
+        pathspecs: [],
+        include: [],
+        limit: 1_000,
+        cursor: nil,
+        limits: nil
+      )
+
+    limits = opts[:limits] || Limits.new()
+    _limits_map = NativeSupport.limits_map!(limits)
+    {opts, limits}
+  end
+
+  defp read_file_options!(opts) do
+    opts = Keyword.validate!(opts, lines: nil, max_bytes: 256_000, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    _limits_map = NativeSupport.limits_map!(limits)
+    {opts, limits}
+  end
+
+  defp submit_list_tree(
+         %Snapshot{odb: %ODB{ref: resource, runtime: runtime}} = snapshot,
+         path,
+         opts,
+         limits,
+         detach
+       ) do
+    limits_map = NativeSupport.limits_map!(limits)
+    recursive = NativeSupport.boolean_option!(opts, :recursive)
+
+    with :ok <- validate_binary(path, "tree path"),
+         {:ok, depth} <- validate_depth(opts[:depth]),
+         {:ok, types} <- validate_tree_types(opts[:types]),
+         {:ok, pathspecs} <- validate_pathspecs(opts[:pathspecs]),
+         {:ok, include_size} <- validate_include(opts[:include]),
+         {:ok, limit} <- effective_page_limit(opts[:limit], limits.max_results),
+         {:ok, cursor} <- decode_cursor(opts[:cursor]) do
+      NativeSupport.submit_job(runtime, :list_tree, fn runtime_resource ->
+        Native.job_submit_list_tree(
+          runtime_resource,
+          resource,
+          snapshot.commit_oid.bytes,
+          snapshot.tree_oid.bytes,
+          %{
+            path: path,
+            recursive: recursive,
+            depth: depth,
+            types: types,
+            pathspecs: pathspecs,
+            include_size: include_size,
+            limit: limit,
+            cursor: cursor
+          },
+          limits_map,
+          detach
+        )
+      end)
+    end
+  end
+
+  defp submit_read_file(
+         %Snapshot{odb: %ODB{ref: resource, runtime: runtime}} = snapshot,
+         path,
+         opts,
+         limits,
+         detach
+       ) do
+    limits_map = NativeSupport.limits_map!(limits)
+
+    with :ok <- validate_binary(path, "file path"),
+         {:ok, lines} <- validate_lines(opts[:lines]),
+         {:ok, max_bytes} <- effective_max_bytes(opts[:max_bytes], limits.max_object_bytes) do
+      NativeSupport.submit_job(runtime, :read_file, fn runtime_resource ->
+        Native.job_submit_read_file(
+          runtime_resource,
+          resource,
+          snapshot.commit_oid.bytes,
+          snapshot.tree_oid.bytes,
+          path,
+          %{lines: lines, max_bytes: max_bytes},
+          limits_map,
+          detach
+        )
+      end)
+    end
   end
 
   @doc "Asynchronous `search/3`; returns the `Gitility.Job`."

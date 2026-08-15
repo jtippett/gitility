@@ -5,7 +5,8 @@ defmodule Gitility.ODB.Watchdog do
 
   alias Gitility.Native
 
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+  def start_link(opts),
+    do: GenServer.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
 
   @impl GenServer
   def init(opts) do
@@ -17,23 +18,37 @@ defmodule Gitility.ODB.Watchdog do
       store: nil
     }
 
-    # The provider child starts before the watchdog. Establish the monitor
-    # synchronously so Supervisor.start_link cannot return a handle with an
-    # uncovered provider-death window.
-    case fetch_handle(base.provider) do
-      {:ok, {store, _hash, pid}} ->
-        {:ok, %{base | store: store, pid: pid, monitor: Process.monitor(pid)}}
+    {:ok, base}
+  end
 
-      :error ->
-        {:stop, :provider_not_started}
+  @impl GenServer
+  def handle_call({:watch, pid, store}, _from, state) when is_pid(pid) do
+    if state.monitor, do: Process.demonitor(state.monitor, [:flush])
+    monitor = Process.monitor(pid)
+
+    if Process.alive?(pid) do
+      {:reply, :ok, %{state | store: store, pid: pid, monitor: monitor}}
+    else
+      Process.demonitor(monitor, [:flush])
+      Native.provider_failed(store)
+      {:reply, {:error, :provider_down}, %{state | store: nil, pid: nil, monitor: nil}}
     end
   end
 
   @impl GenServer
   def handle_info(:rewatch, state) do
     case fetch_handle(state.provider) do
-      {:ok, {store, _hash, pid}} ->
-        {:noreply, %{state | store: store, pid: pid, monitor: Process.monitor(pid)}}
+      {:ok, {store, _hash, pid, _runtime, _request_timeout}} ->
+        monitor = Process.monitor(pid)
+
+        if Process.alive?(pid) do
+          {:noreply, %{state | store: store, pid: pid, monitor: monitor}}
+        else
+          Process.demonitor(monitor, [:flush])
+          Native.provider_failed(store)
+          Process.send_after(self(), :rewatch, 10)
+          {:noreply, %{state | store: nil, pid: nil, monitor: nil}}
+        end
 
       :error ->
         Process.send_after(self(), :rewatch, 10)

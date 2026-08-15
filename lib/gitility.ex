@@ -10,8 +10,9 @@ defmodule Gitility do
   ## The model in three steps
 
   1. **Get a store.** `Gitility.Repository.open/2` for a local repository;
-     `Gitility.ODB.start_link/1` / `from_objects/2` for object storage with
-     no filesystem at all. Refs (`Gitility.RefDB`) are optional and separate.
+     `Gitility.ODB.start_link/1` plus `Gitility.ODB.handle/1`, or
+     `Gitility.ODB.from_objects/2`, for object storage with no filesystem at
+     all. Refs (`Gitility.RefDB`) are optional and separate.
   2. **Pin a snapshot.** `Gitility.Repository.snapshot(repo, {:branch, "main"})`
      or `Gitility.Snapshot.open(odb, commit_oid)` resolves a name once and
      records an immutable commit + tree identity.

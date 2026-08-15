@@ -12,7 +12,7 @@ use crate::cursor::{self, Cursor, CursorExpected, OPERATION_LIST_TREE};
 use crate::decode::decode_tree;
 use crate::error::{Error, ErrorCode};
 use crate::object::{HashKind, ObjectKind, Oid};
-use crate::odb::ObjectDb;
+use crate::odb::{HeaderProvenance, ObjectDb};
 use crate::pathspec::PathspecMatcher;
 use crate::snapshot::Snapshot;
 
@@ -303,7 +303,8 @@ impl Walker<'_> {
         }
 
         let mut stack = vec![Frame {
-            entries: read_tree_entries(self.store, oid, self.budget)?.into_iter(),
+            entries: read_tree_entries_for_walk(self.store, oid, self.budget, self.opts.recursive)?
+                .into_iter(),
             prefix: prefix.to_vec(),
             depth: 1,
         }];
@@ -334,17 +335,23 @@ impl Walker<'_> {
                 let size = if self.opts.include_size
                     && matches!(entry.kind, TreeItemKind::Blob | TreeItemKind::Symlink)
                 {
-                    let header = self
+                    let header_read = self
                         .store
-                        .try_header(&entry.oid, self.budget)?
+                        .try_header_with_provenance(&entry.oid, self.budget)?
                         .ok_or_else(|| missing_object(entry.oid, "listed entry"))?;
-                    if header.kind != ObjectKind::Blob {
-                        return Err(Error::new(
-                            ErrorCode::MalformedObject,
-                            format!("listed blob {} addresses a non-blob object", entry.oid),
-                        ));
+                    if header_read.header.kind != ObjectKind::Blob {
+                        return Err(match header_read.provenance {
+                            HeaderProvenance::UnverifiedProvider => Error::new(
+                                ErrorCode::ProviderProtocolError,
+                                "provider header contradicts tree entry kind",
+                            ),
+                            HeaderProvenance::Verified => Error::new(
+                                ErrorCode::MalformedObject,
+                                format!("listed blob {} addresses a non-blob object", entry.oid),
+                            ),
+                        });
                     }
-                    Some(header.size)
+                    Some(header_read.header.size)
                 } else {
                     None
                 };
@@ -360,7 +367,12 @@ impl Walker<'_> {
 
             if should_descend {
                 let depth = depth.saturating_add(1);
-                let entries = read_tree_entries(self.store, entry.oid, self.budget)?;
+                let entries = read_tree_entries_for_walk(
+                    self.store,
+                    entry.oid,
+                    self.budget,
+                    self.opts.recursive,
+                )?;
                 stack.push(Frame {
                     entries: entries.into_iter(),
                     prefix: path,
@@ -454,6 +466,26 @@ fn read_tree_entries(
             })
         })
         .collect()
+}
+
+fn read_tree_entries_for_walk(
+    store: &dyn ObjectDb,
+    oid: Oid,
+    budget: &Budget,
+    prefetch_children: bool,
+) -> Result<Vec<OwnedTreeEntry>, Error> {
+    let entries = read_tree_entries(store, oid, budget)?;
+    if prefetch_children && store.supports_prefetch() {
+        let child_trees = entries
+            .iter()
+            .filter(|entry| entry.kind == TreeItemKind::Tree)
+            .map(|entry| entry.oid)
+            .collect::<Vec<_>>();
+        if !child_trees.is_empty() {
+            store.prefetch(&child_trees, budget)?;
+        }
+    }
+    Ok(entries)
 }
 
 pub(crate) fn kind_from_mode(mode: u32) -> Result<TreeItemKind, Error> {

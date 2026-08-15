@@ -10,9 +10,32 @@
 use crate::budget::Budget;
 use crate::error::Error;
 use crate::object::{HashKind, ObjectHeader, ObjectKind, Oid};
+use std::sync::Arc;
 
-/// One owned payload result in a batch, retaining misses as `None`.
-pub type ObjectReadResult = Option<(ObjectKind, Vec<u8>)>;
+/// One shared payload result in a batch, retaining misses as `None`.
+pub type ObjectReadResult = Option<(ObjectKind, Arc<Vec<u8>>)>;
+
+/// Whether a header was derived from verified payload bytes or supplied as
+/// unverifiable provider metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderProvenance {
+    Verified,
+    UnverifiedProvider,
+}
+
+/// A header together with the provenance needed by consumers that reconcile
+/// it with verified repository structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderRead {
+    pub header: ObjectHeader,
+    pub provenance: HeaderProvenance,
+}
+
+/// Per-call result-materialization ceiling for a batch read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadManyBudget {
+    pub max_total_bytes: Option<u64>,
+}
 
 /// A content-addressed, read-only object store.
 ///
@@ -27,6 +50,22 @@ pub trait ObjectDb: Send + Sync + 'static {
     /// the store does not have it. Charged against the budget by the
     /// implementation.
     fn try_header(&self, oid: &Oid, budget: &Budget) -> Result<Option<ObjectHeader>, Error>;
+
+    /// Reads a header and reports whether its metadata came from verified
+    /// bytes. Local/static stores use this default; providers override it for
+    /// direct `read_headers` replies.
+    fn try_header_with_provenance(
+        &self,
+        oid: &Oid,
+        budget: &Budget,
+    ) -> Result<Option<HeaderRead>, Error> {
+        self.try_header(oid, budget).map(|header| {
+            header.map(|header| HeaderRead {
+                header,
+                provenance: HeaderProvenance::Verified,
+            })
+        })
+    }
 
     /// Reads an object's payload into `out` (cleared first), returning
     /// its kind, or `None` if the store does not have it.
@@ -44,12 +83,30 @@ pub trait ObjectDb: Send + Sync + 'static {
     /// algorithms ask for one object at a time. Cross-job coalescing is not
     /// part of v1, but can be added without changing this contract.
     fn try_find_many(&self, oids: &[Oid], budget: &Budget) -> Result<Vec<ObjectReadResult>, Error> {
+        self.try_find_many_bounded(oids, budget, ReadManyBudget::default())
+    }
+
+    /// Reads a batch while stopping before the first object that would exceed
+    /// the per-call result ceiling. The default is intentionally incremental,
+    /// so local and static stores do not decode the remainder after failure.
+    fn try_find_many_bounded(
+        &self,
+        oids: &[Oid],
+        budget: &Budget,
+        read_budget: ReadManyBudget,
+    ) -> Result<Vec<ObjectReadResult>, Error> {
         let mut results = Vec::with_capacity(oids.len());
+        let mut total = 0u64;
         for oid in oids {
             let mut data = Vec::new();
-            let value = self
-                .try_find(oid, &mut data, budget)?
-                .map(|kind| (kind, data));
+            let value = match self.try_find(oid, &mut data, budget)? {
+                Some(kind) => {
+                    total = total.saturating_add(data.len() as u64);
+                    enforce_read_many_budget(total, read_budget)?;
+                    Some((kind, Arc::new(data)))
+                }
+                None => None,
+            };
             results.push(value);
         }
         Ok(results)
@@ -63,6 +120,11 @@ pub trait ObjectDb: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether tree walkers should emit prefetch hints for child trees.
+    fn supports_prefetch(&self) -> bool {
+        false
+    }
+
     /// Invalidates availability knowledge — a missing object may have
     /// arrived in a shallow or incrementally populated store. The default
     /// does nothing.
@@ -70,6 +132,23 @@ pub trait ObjectDb: Send + Sync + 'static {
         let _ = budget;
         Ok(())
     }
+}
+
+pub(crate) fn enforce_read_many_budget(
+    total: u64,
+    read_budget: ReadManyBudget,
+) -> Result<(), Error> {
+    if read_budget
+        .max_total_bytes
+        .is_some_and(|maximum| total > maximum)
+    {
+        return Err(Error::new(
+            crate::error::ErrorCode::ResultTooLarge,
+            "object batch exceeds max_total_bytes",
+        )
+        .with_limit("max_total_bytes"));
+    }
+    Ok(())
 }
 
 /// Compile-time proof the contract stays `dyn`-compatible; algorithms
@@ -83,8 +162,35 @@ mod tests {
     use crate::error::ErrorCode;
     use crate::static_odb::StaticOdb;
     use crate::verify::object_id;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    struct CountingStore {
+        calls: Arc<AtomicUsize>,
+        payload: Vec<u8>,
+    }
+
+    impl ObjectDb for CountingStore {
+        fn hash_kind(&self) -> HashKind {
+            HashKind::Sha1
+        }
+
+        fn try_header(&self, _oid: &Oid, _budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
+            Ok(None)
+        }
+
+        fn try_find(
+            &self,
+            _oid: &Oid,
+            out: &mut Vec<u8>,
+            _budget: &Budget,
+        ) -> Result<Option<ObjectKind>, Error> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            out.clear();
+            out.extend_from_slice(&self.payload);
+            Ok(Some(ObjectKind::Blob))
+        }
+    }
 
     /// The M0→M1 gate: the real static store drives the contract through
     /// a `&dyn ObjectDb`, no engine and no filesystem.
@@ -133,6 +239,29 @@ mod tests {
         db.prefetch(&[blob_oid, commit_oid], &budget)
             .expect("prefetch default succeeds");
         db.refresh(&budget).expect("refresh default succeeds");
+    }
+
+    #[test]
+    fn default_bounded_batch_stops_decoding_at_the_first_oversized_result() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = CountingStore {
+            calls: Arc::clone(&calls),
+            payload: vec![1, 2],
+        };
+        let oids = (0..6)
+            .map(|byte| Oid::new(HashKind::Sha1, &[byte; 20]).unwrap())
+            .collect::<Vec<_>>();
+        let error = store
+            .try_find_many_bounded(
+                &oids,
+                &Budget::unlimited(),
+                ReadManyBudget {
+                    max_total_bytes: Some(1),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResultTooLarge);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

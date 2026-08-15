@@ -822,6 +822,12 @@ It rejects a mismatched ID, kind, or size. Verification is Gitility's own code
 and is hash-agnostic (both SHA-1 and SHA-256) independent of upstream (R1).
 Cached objects are immutable and keyed by hash algorithm plus full object ID.
 Abbreviated IDs are resolved only by stores that can prove uniqueness.
+Header replies cannot be verified (there is no payload to hash). Gitility
+trusts them for type/size metadata only; they never influence which bytes are
+served (payload reads always verify). A backend that cannot answer headers
+truthfully should not export `read_headers` — the fallback verifies via full
+reads. Direct header sizes have a 2^40-byte sanity ceiling and cached direct
+headers are marked unverified.
 
 ### Layered ODBs
 

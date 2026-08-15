@@ -30,11 +30,13 @@ defmodule Gitility.ODB.Backend.Conformance do
     backend = Keyword.fetch!(opts, :backend)
     init_arg = Keyword.get(opts, :init_arg)
     concurrency = Keyword.get(opts, :concurrency, 4)
+    expected_failure = Keyword.get(opts, :expected_failure)
 
     quote bind_quoted: [
             backend: backend,
             init_arg: init_arg,
-            concurrency: concurrency
+            concurrency: concurrency,
+            expected_failure: expected_failure
           ] do
       use ExUnit.Case, async: false
 
@@ -44,6 +46,7 @@ defmodule Gitility.ODB.Backend.Conformance do
       @conformance_backend backend
       @conformance_init_arg init_arg
       @conformance_concurrency concurrency
+      @conformance_expected_failure expected_failure
 
       setup do
         objects = backend_objects()
@@ -52,70 +55,94 @@ defmodule Gitility.ODB.Backend.Conformance do
         %{objects: objects, oids: Enum.map(objects, & &1.oid), state: state}
       end
 
-      test "backend returns one result for every requested OID", context do
-        reply = @conformance_backend.read_many(context.oids, context.state)
-        assert :ok = validate_batch(context.oids, reply)
-      end
-
-      test ":not_found is a per-object result distinct from backend failure", context do
-        first = hd(context.oids)
-        missing = Gitility.ODB.Backend.Conformance.missing_oid(first)
-        reply = @conformance_backend.read_many([first, missing], context.state)
-        assert :ok = validate_batch([first, missing], reply)
-        assert {:ok, results} = reply
-        assert results[first] != :not_found
-        assert results[missing] == :not_found
-
-        assert :backend_error =
-                 Gitility.ODB.Backend.Conformance.classify_reply({:error, :sentinel})
-      end
-
-      test "callbacks are safe under configured concurrency", context do
-        tasks =
-          for _ <- 1..@conformance_concurrency do
-            Task.async(fn -> @conformance_backend.read_many(context.oids, context.state) end)
-          end
-
-        Enum.each(tasks, fn task ->
-          assert :ok = validate_batch(context.oids, Task.await(task, 5_000))
-        end)
-      end
-
-      test "read_headers matches the documented read_many fallback", context do
-        expected = fallback_headers(context.oids, context.state, @conformance_backend)
-
-        actual =
-          if function_exported?(@conformance_backend, :read_headers, 2) do
-            apply(@conformance_backend, :read_headers, [context.oids, context.state])
-          else
-            expected
-          end
-
-        assert :ok = validate_batch(context.oids, actual)
-        assert actual == expected
-      end
-
-      test "optional prefetch is tolerant", context do
-        if function_exported?(@conformance_backend, :prefetch, 2) do
-          result = @conformance_backend.prefetch(context.oids, context.state)
-          assert result == :ok or match?({:error, _reason}, result)
-        else
-          assert true
+      if @conformance_expected_failure do
+        test "generated conformance suite rejects the broken backend batch", context do
+          reply = @conformance_backend.read_many(context.oids, context.state)
+          assert {:error, @conformance_expected_failure} = validate_batch(context.oids, reply)
         end
-      end
 
-      test "objects round-trip through a verified provider store", context do
-        assert {:ok, odb} =
-                 Gitility.ODB.start_link(
-                   backend: {@conformance_backend, @conformance_init_arg},
-                   concurrency: @conformance_concurrency
-                 )
+        test "generated conformance suite rejects the broken backend end to end", context do
+          assert {:ok, provider} =
+                   Gitility.ODB.start_link(
+                     backend: {@conformance_backend, @conformance_init_arg},
+                     concurrency: @conformance_concurrency
+                   )
 
-        assert {:ok, returned} = Gitility.ODB.read_many(odb, context.oids)
+          assert {:ok, odb} = Gitility.ODB.handle(provider)
 
-        Enum.each(context.objects, fn object ->
-          assert returned[object.oid] == object
-        end)
+          assert {:error, %Gitility.Error{code: :provider_protocol_error}} =
+                   Gitility.ODB.read_many(odb, context.oids)
+        end
+      else
+        test "backend returns one result for every requested OID", context do
+          reply = @conformance_backend.read_many(context.oids, context.state)
+          assert :ok = validate_batch(context.oids, reply)
+        end
+
+        test ":not_found is a per-object result distinct from backend failure", context do
+          first = hd(context.oids)
+          missing = Gitility.ODB.Backend.Conformance.missing_oid(first)
+          reply = @conformance_backend.read_many([first, missing], context.state)
+          assert :ok = validate_batch([first, missing], reply)
+          assert {:ok, results} = reply
+          assert results[first] != :not_found
+          assert results[missing] == :not_found
+
+          assert :backend_error =
+                   Gitility.ODB.Backend.Conformance.classify_reply({:error, :sentinel})
+        end
+
+        test "callbacks are safe under configured concurrency", context do
+          tasks =
+            for _ <- 1..@conformance_concurrency do
+              Task.async(fn -> @conformance_backend.read_many(context.oids, context.state) end)
+            end
+
+          Enum.each(tasks, fn task ->
+            assert :ok = validate_batch(context.oids, Task.await(task, 5_000))
+          end)
+        end
+
+        if function_exported?(@conformance_backend, :read_headers, 2) do
+          test "read_headers matches the documented read_many fallback", context do
+            expected = fallback_headers(context.oids, context.state, @conformance_backend)
+            actual = apply(@conformance_backend, :read_headers, [context.oids, context.state])
+            assert :ok = validate_batch(context.oids, actual)
+            assert actual == expected
+          end
+        else
+          @tag skip: ":skipped — backend does not export optional read_headers/2"
+          test "read_headers :skipped (optional callback not exported)" do
+            :ok
+          end
+        end
+
+        if function_exported?(@conformance_backend, :prefetch, 2) do
+          test "optional prefetch callback is invoked", context do
+            result = @conformance_backend.prefetch(context.oids, context.state)
+            assert result == :ok or match?({:error, _reason}, result)
+          end
+        else
+          @tag skip: ":skipped — backend does not export optional prefetch/2"
+          test "prefetch :skipped (optional callback not exported)" do
+            :ok
+          end
+        end
+
+        test "objects round-trip through a verified provider store", context do
+          assert {:ok, provider} =
+                   Gitility.ODB.start_link(
+                     backend: {@conformance_backend, @conformance_init_arg},
+                     concurrency: @conformance_concurrency
+                   )
+
+          assert {:ok, odb} = Gitility.ODB.handle(provider)
+          assert {:ok, returned} = Gitility.ODB.read_many(odb, context.oids)
+
+          Enum.each(context.objects, fn object ->
+            assert returned[object.oid] == object
+          end)
+        end
       end
     end
   end

@@ -35,10 +35,11 @@ defmodule Gitility.Runtime do
          max_jobs_per_owner: 16}
       ]
 
-  Every root handle (`Gitility.Repository.open/2`, `Gitility.ODB.start_link/1`,
-  `Gitility.ODB.from_objects/2`) accepts `runtime:` and defaults to the
-  shared instance. Snapshots and jobs inherit the runtime of the store they
-  came from; stores composed together must share one runtime, enforced at
+  Every root store (`Gitility.Repository.open/2`, the provider configured by
+  `Gitility.ODB.start_link/1` and retrieved with `Gitility.ODB.handle/1`, or
+  `Gitility.ODB.from_objects/2`) accepts `runtime:` and defaults to the shared
+  instance. Snapshots and jobs inherit the runtime of the store they came
+  from; stores composed together must share one runtime, enforced at
   composition time with `:runtime_mismatch`.
 
   ## Backpressure

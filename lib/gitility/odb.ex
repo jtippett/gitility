@@ -23,6 +23,11 @@ defmodule Gitility.ODB do
   Layers are queried in order and must share a runtime and hash algorithm.
   A successful remote read populates earlier writable cache layers. Disk
   caching is never implicit — there is no disk anywhere in this module.
+
+  Process-backed stores have a two-shape API: `start_link/1` starts and
+  returns the provider supervisor pid, and `handle/1` obtains the opaque ODB
+  handle used by queries. Value stores such as `from_objects/2` start no
+  process and return their handle directly.
   """
 
   alias Gitility.{
@@ -60,9 +65,12 @@ defmodule Gitility.ODB do
   Starts a provider-backed ODB serving objects through a
   `Gitility.ODB.Backend` implementation.
 
-  The provider is a supervised process — use `{Gitility.ODB, opts}` in a
-  supervision tree. Gitility monitors it: provider exit fails pending
-  requests with `:provider_down` and cancels jobs that cannot progress.
+  Returns the provider supervisor pid. Obtain the query handle with
+  `handle/1`. The provider is a valid child — use `{Gitility.ODB, opts}` in a
+  supervision tree. Pass a stable `name:` when supervised so other processes
+  can call `handle(name)`; direct starts without a name receive an internal
+  generated name. Gitility monitors provider exit, fails pending requests
+  with `:provider_down`, and cancels jobs that cannot progress.
 
   A provider handle is permanently bound to the exact provider process that
   created it. If that process dies, pending and future reads through the old
@@ -73,7 +81,8 @@ defmodule Gitility.ODB do
   ## Options
 
     * `:backend` (required) — `{module, init_arg}`.
-    * `:name` — optional registered name (supports via tuples).
+    * `:name` — provider-supervisor registered name (supports via tuples).
+      When omitted, Gitility generates a private global name.
     * `:hash` — `:sha1` (default) or `:sha256`.
     * `:verify` — `:always` (default): recompute and check every object ID.
     * `:concurrency` — max concurrent backend callbacks (default `8`).
@@ -87,16 +96,29 @@ defmodule Gitility.ODB do
 
   ## Example
 
-      {:ok, odb} =
+      {:ok, provider} =
         Gitility.ODB.start_link(
+          name: MyApp.GitObjects,
           backend: {MyCompany.GitObjectBackend, backend_options},
           concurrency: 8,
           cache: [object_bytes: 128 * 1024 * 1024]
         )
 
+      {:ok, odb} = Gitility.ODB.handle(provider)
       {:ok, snapshot} = Gitility.Snapshot.open(odb, commit_oid)
+
+  In a supervision tree, retrieve the same handle by its stable name:
+
+      children = [
+        {Gitility.ODB,
+         name: MyApp.GitObjects,
+         backend: {MyCompany.GitObjectBackend, backend_options}}
+      ]
+
+      {:ok, _supervisor} = Supervisor.start_link(children, strategy: :one_for_one)
+      {:ok, odb} = Gitility.ODB.handle(MyApp.GitObjects)
   """
-  @spec start_link(keyword()) :: {:ok, t()} | {:error, Error.t()}
+  @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) do
     opts =
       Keyword.validate!(opts,
@@ -110,8 +132,10 @@ defmodule Gitility.ODB do
         cache: []
       )
 
+    name = opts[:name] || {:global, {Gitility.ODB.Provider.Supervisor, make_ref()}}
+
     with :ok <- validate_provider_backend(opts[:backend]),
-         :ok <- validate_provider_name(opts[:name]),
+         :ok <- validate_provider_name(name),
          :ok <- validate_provider_hash(opts[:hash]),
          :ok <- validate_provider_verify(opts[:verify]),
          {:ok, concurrency} <- positive_provider_option(opts[:concurrency], :concurrency),
@@ -122,15 +146,34 @@ defmodule Gitility.ODB do
          {:ok, supervisor} <-
            Gitility.ODB.Provider.Supervisor.start_link(
              backend: opts[:backend],
-             name: opts[:name],
+             name: name,
              hash: opts[:hash],
              concurrency: concurrency,
              request_timeout: request_timeout,
+             runtime: runtime,
              object_cache_bytes: cache[:object_bytes],
              header_cache_entries: cache[:header_entries],
              negative_ttl: cache[:negative_ttl]
-           ),
-         {:ok, {resource, hash, provider}} <- provider_handle(supervisor) do
+           ) do
+      {:ok, supervisor}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> provider_start_error(reason)
+    end
+  end
+
+  @doc """
+  Returns the opaque ODB handle owned by a running provider supervisor.
+
+  Accepts either the pid returned by `start_link/1` or its configured `:name`.
+  A handle is permanently bound to the current provider process; obtain a new
+  handle after a provider restart.
+  """
+  @spec handle(pid() | GenServer.name()) :: {:ok, t()} | {:error, Error.t()}
+  def handle(pid_or_name) do
+    with {:ok, supervisor} <- resolve_provider_supervisor(pid_or_name),
+         {:ok, {resource, hash, provider, runtime, _request_timeout}} <-
+           provider_handle(supervisor) do
       {:ok,
        %__MODULE__{
          kind: :provider,
@@ -142,7 +185,7 @@ defmodule Gitility.ODB do
        }}
     else
       {:error, %Error{} = error} -> {:error, error}
-      {:error, reason} -> provider_start_error(reason)
+      {:error, _reason} -> provider_handle_error()
     end
   end
 
@@ -232,15 +275,16 @@ defmodule Gitility.ODB do
   def cache(opts), do: {:cache, opts}
 
   @doc """
-  Clears a provider store's native negative cache and asks its backend to
-  refresh availability state when the optional callback is implemented.
+  Asks a provider backend to refresh availability state, bounded by its
+  `request_timeout`, then clears the native negative cache only after the
+  callback succeeds.
 
   Other store kinds return `:unsupported_operation` in this milestone.
   """
   @spec refresh(t()) :: :ok | {:error, Error.t()}
   def refresh(%__MODULE__{kind: :provider, ref: resource, provider: provider}) do
-    with {:ok, nil} <- native_provider_refresh(resource),
-         :ok <- provider_refresh(provider) do
+    with :ok <- provider_refresh(provider),
+         {:ok, nil} <- native_provider_refresh(resource) do
       :ok
     end
   end
@@ -491,6 +535,30 @@ defmodule Gitility.ODB do
     :exit, reason -> {:error, reason}
   end
 
+  defp resolve_provider_supervisor(pid) when is_pid(pid) do
+    if Process.alive?(pid), do: {:ok, pid}, else: {:error, :provider_down}
+  end
+
+  defp resolve_provider_supervisor(name) do
+    with :ok <- validate_provider_name(name),
+         pid when is_pid(pid) <- GenServer.whereis(name) do
+      {:ok, pid}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      _missing -> {:error, :provider_down}
+    end
+  catch
+    :exit, _reason -> {:error, :provider_down}
+  end
+
+  defp provider_handle_error do
+    {:error,
+     Error.new(:provider_down, "provider process is down",
+       retryable: true,
+       operation: :odb_handle
+     )}
+  end
+
   defp provider_start_error(
          {:shutdown, {:failed_to_start_child, Provider, {:backend_init, reason}}}
        ),
@@ -522,6 +590,13 @@ defmodule Gitility.ODB do
       case GenServer.call(provider, :refresh, :infinity) do
         :ok ->
           :ok
+
+        {:error, :provider_timeout} ->
+          {:error,
+           Error.new(:provider_timeout, "provider request deadline expired",
+             retryable: true,
+             operation: :odb_refresh
+           )}
 
         {:error, _reason} ->
           {:error,

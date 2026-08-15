@@ -53,7 +53,7 @@ end
 defmodule Gitility.ProviderTestBackend do
   @behaviour Gitility.ODB.Backend
 
-  alias Gitility.Object
+  alias Gitility.{Object, ObjectHeader}
 
   @impl true
   def init(:conformance) do
@@ -66,6 +66,7 @@ defmodule Gitility.ProviderTestBackend do
   @impl true
   def read_many(oids, agent) do
     config = enter(agent)
+    Agent.update(agent, &%{&1 | batches: [oids | &1.batches]})
 
     try do
       maybe_notify(config)
@@ -77,6 +78,13 @@ defmodule Gitility.ProviderTestBackend do
         {:sleep, milliseconds} ->
           Process.sleep(milliseconds)
           results(oids, config.objects)
+
+        {:latch, observer} ->
+          send(observer, {:provider_latch_entered, self()})
+
+          receive do
+            :release_provider_latch -> results(oids, config.objects)
+          end
 
         :hang ->
           receive do
@@ -110,7 +118,66 @@ defmodule Gitility.ProviderTestBackend do
   end
 
   @impl true
-  def prefetch(_oids, _agent), do: :ok
+  def read_headers(oids, agent) do
+    config = enter(agent)
+
+    try do
+      {:ok,
+       Map.new(oids, fn oid ->
+         case config.objects[oid] do
+           nil ->
+             {oid, :not_found}
+
+           %Object{} = object ->
+             type = if config.header_kind, do: config.header_kind, else: object.type
+             size = if config.header_size, do: config.header_size, else: byte_size(object.data)
+             {oid, %ObjectHeader{oid: oid, type: type, size: size}}
+         end
+       end)}
+    after
+      leave(agent)
+    end
+  end
+
+  @impl true
+  def prefetch(oids, agent) do
+    observer =
+      Agent.get_and_update(agent, fn state ->
+        {state.observer, %{state | prefetches: [oids | state.prefetches]}}
+      end)
+
+    if is_pid(observer), do: send(observer, {:provider_prefetch, oids})
+    :ok
+  end
+
+  @impl true
+  def refresh(agent) do
+    config =
+      Agent.get_and_update(agent, fn state ->
+        next = %{state | refresh_calls: state.refresh_calls + 1}
+        {next, next}
+      end)
+
+    case config.refresh_mode do
+      :normal ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+
+      {:latch, observer} ->
+        send(observer, {:provider_refresh_entered, self()})
+
+        receive do
+          :release_provider_refresh -> :ok
+        end
+
+      :hang ->
+        receive do
+          :never -> :ok
+        end
+    end
+  end
 
   defp results(oids, objects) do
     {:ok, Map.new(oids, fn oid -> {oid, Map.get(objects, oid, :not_found)} end)}
@@ -128,6 +195,23 @@ defmodule Gitility.ProviderTestBackend do
 
   defp maybe_notify(%{observer: pid}) when is_pid(pid), do: send(pid, :provider_callback_entered)
   defp maybe_notify(_config), do: :ok
+end
+
+defmodule Gitility.BrokenProviderTestBackend do
+  @behaviour Gitility.ODB.Backend
+
+  @impl true
+  def init(:conformance) do
+    {:ok, :persistent_term.get({__MODULE__, :conformance_objects})}
+  end
+
+  @impl true
+  def read_many(oids, objects) do
+    {:ok,
+     oids
+     |> Enum.drop(-1)
+     |> Map.new(fn oid -> {oid, Map.get(objects, oid, :not_found)} end)}
+  end
 end
 
 defmodule Gitility.ProviderBackendConformanceTest do
@@ -155,7 +239,48 @@ defmodule Gitility.ProviderBackendConformanceTest do
   end
 
   defp provider_state(objects) do
-    %{objects: objects, mode: :normal, observer: nil, current: 0, max: 0, calls: 0}
+    %{
+      objects: objects,
+      mode: :normal,
+      observer: nil,
+      current: 0,
+      max: 0,
+      calls: 0,
+      header_kind: nil,
+      header_size: nil,
+      prefetches: [],
+      refresh_mode: :normal,
+      refresh_calls: 0,
+      batches: []
+    }
+  end
+end
+
+defmodule Gitility.BrokenProviderBackendConformanceTest do
+  use Gitility.ODB.Backend.Conformance,
+    backend: Gitility.BrokenProviderTestBackend,
+    init_arg: :conformance,
+    concurrency: 2,
+    expected_failure: :incomplete_batch
+
+  setup_all do
+    fixture = Gitility.ProviderTestFixtures.load_objects()
+
+    :persistent_term.put(
+      {Gitility.BrokenProviderTestBackend, :conformance_objects},
+      fixture.object_map
+    )
+
+    on_exit(fn ->
+      :persistent_term.erase({Gitility.BrokenProviderTestBackend, :conformance_objects})
+    end)
+
+    :ok
+  end
+
+  def backend_objects do
+    :persistent_term.get({Gitility.BrokenProviderTestBackend, :conformance_objects})
+    |> Map.values()
   end
 end
 
@@ -213,38 +338,43 @@ defmodule Gitility.Milestone2cProviderOdbTest do
       start_provider(fixture.object_map,
         runtime: runtime,
         concurrency: 4,
-        mode: {:sleep, 150}
+        mode: {:latch, self()}
       )
 
-    assert {:ok, concurrent_snapshot} = Snapshot.open(concurrent, fixture.head)
-    reset_probe(concurrent_agent, {:sleep, 150})
-
-    jobs =
+    tasks =
       for _ <- 1..4 do
-        {:ok, job} = Gitility.async_list_tree(concurrent_snapshot)
-        job
+        Task.async(fn -> ODB.read(concurrent, fixture.head) end)
       end
 
-    Enum.each(jobs, fn job -> assert {:ok, _page} = Job.await(job, 5_000) end)
+    callback_tasks =
+      for _ <- 1..4 do
+        assert_receive {:provider_latch_entered, callback_task}, 1_000
+        callback_task
+      end
+
+    Enum.each(callback_tasks, &send(&1, :release_provider_latch))
+    Enum.each(tasks, fn task -> assert {:ok, _object} = Task.await(task, 5_000) end)
     assert Agent.get(concurrent_agent, & &1.max) > 1
 
     {serial, serial_agent} =
       start_provider(fixture.object_map,
         runtime: runtime,
         concurrency: 1,
-        mode: {:sleep, 75}
+        mode: {:latch, self()}
       )
 
-    assert {:ok, serial_snapshot} = Snapshot.open(serial, fixture.head)
-    reset_probe(serial_agent, {:sleep, 75})
-
-    jobs =
+    tasks =
       for _ <- 1..4 do
-        {:ok, job} = Gitility.async_list_tree(serial_snapshot)
-        job
+        Task.async(fn -> ODB.read(serial, fixture.head) end)
       end
 
-    Enum.each(jobs, fn job -> assert {:ok, _page} = Job.await(job, 5_000) end)
+    for _ <- 1..4 do
+      assert_receive {:provider_latch_entered, callback_task}, 1_000
+      assert Agent.get(serial_agent, & &1.current) == 1
+      send(callback_task, :release_provider_latch)
+    end
+
+    Enum.each(tasks, fn task -> assert {:ok, _object} = Task.await(task, 5_000) end)
     assert Agent.get(serial_agent, & &1.max) == 1
   end
 
@@ -262,6 +392,96 @@ defmodule Gitility.Milestone2cProviderOdbTest do
 
     assert {:error, %Error{code: :provider_down, retryable: true}} =
              ODB.read(odb, fixture.head)
+  end
+
+  test "provider death wakes five concurrent waiters", fixture do
+    runtime = start_runtime(workers: 6, max_queue: 16, max_jobs_per_owner: 8)
+
+    {odb, _agent} =
+      start_provider(fixture.object_map,
+        runtime: runtime,
+        concurrency: 5,
+        mode: :hang,
+        observer: self()
+      )
+
+    waiters = for _ <- 1..5, do: Task.async(fn -> ODB.read(odb, fixture.head) end)
+
+    for _ <- 1..5 do
+      assert_receive :provider_callback_entered, 1_000
+    end
+
+    Process.exit(odb.provider, :kill)
+
+    Enum.each(waiters, fn waiter ->
+      assert {:error, %Error{code: :provider_down}} = Task.await(waiter, 1_000)
+    end)
+  end
+
+  test "clean supervisor shutdown wakes an in-flight provider read promptly", fixture do
+    {odb, agent} =
+      start_provider(fixture.object_map, observer: self(), request_timeout: 10_000)
+
+    assert {:ok, snapshot} = Snapshot.open(odb, fixture.head)
+    reset_probe(agent, :hang, self())
+    assert {:ok, job} = Gitility.async_list_tree(snapshot)
+    assert_receive :provider_callback_entered, 1_000
+
+    started = System.monotonic_time(:millisecond)
+    assert :ok = Supervisor.stop(odb.supervisor, :normal)
+    assert {:error, %Error{code: :provider_down}} = Job.await(job, 1_000)
+    assert System.monotonic_time(:millisecond) - started < 250
+  end
+
+  test "a provider ODB is a valid supervisor child and handle accepts pid or name", fixture do
+    agent = start_backend_agent(fixture.object_map)
+    name = {:global, {__MODULE__, make_ref()}}
+
+    provider =
+      start_supervised!(
+        {ODB, name: name, backend: {Backend, agent}, cache: [object_bytes: 1_000_000]}
+      )
+
+    assert is_pid(provider)
+    assert {:ok, by_pid} = ODB.handle(provider)
+    assert {:ok, by_name} = ODB.handle(name)
+    assert by_pid.ref == by_name.ref
+    assert {:ok, object} = ODB.read(by_name, fixture.head)
+    assert object.oid == fixture.head
+  end
+
+  test "stray messages and unknown calls do not kill or poison a provider", fixture do
+    {odb, _agent} = start_provider(fixture.object_map)
+    send(odb.provider, {:garbage, make_ref()})
+    assert {:error, :unknown_call} = GenServer.call(odb.provider, {:garbage_call, make_ref()})
+    assert Process.alive?(odb.provider)
+    assert {:ok, object} = ODB.read(odb, fixture.head)
+    assert object.oid == fixture.head
+  end
+
+  test "duplicate replies are harmless end to end", fixture do
+    previous = Application.get_env(:gitility, :provider_test_hook)
+    Application.put_env(:gitility, :provider_test_hook, :duplicate_reply)
+
+    on_exit(fn ->
+      if previous do
+        Application.put_env(:gitility, :provider_test_hook, previous)
+      else
+        Application.delete_env(:gitility, :provider_test_hook)
+      end
+    end)
+
+    {odb, _agent} = start_provider(fixture.object_map)
+    assert {:ok, first} = ODB.read(odb, fixture.head)
+    assert {:ok, second} = ODB.read(odb, fixture.head)
+    assert first == second
+  end
+
+  test "oversized provider payloads fail as object_too_large", fixture do
+    {odb, _agent} = start_provider(fixture.object_map)
+
+    assert {:error, %Error{code: :object_too_large, details: %{limit: :max_object_bytes}}} =
+             ODB.read(odb, fixture.head, limits: Limits.new(max_object_bytes: 1))
   end
 
   test "job timeout and cancellation interrupt a hung provider wait promptly", fixture do
@@ -312,7 +532,10 @@ defmodule Gitility.Milestone2cProviderOdbTest do
     end
 
     assert Agent.get(tampered_agent, & &1.calls) == 2
-    assert {:error, %Error{code: :hash_mismatch}} = ODB.header(tampered, fixture.head)
+    # Direct header metadata has no payload to verify; it remains independent
+    # of the rejected object bytes and never makes those bytes cacheable.
+    assert {:ok, _header} = ODB.header(tampered, fixture.head)
+    assert {:error, %Error{code: :hash_mismatch}} = ODB.read(tampered, fixture.head)
 
     extra = OID.new!(:sha1, <<7::160>>)
     {unexpected, _agent} = start_provider(fixture.object_map, mode: {:extra, extra})
@@ -321,6 +544,46 @@ defmodule Gitility.Milestone2cProviderOdbTest do
     # are rejected and none are cached.
     assert {:error, %Error{code: :provider_protocol_error}} =
              ODB.read(unexpected, fixture.head)
+  end
+
+  test "provider header metadata is bounded and kind contradictions name the provider", fixture do
+    {sized, _agent} = start_provider(fixture.object_map, header_size: 123_456)
+    assert {:ok, sized_snapshot} = Snapshot.open(sized, fixture.head)
+    assert {:ok, sized_page} = Gitility.list_tree(sized_snapshot, "", include: [:size])
+
+    assert sized_page.items
+           |> Enum.filter(&(&1.type in [:blob, :symlink]))
+           |> Enum.all?(&(&1.size == 123_456))
+
+    {oversized, _agent} =
+      start_provider(fixture.object_map, header_size: 1_099_511_627_777)
+
+    assert {:ok, oversized_snapshot} = Snapshot.open(oversized, fixture.head)
+
+    assert {:error, %Error{code: :provider_protocol_error}} =
+             Gitility.list_tree(oversized_snapshot, "", include: [:size])
+
+    {wrong_kind, _agent} = start_provider(fixture.object_map, header_kind: :tree)
+    assert {:ok, wrong_kind_snapshot} = Snapshot.open(wrong_kind, fixture.head)
+
+    assert {:error,
+            %Error{
+              code: :provider_protocol_error,
+              message: "provider header contradicts tree entry kind"
+            }} = Gitility.list_tree(wrong_kind_snapshot, "", include: [:size])
+  end
+
+  test "verified local and static headers remain unaffected", fixture do
+    assert {:ok, expected} =
+             Gitility.list_tree(fixture.local_snapshot, "", recursive: true, include: [:size])
+
+    assert {:ok, static} = ODB.from_objects(fixture.objects)
+    assert {:ok, static_snapshot} = Snapshot.open(static, fixture.head)
+
+    assert {:ok, actual} =
+             Gitility.list_tree(static_snapshot, "", recursive: true, include: [:size])
+
+    assert actual.items == expected.items
   end
 
   test "provider request and byte budgets stop tree work with named limits", fixture do
@@ -335,6 +598,33 @@ defmodule Gitility.Milestone2cProviderOdbTest do
 
     assert {:error, %Error{code: :budget_exceeded, details: %{limit: :max_provider_bytes}}} =
              Gitility.list_tree(snapshot, "", limits: Limits.new(max_provider_bytes: 10))
+  end
+
+  test "read_many enforces its cap during the batch and deduplicates backend oids", fixture do
+    {odb, agent} = start_provider(fixture.object_map)
+    oids = fixture.objects |> Enum.take(6) |> Enum.map(& &1.oid)
+    reset_probe(agent, :normal)
+
+    assert {:error, %Error{code: :result_too_large, details: %{limit: :max_total_bytes}}} =
+             ODB.read_many(odb, oids, max_total_bytes: 1)
+
+    assert Agent.get(agent, & &1.calls) <= 1
+
+    reset_probe(agent, :normal)
+    assert {:ok, returned} = ODB.read_many(odb, [fixture.head, fixture.head])
+    assert map_size(returned) == 1
+    assert [[only_oid]] = Agent.get(agent, & &1.batches)
+    assert only_oid == fixture.head
+  end
+
+  test "recursive provider walks prefetch child tree batches", fixture do
+    {odb, _agent} = start_provider(fixture.object_map, observer: self())
+    assert {:ok, snapshot} = Snapshot.open(odb, fixture.head)
+    assert {:ok, _page} = Gitility.list_tree(snapshot, "", recursive: true)
+
+    assert_receive {:provider_prefetch, child_tree_oids}, 1_000
+    assert child_tree_oids != []
+    assert Enum.all?(child_tree_oids, &match?(%OID{}, &1))
   end
 
   test "negative cache suppresses misses until refresh", fixture do
@@ -354,6 +644,58 @@ defmodule Gitility.Milestone2cProviderOdbTest do
     assert Agent.get(agent, & &1.calls) == 2
 
     assert {:error, %Error{code: :unsupported_operation}} = ODB.refresh(fixture.repository.odb)
+  end
+
+  test "negative cache entries expire by TTL", fixture do
+    missing = OID.new!(:sha1, <<1::160>>)
+    {odb, agent} = start_provider(fixture.object_map, cache: [negative_ttl: 40])
+    reset_probe(agent, :normal)
+
+    assert {:error, %Error{code: :missing_object}} = ODB.read(odb, missing)
+    assert {:error, %Error{code: :missing_object}} = ODB.read(odb, missing)
+    assert Agent.get(agent, & &1.calls) == 1
+
+    Process.sleep(60)
+    assert {:error, %Error{code: :missing_object}} = ODB.read(odb, missing)
+    assert Agent.get(agent, & &1.calls) == 2
+  end
+
+  test "refresh is timed and clears negatives only after backend success", fixture do
+    missing = OID.new!(:sha1, <<2::160>>)
+
+    {odb, agent} =
+      start_provider(fixture.object_map,
+        cache: [negative_ttl: 60_000],
+        request_timeout: 100
+      )
+
+    reset_probe(agent, :normal)
+    assert {:error, %Error{code: :missing_object}} = ODB.read(odb, missing)
+    assert Agent.get(agent, & &1.calls) == 1
+
+    test_pid = self()
+    Agent.update(agent, &%{&1 | refresh_mode: {:latch, test_pid}})
+    refresh = Task.async(fn -> ODB.refresh(odb) end)
+    assert_receive {:provider_refresh_entered, refresh_callback}, 1_000
+
+    # The callback is still running, so the native negative remains visible.
+    assert {:error, %Error{code: :missing_object}} = ODB.read(odb, missing)
+    assert Agent.get(agent, & &1.calls) == 1
+
+    send(refresh_callback, :release_provider_refresh)
+    assert :ok = Task.await(refresh, 1_000)
+    assert {:error, %Error{code: :missing_object}} = ODB.read(odb, missing)
+    assert Agent.get(agent, & &1.calls) == 2
+
+    Agent.update(agent, &%{&1 | refresh_mode: :hang})
+    started = System.monotonic_time(:millisecond)
+
+    assert {:error, %Error{code: :provider_timeout, retryable: true}} = ODB.refresh(odb)
+    assert System.monotonic_time(:millisecond) - started < 1_000
+
+    # A timed-out refresh did not clear the negative populated above.
+    assert {:error, %Error{code: :missing_object}} = ODB.read(odb, missing)
+    assert Agent.get(agent, & &1.calls) == 2
   end
 
   test "backend error terms are logged locally but sanitized from query errors", fixture do
@@ -391,6 +733,21 @@ defmodule Gitility.Milestone2cProviderOdbTest do
   end
 
   defp start_provider(objects, opts \\ []) do
+    agent = start_backend_agent(objects, opts)
+
+    provider_opts =
+      [backend: {Backend, agent}]
+      |> Keyword.merge(
+        Keyword.drop(opts, [:mode, :observer, :header_kind, :header_size, :refresh_mode])
+      )
+
+    assert {:ok, provider} = ODB.start_link(provider_opts)
+    assert {:ok, odb} = ODB.handle(provider)
+
+    {odb, agent}
+  end
+
+  defp start_backend_agent(objects, opts \\ []) do
     {:ok, agent} =
       Agent.start_link(fn ->
         %{
@@ -399,19 +756,18 @@ defmodule Gitility.Milestone2cProviderOdbTest do
           observer: Keyword.get(opts, :observer),
           current: 0,
           max: 0,
-          calls: 0
+          calls: 0,
+          header_kind: Keyword.get(opts, :header_kind),
+          header_size: Keyword.get(opts, :header_size),
+          prefetches: [],
+          refresh_mode: Keyword.get(opts, :refresh_mode, :normal),
+          refresh_calls: 0,
+          batches: []
         }
       end)
 
     on_exit(fn -> if Process.alive?(agent), do: Agent.stop(agent) end)
-
-    provider_opts =
-      [backend: {Backend, agent}]
-      |> Keyword.merge(Keyword.drop(opts, [:mode, :observer]))
-
-    assert {:ok, odb} = ODB.start_link(provider_opts)
-
-    {odb, agent}
+    agent
   end
 
   defp start_runtime(opts) do
@@ -420,7 +776,16 @@ defmodule Gitility.Milestone2cProviderOdbTest do
 
   defp reset_probe(agent, mode, observer \\ nil) do
     Agent.update(agent, fn state ->
-      %{state | mode: mode, observer: observer, current: 0, max: 0, calls: 0}
+      %{
+        state
+        | mode: mode,
+          observer: observer,
+          current: 0,
+          max: 0,
+          calls: 0,
+          batches: [],
+          prefetches: []
+      }
     end)
   end
 

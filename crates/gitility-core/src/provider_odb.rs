@@ -6,17 +6,25 @@
 
 use crate::budget::Budget;
 use crate::error::{Error, ErrorCode};
+use crate::lru::LruCache;
 use crate::object::{HashKind, ObjectHeader, ObjectKind, Oid};
-use crate::odb::{ObjectDb, ObjectReadResult};
+use crate::odb::{
+    enforce_read_many_budget, HeaderProvenance, HeaderRead, ObjectDb, ObjectReadResult,
+    ReadManyBudget,
+};
 use crate::verify::verify;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::hash::Hash;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const WAIT_SLICE: Duration = Duration::from_millis(50);
 const DEFAULT_NEGATIVE_ENTRIES: usize = 4_096;
+
+/// Direct provider header metadata above one tebibyte is rejected as an
+/// implausible protocol value. This does not use a job's payload ceiling:
+/// metadata for a legitimate object larger than that job may still be useful.
+pub const PROVIDER_HEADER_SIZE_CEILING: u64 = 1 << 40;
 
 /// Callback operation sent to the provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +39,10 @@ pub enum ProviderKind {
 pub enum ProviderReplyValue {
     NotFound,
     Header(ObjectHeader),
-    Object { kind: ObjectKind, data: Vec<u8> },
+    Object {
+        kind: ObjectKind,
+        data: Arc<Vec<u8>>,
+    },
 }
 
 /// A complete callback reply. Backend errors deliberately carry no backend
@@ -90,6 +101,9 @@ pub struct ProviderRequest {
     /// payload buffers; core validation repeats them after decoding.
     pub max_object_bytes: u64,
     pub max_reply_bytes: u64,
+    /// Optional public `read_many` result ceiling, independent of provider
+    /// bandwidth accounting.
+    pub max_result_bytes: Option<u64>,
 }
 
 /// Sends a provider request without waiting for its reply.
@@ -257,9 +271,9 @@ impl<T: ProviderTransport> ProviderOdb<T> {
         kind: ProviderKind,
         oids: Vec<Oid>,
         budget: &Budget,
+        read_budget: ReadManyBudget,
     ) -> Result<ProviderPayload, Error> {
         budget.charge_provider_request()?;
-        self.ensure_alive()?;
 
         let now = Instant::now();
         let request_deadline = now.checked_add(self.options.request_timeout).unwrap_or(now);
@@ -271,6 +285,13 @@ impl<T: ProviderTransport> ProviderOdb<T> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply, sender) = ReplySlot::pair();
         self.pending.insert(id, sender);
+        // Insert first, then inspect liveness. If provider death raced the
+        // insertion, either fail_all drained this sender or the false flag
+        // makes us remove it and fail immediately.
+        if let Err(error) = self.ensure_alive() {
+            self.pending.cancel(id);
+            return Err(error);
+        }
         let provider_bytes_remaining = budget
             .limits()
             .max_provider_bytes
@@ -283,6 +304,7 @@ impl<T: ProviderTransport> ProviderOdb<T> {
             deadline,
             max_object_bytes: budget.limits().max_object_bytes,
             max_reply_bytes: provider_bytes_remaining,
+            max_result_bytes: read_budget.max_total_bytes,
         };
         if let Err(error) = self.transport.request(request) {
             self.pending.cancel(id);
@@ -323,8 +345,9 @@ impl<T: ProviderTransport> ProviderOdb<T> {
         kind: ProviderKind,
         expected: &[Oid],
         budget: &Budget,
+        read_budget: ReadManyBudget,
     ) -> Result<HashMap<Oid, ProviderReplyValue>, Error> {
-        let payload = self.send_and_wait(kind, expected.to_vec(), budget)?;
+        let payload = self.send_and_wait(kind, expected.to_vec(), budget, read_budget)?;
         let ProviderPayload::Results(results) = payload else {
             return Err(Error::retryable(
                 ErrorCode::BackendError,
@@ -369,6 +392,13 @@ impl<T: ProviderTransport> ProviderOdb<T> {
                     )
                     .with_limit("max_provider_bytes"));
                 }
+                enforce_read_many_budget(reply_bytes, read_budget)?;
+            } else if let ProviderReplyValue::Header(header) = &value {
+                if header.size > PROVIDER_HEADER_SIZE_CEILING {
+                    return Err(protocol_error(
+                        "provider header size exceeds the 2^40 sanity ceiling",
+                    ));
+                }
             }
             decoded.insert(oid, value);
         }
@@ -392,27 +422,24 @@ impl<T: ProviderTransport> ProviderOdb<T> {
     fn clear_negative_cache(&self) {
         lock(&self.caches).negative.clear();
     }
-}
 
-impl<T: ProviderTransport> ObjectDb for ProviderOdb<T> {
-    fn hash_kind(&self) -> HashKind {
-        self.hash
-    }
-
-    fn try_header(&self, oid: &Oid, budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
+    fn try_header_read(&self, oid: &Oid, budget: &Budget) -> Result<Option<HeaderRead>, Error> {
         self.ensure_oid(oid)?;
         self.ensure_alive()?;
         {
             let mut caches = lock(&self.caches);
-            if let Some(header) = caches.headers.get(oid) {
+            if let Some(header) = caches.headers.get_cloned(oid) {
                 budget.charge_header()?;
                 return Ok(Some(header));
             }
-            if let Some((kind, data)) = caches.objects.get(oid) {
+            if let Some((kind, data)) = caches.objects.get_cloned(oid) {
                 budget.charge_header()?;
-                return Ok(Some(ObjectHeader {
-                    kind,
-                    size: data.len() as u64,
+                return Ok(Some(HeaderRead {
+                    header: ObjectHeader {
+                        kind,
+                        size: data.len() as u64,
+                    },
+                    provenance: HeaderProvenance::Verified,
                 }));
             }
             if caches.negative.contains_fresh(oid) {
@@ -421,7 +448,12 @@ impl<T: ProviderTransport> ObjectDb for ProviderOdb<T> {
             }
         }
 
-        let mut results = self.request_results(ProviderKind::Header, &[*oid], budget)?;
+        let mut results = self.request_results(
+            ProviderKind::Header,
+            &[*oid],
+            budget,
+            ReadManyBudget::default(),
+        )?;
         match results.remove(oid).expect("validated singleton reply") {
             ProviderReplyValue::NotFound => {
                 lock(&self.caches).negative.insert(*oid);
@@ -429,58 +461,56 @@ impl<T: ProviderTransport> ObjectDb for ProviderOdb<T> {
                 Ok(None)
             }
             ProviderReplyValue::Header(header) => {
-                lock(&self.caches).headers.insert(*oid, header, 1);
+                let read = HeaderRead {
+                    header,
+                    provenance: HeaderProvenance::UnverifiedProvider,
+                };
+                lock(&self.caches).headers.insert(*oid, read, 1);
                 budget.charge_header()?;
-                Ok(Some(header))
+                Ok(Some(read))
             }
             ProviderReplyValue::Object { kind, data } => {
-                let header = ObjectHeader {
-                    kind,
-                    size: data.len() as u64,
+                let read = HeaderRead {
+                    header: ObjectHeader {
+                        kind,
+                        size: data.len() as u64,
+                    },
+                    provenance: HeaderProvenance::Verified,
                 };
                 let mut caches = lock(&self.caches);
                 caches
                     .objects
-                    .insert(*oid, (kind, data.clone()), data.len() as u64);
-                caches.headers.insert(*oid, header, 1);
+                    .insert(*oid, (kind, Arc::clone(&data)), data.len() as u64);
+                caches.headers.insert(*oid, read, 1);
                 budget.charge_header()?;
-                Ok(Some(header))
+                Ok(Some(read))
             }
         }
     }
 
-    fn try_find(
+    fn try_find_many_with_budget(
         &self,
-        oid: &Oid,
-        out: &mut Vec<u8>,
+        oids: &[Oid],
         budget: &Budget,
-    ) -> Result<Option<ObjectKind>, Error> {
-        out.clear();
-        let mut values = self.try_find_many(&[*oid], budget)?;
-        match values.pop().expect("singleton read result") {
-            Some((kind, data)) => {
-                out.extend_from_slice(&data);
-                Ok(Some(kind))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn try_find_many(&self, oids: &[Oid], budget: &Budget) -> Result<Vec<ObjectReadResult>, Error> {
+        read_budget: ReadManyBudget,
+    ) -> Result<Vec<ObjectReadResult>, Error> {
         self.ensure_alive()?;
         for oid in oids {
             self.ensure_oid(oid)?;
         }
 
-        let mut found = HashMap::<Oid, Option<(ObjectKind, Vec<u8>)>>::new();
+        let mut found = HashMap::<Oid, Option<(ObjectKind, Arc<Vec<u8>>)>>::new();
         let mut misses = Vec::new();
+        let mut resident_bytes = 0u64;
         {
             let mut caches = lock(&self.caches);
             for oid in oids {
                 if found.contains_key(oid) {
                     continue;
                 }
-                if let Some(value) = caches.objects.get(oid) {
+                if let Some(value) = caches.objects.get_cloned(oid) {
+                    resident_bytes = resident_bytes.saturating_add(value.1.len() as u64);
+                    enforce_read_many_budget(resident_bytes, read_budget)?;
                     found.insert(*oid, Some(value));
                 } else if caches.negative.contains_fresh(oid) {
                     found.insert(*oid, None);
@@ -491,7 +521,12 @@ impl<T: ProviderTransport> ObjectDb for ProviderOdb<T> {
         }
 
         if !misses.is_empty() {
-            let results = self.request_results(ProviderKind::Object, &misses, budget)?;
+            let remaining = ReadManyBudget {
+                max_total_bytes: read_budget
+                    .max_total_bytes
+                    .map(|maximum| maximum.saturating_sub(resident_bytes)),
+            };
+            let results = self.request_results(ProviderKind::Object, &misses, budget, remaining)?;
             let mut caches = lock(&self.caches);
             for oid in misses {
                 match results.get(&oid).expect("validated complete reply") {
@@ -500,13 +535,16 @@ impl<T: ProviderTransport> ObjectDb for ProviderOdb<T> {
                         found.insert(oid, None);
                     }
                     ProviderReplyValue::Object { kind, data } => {
-                        let value = (*kind, data.clone());
+                        let value = (*kind, Arc::clone(data));
                         caches.objects.insert(oid, value.clone(), data.len() as u64);
                         caches.headers.insert(
                             oid,
-                            ObjectHeader {
-                                kind: *kind,
-                                size: data.len() as u64,
+                            HeaderRead {
+                                header: ObjectHeader {
+                                    kind: *kind,
+                                    size: data.len() as u64,
+                                },
+                                provenance: HeaderProvenance::Verified,
                             },
                             1,
                         );
@@ -522,7 +560,7 @@ impl<T: ProviderTransport> ObjectDb for ProviderOdb<T> {
             match found.get(oid).expect("every input was resolved") {
                 Some((kind, data)) => {
                     budget.charge_object(data.len() as u64)?;
-                    output.push(Some((*kind, data.clone())));
+                    output.push(Some((*kind, Arc::clone(data))));
                 }
                 None => {
                     budget.check()?;
@@ -531,6 +569,55 @@ impl<T: ProviderTransport> ObjectDb for ProviderOdb<T> {
             }
         }
         Ok(output)
+    }
+}
+
+impl<T: ProviderTransport> ObjectDb for ProviderOdb<T> {
+    fn hash_kind(&self) -> HashKind {
+        self.hash
+    }
+
+    fn try_header(&self, oid: &Oid, budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
+        Ok(self.try_header_read(oid, budget)?.map(|read| read.header))
+    }
+
+    fn try_header_with_provenance(
+        &self,
+        oid: &Oid,
+        budget: &Budget,
+    ) -> Result<Option<HeaderRead>, Error> {
+        self.try_header_read(oid, budget)
+    }
+
+    fn try_find(
+        &self,
+        oid: &Oid,
+        out: &mut Vec<u8>,
+        budget: &Budget,
+    ) -> Result<Option<ObjectKind>, Error> {
+        out.clear();
+        let mut values =
+            self.try_find_many_with_budget(&[*oid], budget, ReadManyBudget::default())?;
+        match values.pop().expect("singleton read result") {
+            Some((kind, data)) => {
+                out.extend_from_slice(&data);
+                Ok(Some(kind))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn try_find_many(&self, oids: &[Oid], budget: &Budget) -> Result<Vec<ObjectReadResult>, Error> {
+        self.try_find_many_with_budget(oids, budget, ReadManyBudget::default())
+    }
+
+    fn try_find_many_bounded(
+        &self,
+        oids: &[Oid],
+        budget: &Budget,
+        read_budget: ReadManyBudget,
+    ) -> Result<Vec<ObjectReadResult>, Error> {
+        self.try_find_many_with_budget(oids, budget, read_budget)
     }
 
     fn prefetch(&self, oids: &[Oid], budget: &Budget) -> Result<(), Error> {
@@ -557,7 +644,12 @@ impl<T: ProviderTransport> ObjectDb for ProviderOdb<T> {
             deadline,
             max_object_bytes: 0,
             max_reply_bytes: 0,
+            max_result_bytes: None,
         })
+    }
+
+    fn supports_prefetch(&self) -> bool {
+        true
     }
 
     fn refresh(&self, budget: &Budget) -> Result<(), Error> {
@@ -589,97 +681,31 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 struct ProviderCaches {
-    objects: Lru<Oid, (ObjectKind, Vec<u8>)>,
-    headers: Lru<Oid, ObjectHeader>,
+    objects: LruCache<Oid, (ObjectKind, Arc<Vec<u8>>)>,
+    headers: LruCache<Oid, HeaderRead>,
     negative: NegativeCache,
 }
 
 impl ProviderCaches {
     fn new(options: ProviderCacheOptions) -> Self {
         Self {
-            objects: Lru::new(options.object_bytes),
-            headers: Lru::new(options.header_entries as u64),
+            objects: LruCache::new(options.object_bytes),
+            headers: LruCache::new(options.header_entries as u64),
             negative: NegativeCache::new(options.negative_ttl, DEFAULT_NEGATIVE_ENTRIES),
         }
     }
 }
 
-/// Minimal mutex-contained LRU: values and recency order stay bounded by a
-/// caller-supplied byte or entry weight, avoiding another dependency.
-struct Lru<K, V> {
-    values: HashMap<K, (V, u64)>,
-    order: VecDeque<K>,
-    used: u64,
-    capacity: u64,
-}
-
-impl<K, V> Lru<K, V>
-where
-    K: Copy + Eq + Hash,
-    V: Clone,
-{
-    fn new(capacity: u64) -> Self {
-        Self {
-            values: HashMap::new(),
-            order: VecDeque::new(),
-            used: 0,
-            capacity,
-        }
-    }
-
-    fn get(&mut self, key: &K) -> Option<V> {
-        let value = self.values.get(key)?.0.clone();
-        self.touch(*key);
-        Some(value)
-    }
-
-    fn insert(&mut self, key: K, value: V, weight: u64) {
-        if self.capacity == 0 || weight > self.capacity {
-            return;
-        }
-        if let Some((_, old_weight)) = self.values.remove(&key) {
-            self.used = self.used.saturating_sub(old_weight);
-            self.remove_order(&key);
-        }
-        while self.used.saturating_add(weight) > self.capacity {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            if let Some((_, old_weight)) = self.values.remove(&oldest) {
-                self.used = self.used.saturating_sub(old_weight);
-            }
-        }
-        self.used = self.used.saturating_add(weight);
-        self.values.insert(key, (value, weight));
-        self.order.push_back(key);
-    }
-
-    fn touch(&mut self, key: K) {
-        self.remove_order(&key);
-        self.order.push_back(key);
-    }
-
-    fn remove_order(&mut self, key: &K) {
-        if let Some(index) = self.order.iter().position(|value| value == key) {
-            self.order.remove(index);
-        }
-    }
-}
-
 struct NegativeCache {
-    values: HashMap<Oid, Instant>,
-    order: VecDeque<Oid>,
+    values: LruCache<Oid, Instant>,
     ttl: Duration,
-    capacity: usize,
 }
 
 impl NegativeCache {
     fn new(ttl: Duration, capacity: usize) -> Self {
         Self {
-            values: HashMap::new(),
-            order: VecDeque::new(),
+            values: LruCache::new(capacity as u64),
             ttl,
-            capacity,
         }
     }
 
@@ -691,39 +717,21 @@ impl NegativeCache {
             .values
             .get(oid)
             .is_some_and(|inserted| inserted.elapsed() < self.ttl);
-        if fresh {
-            if let Some(index) = self.order.iter().position(|value| value == oid) {
-                self.order.remove(index);
-            }
-            self.order.push_back(*oid);
-        } else {
+        if !fresh {
             self.values.remove(oid);
-            if let Some(index) = self.order.iter().position(|value| value == oid) {
-                self.order.remove(index);
-            }
         }
         fresh
     }
 
     fn insert(&mut self, oid: Oid) {
-        if self.ttl.is_zero() || self.capacity == 0 {
+        if self.ttl.is_zero() {
             return;
         }
-        self.values.insert(oid, Instant::now());
-        if let Some(index) = self.order.iter().position(|value| *value == oid) {
-            self.order.remove(index);
-        }
-        self.order.push_back(oid);
-        while self.order.len() > self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.values.remove(&oldest);
-            }
-        }
+        self.values.insert(oid, Instant::now(), 1);
     }
 
     fn clear(&mut self) {
         self.values.clear();
-        self.order.clear();
     }
 }
 
@@ -784,7 +792,7 @@ mod tests {
                         *oid,
                         ProviderReplyValue::Object {
                             kind: ObjectKind::Blob,
-                            data: data.to_vec(),
+                            data: Arc::new(data.to_vec()),
                         },
                     )
                 })
@@ -829,6 +837,75 @@ mod tests {
     }
 
     #[test]
+    fn cache_hits_share_the_verified_payload_allocation() {
+        let (oid, data) = blob();
+        let reply_data = data.clone();
+        let provider = store(
+            ProviderOptions {
+                cache: ProviderCacheOptions {
+                    object_bytes: 1_024,
+                    ..ProviderCacheOptions::default()
+                },
+                ..ProviderOptions::default()
+            },
+            move |request| Some(object_results(request, &reply_data)),
+        );
+
+        let first = provider
+            .try_find_many(&[oid], &Budget::unlimited())
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap()
+            .1;
+        let second = provider
+            .try_find_many(&[oid], &Budget::unlimited())
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap()
+            .1;
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn direct_headers_are_unverified_and_sanity_capped() {
+        let (oid, _data) = blob();
+        let provider = store(ProviderOptions::default(), move |_request| {
+            Some(ProviderPayload::Results(vec![(
+                oid,
+                ProviderReplyValue::Header(ObjectHeader {
+                    kind: ObjectKind::Blob,
+                    size: PROVIDER_HEADER_SIZE_CEILING,
+                }),
+            )]))
+        });
+        let read = provider
+            .try_header_with_provenance(&oid, &Budget::unlimited())
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.provenance, HeaderProvenance::UnverifiedProvider);
+        assert_eq!(read.header.size, PROVIDER_HEADER_SIZE_CEILING);
+
+        let provider = store(ProviderOptions::default(), move |_request| {
+            Some(ProviderPayload::Results(vec![(
+                oid,
+                ProviderReplyValue::Header(ObjectHeader {
+                    kind: ObjectKind::Blob,
+                    size: PROVIDER_HEADER_SIZE_CEILING + 1,
+                }),
+            )]))
+        });
+        assert_eq!(
+            provider
+                .try_header(&oid, &Budget::unlimited())
+                .unwrap_err()
+                .code,
+            ErrorCode::ProviderProtocolError
+        );
+    }
+
+    #[test]
     fn read_many_uses_one_real_batch_and_preserves_input_order() {
         let first_data = b"first".to_vec();
         let second_data = b"second".to_vec();
@@ -844,14 +921,14 @@ mod tests {
                     first,
                     ProviderReplyValue::Object {
                         kind: ObjectKind::Blob,
-                        data: first_data.clone(),
+                        data: Arc::new(first_data.clone()),
                     },
                 ),
                 (
                     second,
                     ProviderReplyValue::Object {
                         kind: ObjectKind::Blob,
-                        data: second_data.clone(),
+                        data: Arc::new(second_data.clone()),
                     },
                 ),
             ]))
@@ -861,8 +938,32 @@ mod tests {
             .try_find_many(&[second, first], &Budget::unlimited())
             .unwrap();
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
-        assert_eq!(results[0].as_ref().unwrap().1, b"second");
-        assert_eq!(results[1].as_ref().unwrap().1, b"first");
+        assert_eq!(results[0].as_ref().unwrap().1.as_slice(), b"second");
+        assert_eq!(results[1].as_ref().unwrap().1.as_slice(), b"first");
+    }
+
+    #[test]
+    fn bounded_read_many_rejects_before_retaining_the_batch() {
+        let (oid, data) = blob();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let provider = store(ProviderOptions::default(), move |request| {
+            observed.fetch_add(1, AtomicOrdering::Relaxed);
+            assert_eq!(request.max_result_bytes, Some(1));
+            Some(object_results(request, &data))
+        });
+        let error = provider
+            .try_find_many_bounded(
+                &[oid],
+                &Budget::unlimited(),
+                ReadManyBudget {
+                    max_total_bytes: Some(1),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResultTooLarge);
+        assert_eq!(error.limit, Some("max_total_bytes"));
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]

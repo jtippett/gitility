@@ -400,3 +400,63 @@ fn loom_shutdown_races_reentrant_shutdown_without_deadlock() {
         },
     );
 }
+
+#[test]
+fn loom_provider_reply_cancel_fail_all_has_one_terminal_outcome() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Outcome {
+        Reply,
+        Cancel,
+        FailAll,
+    }
+
+    #[derive(Debug)]
+    struct Rendezvous {
+        pending: bool,
+        outcome: Option<Outcome>,
+        takes: u8,
+    }
+
+    fn take(slot: &Arc<(Mutex<Rendezvous>, Condvar)>, outcome: Outcome) {
+        let mut state = sync::lock(&slot.0);
+        if state.pending {
+            state.pending = false;
+            state.outcome = Some(outcome);
+            state.takes += 1;
+            slot.1.notify_all();
+        }
+    }
+
+    model(
+        "loom_provider_reply_cancel_fail_all_has_one_terminal_outcome",
+        || {
+            let slot = Arc::new((
+                Mutex::new(Rendezvous {
+                    pending: true,
+                    outcome: None,
+                    takes: 0,
+                }),
+                Condvar::new(),
+            ));
+            let replying = Arc::clone(&slot);
+            let cancelling = Arc::clone(&slot);
+            let failing = Arc::clone(&slot);
+            let reply = loom::thread::spawn(move || take(&replying, Outcome::Reply));
+            let cancel = loom::thread::spawn(move || take(&cancelling, Outcome::Cancel));
+            let fail_all = loom::thread::spawn(move || take(&failing, Outcome::FailAll));
+
+            let mut state = sync::lock(&slot.0);
+            while state.pending {
+                state = sync::wait(&slot.1, state);
+            }
+            assert!(state.outcome.is_some());
+            assert_eq!(state.takes, 1);
+            drop(state);
+
+            reply.join().expect("reply racer does not panic");
+            cancel.join().expect("cancel racer does not panic");
+            fail_all.join().expect("fail_all racer does not panic");
+            assert_eq!(sync::lock(&slot.0).takes, 1);
+        },
+    );
+}

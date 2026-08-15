@@ -25,7 +25,6 @@ defmodule Gitility.Native do
   def provider_reply(_request, _reply), do: :erlang.nif_error(:nif_not_loaded)
   def provider_failed(_store), do: :erlang.nif_error(:nif_not_loaded)
   def provider_refresh(_store), do: :erlang.nif_error(:nif_not_loaded)
-  def snapshot_open(_resource, _oid, _limits), do: :erlang.nif_error(:nif_not_loaded)
 
   def job_submit_snapshot_open(_runtime, _resource, _oid, _limits),
     do: :erlang.nif_error(:nif_not_loaded)

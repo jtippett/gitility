@@ -18,6 +18,7 @@ pub mod decode;
 pub mod error;
 pub mod file;
 pub mod local_odb;
+pub mod lru;
 pub mod object;
 pub mod odb;
 pub mod pathspec;
@@ -41,10 +42,11 @@ pub use error::{Error, ErrorCode};
 pub use file::{read_file, FileKind, FileOptions, FileRead, LfsPointer};
 pub use local_odb::{LocalOdb, LocalOdbOptions, RepositoryLayout};
 pub use object::{HashKind, ObjectHeader, ObjectKind, Oid};
-pub use odb::{ObjectDb, ObjectReadResult};
+pub use odb::{HeaderProvenance, HeaderRead, ObjectDb, ObjectReadResult, ReadManyBudget};
 pub use provider_odb::{
     PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions,
     ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport, ReplySlot,
+    PROVIDER_HEADER_SIZE_CEILING,
 };
 pub use refs::{RefDb, RefPage, RefQuery, RefTarget};
 pub use runtime::{

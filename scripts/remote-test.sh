@@ -92,7 +92,7 @@ stage_sync() {
   # tar over the exec channel; excludes keep the payload small.
   printf '%s\n' "$manifest" \
     | grep -v -E '^(sources/|fixtures/generated/|_build/|deps/|target/|priv/native/|doc/)' \
-    | tar -czf - -T - \
+    | COPYFILE_DISABLE=1 tar --no-xattrs -czf - -T - \
     | sprite exec -s "$SPRITE_NAME" -- bash -lc "cd $REMOTE_DIR && tar -xzf -"
   rexec "cd $REMOTE_DIR && ls && git init -q 2>/dev/null; true"
   echo "==> sync: done"

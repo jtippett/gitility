@@ -75,8 +75,9 @@ pub enum JobOutput {
     Snapshot(Snapshot),
 }
 
-/// One ordered batch of object reads, retaining missing entries as `None`.
-pub type ReadManyOutput = Vec<(Oid, Option<(ObjectKind, Vec<u8>)>)>;
+/// One ordered batch of object reads, retaining missing entries as `None` and
+/// sharing immutable payload allocations with store caches until encoding.
+pub type ReadManyOutput = Vec<(Oid, Option<(ObjectKind, StdArc<Vec<u8>>)>)>;
 
 /// Consumed operation body stored by a job until a worker starts it.
 pub type JobTask = Box<dyn FnOnce(&Budget) -> Result<JobOutput, Error> + Send + 'static>;

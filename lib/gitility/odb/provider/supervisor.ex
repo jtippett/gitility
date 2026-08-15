@@ -1,5 +1,12 @@
 defmodule Gitility.ODB.Provider.Supervisor do
-  @moduledoc false
+  @moduledoc """
+  Internal provider supervision tree.
+
+  Child order is an invariant: the watchdog starts before the provider, so
+  reverse-order shutdown stops the provider (and wakes native waiters) while
+  the watchdog is still alive. The provider synchronously installs its watch
+  during `init/1`, closing the corresponding startup window.
+  """
 
   use Supervisor
 
@@ -7,8 +14,10 @@ defmodule Gitility.ODB.Provider.Supervisor do
 
   def start_link(opts) do
     id = make_ref()
-    provider_name = opts[:name] || {:global, {Provider, id}}
+    supervisor_name = Keyword.fetch!(opts, :name)
+    provider_name = {:global, {Provider, id}}
     task_name = {:global, {Provider, id, TaskSupervisor}}
+    watchdog_name = {:global, {Provider, id, Gitility.ODB.Watchdog}}
     caller = self()
     handshake = make_ref()
 
@@ -16,6 +25,7 @@ defmodule Gitility.ODB.Provider.Supervisor do
       opts
       |> Keyword.put(:provider_name, provider_name)
       |> Keyword.put(:task_supervisor, task_name)
+      |> Keyword.put(:watchdog, watchdog_name)
 
     # Isolate child-init exits until Supervisor.start_link has a result. On
     # success the caller links before this bootstrap process releases its own
@@ -25,7 +35,7 @@ defmodule Gitility.ODB.Provider.Supervisor do
       spawn(fn ->
         Process.flag(:trap_exit, true)
 
-        case Supervisor.start_link(__MODULE__, configured_opts) do
+        case Supervisor.start_link(__MODULE__, configured_opts, name: supervisor_name) do
           {:ok, supervisor} ->
             send(caller, {handshake, {:ok, supervisor}, self()})
 
@@ -48,6 +58,10 @@ defmodule Gitility.ODB.Provider.Supervisor do
 
       {^handshake, {:error, reason}, ^starter} ->
         {:error, reason}
+    after
+      5_000 ->
+        Process.exit(starter, :kill)
+        {:error, :timeout}
     end
   end
 
@@ -55,14 +69,16 @@ defmodule Gitility.ODB.Provider.Supervisor do
   def init(opts) do
     provider_name = Keyword.fetch!(opts, :provider_name)
     task_name = Keyword.fetch!(opts, :task_supervisor)
+    watchdog_name = Keyword.fetch!(opts, :watchdog)
 
     children = [
       Supervisor.child_spec({Task.Supervisor, name: task_name}, id: TaskSupervisor),
-      Supervisor.child_spec({Provider, opts}, id: Provider),
       Supervisor.child_spec(
-        {Gitility.ODB.Watchdog, provider: provider_name, task_supervisor: task_name},
+        {Gitility.ODB.Watchdog,
+         name: watchdog_name, provider: provider_name, task_supervisor: task_name},
         id: Gitility.ODB.Watchdog
-      )
+      ),
+      Supervisor.child_spec({Provider, opts}, id: Provider)
     ]
 
     Supervisor.init(children, strategy: :one_for_one)

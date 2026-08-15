@@ -80,6 +80,13 @@ defmodule Gitility.ODB.Backend do
   Fetches type/size headers without payloads. Optional: when absent, the
   provider falls back to `c:read_many/2` and discards payloads (correct but
   wasteful — implement this when your storage can answer cheaply).
+
+  Header replies cannot be verified (there is no payload to hash). Gitility
+  trusts them for type/size metadata only; they never influence which bytes
+  are served (payload reads always verify). A backend that cannot answer
+  headers truthfully should not export `read_headers` — the fallback verifies
+  via full reads. Header sizes are bounded by a protocol sanity ceiling of
+  2^40 bytes, independently of a query's payload limit.
   """
   @callback read_headers([Gitility.OID.t()], state()) ::
               {:ok, %{Gitility.OID.t() => Gitility.ObjectHeader.t() | :not_found}}

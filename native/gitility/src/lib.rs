@@ -13,8 +13,8 @@ use gitility_core::{
     JobObserver, JobOutput, JobSpec, JobState, LocalOdb, LocalOdbOptions, ObjectDb, ObjectHeader,
     ObjectKind, Oid, PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb,
     ProviderOptions, ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport,
-    QueryStats, Runtime as CoreRuntime, RuntimeConfig, Snapshot, StaticOdb, SubmitError,
-    TreeItemKind, TreeOptions, TypeFilter,
+    QueryStats, ReadManyBudget, Runtime as CoreRuntime, RuntimeConfig, Snapshot, StaticOdb,
+    SubmitError, TreeItemKind, TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
 };
 use rustler::{
     types::{map::MapIterator, tuple::get_tuple},
@@ -50,7 +50,12 @@ impl ProviderTransport for NifProviderTransport {
         // OwnedEnv::send_and_clear is forbidden on BEAM-managed scheduler
         // threads, hence this direct send does not use the M2b notification
         // pump and must never be called by a scheduler NIF.
-        debug_assert!(!rustler::thread::is_scheduler_thread());
+        if rustler::thread::is_scheduler_thread() {
+            return Err(Error::new(
+                ErrorCode::BackendError,
+                "provider request from a scheduler thread — Gitility bug",
+            ));
+        }
         let request_resource = ResourceArc::new(RequestResource {
             id: request.id,
             pending: self.pending.clone(),
@@ -59,6 +64,7 @@ impl ProviderTransport for NifProviderTransport {
             hash: self.hash,
             max_object_bytes: request.max_object_bytes,
             max_reply_bytes: request.max_reply_bytes,
+            max_result_bytes: request.max_result_bytes,
         });
         let provider = self.provider;
         let kind = provider_kind_atom(request.kind);
@@ -89,6 +95,7 @@ struct RequestResource {
     hash: HashKind,
     max_object_bytes: u64,
     max_reply_bytes: u64,
+    max_result_bytes: Option<u64>,
 }
 
 #[rustler::resource_impl]
@@ -586,10 +593,6 @@ fn budget_limits(limits: LimitsMap) -> BudgetLimits {
     }
 }
 
-fn budget(limits: LimitsMap) -> Budget {
-    Budget::new(budget_limits(limits), None, Default::default())
-}
-
 #[rustler::nif]
 fn runtime_start(config: RuntimeConfigMap) -> NifResult<ResourceArc<RuntimeResource>> {
     let core_config = RuntimeConfig {
@@ -933,6 +936,16 @@ fn preflight_provider_results(
                     .with_limit("max_provider_bytes"),
             );
         }
+        if request
+            .max_result_bytes
+            .is_some_and(|maximum| total_bytes > maximum)
+        {
+            return Err(Error::new(
+                ErrorCode::ResultTooLarge,
+                "object batch exceeds max_total_bytes",
+            )
+            .with_limit("max_total_bytes"));
+        }
     }
     if seen.len() != request.expected.len() {
         return Err(provider_protocol_error(
@@ -958,10 +971,15 @@ fn preflight_provider_value(
             if value.map_get(atoms::data()).is_ok() {
                 provider_data_size(request, value)
             } else {
-                value
+                let size = value
                     .map_get(atoms::size())
                     .and_then(u64::decode)
                     .map_err(|_| provider_protocol_error("provider header size is invalid"))?;
+                if size > PROVIDER_HEADER_SIZE_CEILING {
+                    return Err(provider_protocol_error(
+                        "provider header size exceeds the 2^40 sanity ceiling",
+                    ));
+                }
                 Ok(0)
             }
         }
@@ -998,17 +1016,19 @@ fn decode_provider_value(
     match request.kind {
         ProviderKind::Object => Ok(ProviderReplyValue::Object {
             kind,
-            data: value
-                .map_get(atoms::data())
-                .and_then(Binary::decode)
-                .expect("preflight proved provider object data")
-                .as_slice()
-                .to_vec(),
+            data: Arc::new(
+                value
+                    .map_get(atoms::data())
+                    .and_then(Binary::decode)
+                    .expect("preflight proved provider object data")
+                    .as_slice()
+                    .to_vec(),
+            ),
         }),
         ProviderKind::Header => match value.map_get(atoms::data()).and_then(Binary::decode) {
             Ok(data) => Ok(ProviderReplyValue::Object {
                 kind,
-                data: data.as_slice().to_vec(),
+                data: Arc::new(data.as_slice().to_vec()),
             }),
             Err(_) => Ok(ProviderReplyValue::Header(ObjectHeader {
                 kind,
@@ -1063,26 +1083,6 @@ fn decode_provider_kind(term: Term<'_>) -> Result<ObjectKind, Error> {
 
 fn provider_protocol_error(message: &'static str) -> Error {
     Error::new(ErrorCode::ProviderProtocolError, message)
-}
-
-#[rustler::nif(schedule = "DirtyCpu")]
-fn snapshot_open<'a>(
-    env: Env<'a>,
-    store: ResourceArc<StoreResource>,
-    oid: Binary<'a>,
-    limits: LimitsMap,
-) -> NifResult<Result<SnapshotMap<'a>, ErrorMap>> {
-    let oid = match oid_for_store(&store, oid.as_slice()) {
-        Ok(oid) => oid,
-        Err(error) => return Ok(Err(error_map(env, error)?)),
-    };
-    match Snapshot::open(store.0.as_dyn(), oid, &budget(limits)) {
-        Ok(snapshot) => Ok(Ok(SnapshotMap {
-            commit_oid: binary(env, snapshot.commit_oid.as_bytes()),
-            tree_oid: binary(env, snapshot.tree_oid.as_bytes()),
-        })),
-        Err(error) => Ok(Err(error_map(env, error)?)),
-    }
 }
 
 fn submit_job<'a>(
@@ -1229,32 +1229,23 @@ fn job_submit_odb_read_many<'a>(
     limits: LimitsMap,
 ) -> NifResult<Term<'a>> {
     let mut oids = Vec::with_capacity(raw_oids.len());
+    let mut seen = HashSet::with_capacity(raw_oids.len());
     for raw_oid in raw_oids {
         match oid_for_store(&store, raw_oid.as_slice()) {
-            Ok(oid) => oids.push(oid),
+            Ok(oid) if seen.insert(oid) => oids.push(oid),
+            Ok(_duplicate) => {}
             Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
         }
     }
     let task_store = store.clone();
     let task = Box::new(move |budget: &Budget| {
-        let mut total = 0u64;
         let mut results = Vec::with_capacity(oids.len());
-        let values = task_store.0.as_dyn().try_find_many(&oids, budget)?;
+        let values = task_store.0.as_dyn().try_find_many_bounded(
+            &oids,
+            budget,
+            ReadManyBudget { max_total_bytes },
+        )?;
         for (oid, value) in oids.into_iter().zip(values) {
-            let value = match value {
-                Some((kind, data)) => {
-                    total = total.saturating_add(data.len() as u64);
-                    if max_total_bytes.is_some_and(|maximum| total > maximum) {
-                        return Err(Error::new(
-                            ErrorCode::ResultTooLarge,
-                            "object batch exceeds max_total_bytes",
-                        )
-                        .with_limit("max_total_bytes"));
-                    }
-                    Some((kind, data))
-                }
-                None => None,
-            };
             results.push((oid, value));
         }
         Ok(JobOutput::ReadMany(results))
@@ -1606,12 +1597,14 @@ fn encode_job_output<'a>(
         }
         .encode(env),
         JobOutput::Header(None) => atoms::not_found().encode(env),
-        JobOutput::Object { kind, data } => object_map(env, kind, data).encode(env),
+        JobOutput::Object { kind, data } => object_map(env, kind, &data).encode(env),
         JobOutput::ReadMany(results) => results
             .into_iter()
             .map(|(oid, object)| {
                 let value = match object {
-                    Some((kind, data)) => ObjectOrNotFound::Object(object_map(env, kind, data)),
+                    Some((kind, data)) => {
+                        ObjectOrNotFound::Object(object_map(env, kind, data.as_slice()))
+                    }
                     None => ObjectOrNotFound::NotFound,
                 };
                 (binary(env, oid.as_bytes()), value)
@@ -1724,11 +1717,11 @@ fn read_object(
     Ok(Some((kind, data)))
 }
 
-fn object_map<'a>(env: Env<'a>, kind: ObjectKind, data: Vec<u8>) -> ObjectMap<'a> {
+fn object_map<'a>(env: Env<'a>, kind: ObjectKind, data: &[u8]) -> ObjectMap<'a> {
     ObjectMap {
         kind: object_kind_atom(kind),
         size: data.len() as u64,
-        data: binary(env, &data),
+        data: binary(env, data),
     }
 }
 

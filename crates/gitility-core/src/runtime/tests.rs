@@ -75,7 +75,15 @@ fn completed_output_is_published_before_one_observer_callback() {
         )
         .expect("job is admitted");
 
-    wait_for_terminal(&job);
+    // The state machine publishes the terminal state (and the output slot)
+    // BEFORE it fires the observer, so `is_terminal()` can be true while the
+    // callback is still in flight. Wait on the observer itself — that is the
+    // signal this test is about. (Waiting on `is_terminal()` here was a real
+    // race: it passed on macOS by scheduling luck and failed 3/3 on Linux.)
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while observer.calls.load(StdOrdering::Acquire) == 0 && Instant::now() < deadline {
+        thread::yield_now();
+    }
     assert_eq!(job.state(), JobState::Completed);
     assert_eq!(observer.calls.load(StdOrdering::Acquire), 1);
     assert!(observer.saw_terminal_with_output.load(StdOrdering::Acquire));

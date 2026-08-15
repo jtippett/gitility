@@ -15,6 +15,13 @@ defmodule Gitility.Runtime do
   The generated child spec gives shutdown `shutdown_join_timeout_ms + 2_000`
   milliseconds. That margin lets the bounded native worker-join phase finish
   before a supervisor is allowed to kill the GenServer running `terminate/2`.
+  Unnamed runtimes receive unique child IDs, so more than one can be placed in
+  the same supervision tree without an explicit `:name`.
+
+  Gitility's library supervisor permits 10 restarts in 60 seconds. This gives
+  its leaf runtime room to recover from a short crash burst; a persistently
+  crashing runtime still stops the application according to normal OTP
+  restart-intensity semantics.
 
   Tuning means starting a named runtime in your own supervision tree — the
   Finch/NimblePool convention, and the only shape that lets two subsystems
@@ -108,7 +115,7 @@ defmodule Gitility.Runtime do
       |> positive_value!(:shutdown_join_timeout_ms)
 
     %{
-      id: Keyword.get(opts, :name, __MODULE__),
+      id: Keyword.get(opts, :name) || {__MODULE__, make_ref()},
       start: {__MODULE__, :start_link, [opts]},
       # The supervisor must outlast CoreRuntime's bounded worker-join phase.
       shutdown: shutdown_join_timeout_ms + @supervisor_shutdown_margin_ms
@@ -118,7 +125,7 @@ defmodule Gitility.Runtime do
   @doc """
   The shared default runtime, started lazily on first use.
   """
-  @spec default() :: t()
+  @spec default() :: t() | {:error, Error.t()}
   def default do
     case :persistent_term.get(@default_key, nil) do
       pid when is_pid(pid) ->
@@ -130,8 +137,17 @@ defmodule Gitility.Runtime do
   end
 
   @doc "Returns a runtime's current native admission and lifecycle counters."
-  @spec stats(t()) :: map() | {:error, Error.t()}
-  def stats(runtime \\ default()) do
+  @spec stats(t() | :default) :: map() | {:error, Error.t()}
+  def stats(runtime \\ :default)
+
+  def stats(:default) do
+    case default() do
+      runtime when is_pid(runtime) -> stats(runtime)
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  def stats(runtime) do
     with {:ok, resource} <- resource(runtime) do
       Native.runtime_stats(resource)
     end
@@ -175,32 +191,43 @@ defmodule Gitility.Runtime do
     %{detached_workers: detached_workers, last_detach_reason: reason} =
       Native.runtime_shutdown(state.resource)
 
-    if detached_workers > 0 do
-      suffix = if reason, do: ": #{reason}", else: ""
-
-      Logger.warning(
-        "Gitility runtime shutdown detached #{detached_workers} worker(s)#{suffix}"
-      )
-    end
+    warn_if_detached_workers(detached_workers, reason)
 
     :ok
+  end
+
+  @doc false
+  def warn_if_detached_workers(0, _reason), do: :ok
+
+  def warn_if_detached_workers(detached_workers, reason)
+      when is_integer(detached_workers) and detached_workers > 0 do
+    suffix = if reason, do: ": #{reason}", else: ""
+
+    Logger.warning("Gitility runtime shutdown detached #{detached_workers} worker(s)#{suffix}")
   end
 
   defp start_default do
     child = {__MODULE__, name: @default_name}
 
-    case Supervisor.start_child(Gitility.Supervisor, child) do
-      {:ok, pid} ->
-        pid
+    try do
+      case Supervisor.start_child(Gitility.Supervisor, child) do
+        {:ok, pid} ->
+          pid
 
-      {:error, {:already_started, pid}} ->
-        pid
+        {:error, {:already_started, pid}} ->
+          pid
 
-      {:error, :already_present} ->
-        Process.whereis(@default_name) || retry_default()
+        {:error, :already_present} ->
+          Process.whereis(@default_name) || retry_default()
 
-      {:error, {:already_present, _child}} ->
-        Process.whereis(@default_name) || retry_default()
+        {:error, {:already_present, _child}} ->
+          Process.whereis(@default_name) || retry_default()
+
+        {:error, _reason} ->
+          runtime_supervisor_error()
+      end
+    catch
+      :exit, _reason -> runtime_supervisor_error()
     end
   end
 
@@ -220,7 +247,7 @@ defmodule Gitility.Runtime do
 
           nil ->
             if System.monotonic_time(:millisecond) >= deadline do
-              raise "default Gitility runtime failed to start"
+              runtime_supervisor_error()
             else
               receive do
               after
@@ -232,6 +259,10 @@ defmodule Gitility.Runtime do
   end
 
   defp default_workers, do: max(div(System.schedulers_online(), 2), 1)
+
+  defp runtime_supervisor_error do
+    {:error, Error.new(:cancelled, "gitility runtime supervisor is not running", retryable: true)}
+  end
 
   defp positive_option!(opts, key) do
     opts |> Keyword.fetch!(key) |> positive_value!(key)

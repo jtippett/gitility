@@ -119,6 +119,16 @@ impl Budget {
         Ok(())
     }
 
+    /// Whether this budget's wall-clock deadline has passed.
+    ///
+    /// The runtime uses this while holding its admission queue lock to sweep
+    /// expired queued jobs without confusing a separate cancellation request
+    /// with deadline expiry.
+    pub(crate) fn deadline_expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     /// Charges one object of `bytes` inflated size against the object
     /// count, the per-object cap, and the total-bytes ceiling.
     pub fn charge_object(&self, bytes: u64) -> Result<(), Error> {

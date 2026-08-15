@@ -21,6 +21,7 @@ use rustler::{
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
@@ -100,6 +101,7 @@ struct RuntimeStatsMap {
     active_jobs: u64,
     job_resources: u64,
     owner_count: u64,
+    pump_alive: bool,
     workers: u64,
     max_queue: u64,
     max_jobs_per_owner: u64,
@@ -148,6 +150,8 @@ struct RuntimeResource {
     job_resources: AtomicU64,
     config: RuntimeConfigMap,
     pump: Mutex<Option<JoinHandle<()>>>,
+    pump_alive: Arc<AtomicBool>,
+    shutdown_lock: Mutex<()>,
     shutdown_started: AtomicBool,
 }
 
@@ -157,10 +161,18 @@ impl Resource for RuntimeResource {}
 impl Drop for RuntimeResource {
     fn drop(&mut self) {
         if !self.shutdown_started.swap(true, Ordering::AcqRel) {
-            // Resource destruction can run on a scheduler. The pump owns a
-            // runtime Arc and performs the blocking shutdown on its Rust-owned
-            // thread; dropping the JoinHandle deliberately detaches it.
             self.notifications.close();
+            if !self.pump_alive.load(Ordering::Acquire) {
+                // Last-resort teardown after the notification pump died.
+                // Resource destruction can run on a scheduler, so it must not
+                // join or delegate by spawning another thread. The core
+                // request path wakes and drains the workers; their own RAII
+                // guards return the process-wide thread-budget slots.
+                self.runtime.request_shutdown();
+            }
+            // With a live pump, closing the channel delegates the explicit
+            // bounded shutdown to that Rust-owned thread. Dropping the handle
+            // here deliberately detaches it from this scheduler thread.
         }
     }
 }
@@ -278,22 +290,28 @@ fn remove_owner(
 fn notification_pump(runtime: Arc<CoreRuntime>, receiver: mpsc::Receiver<Notification>) {
     let mut env = OwnedEnv::new();
     while let Ok(notification) = receiver.recv() {
-        notify_waiters(
-            &mut env,
-            notification.job_id,
-            notification.waiters,
-            &notification.waiter_state,
-        );
+        // A malformed notification or Rustler panic must cost at most that
+        // notification. Keeping this boundary inside the receive loop
+        // preserves liveness for every later job.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            notify_waiters(
+                &mut env,
+                notification.job_id,
+                notification.waiters,
+                &notification.waiter_state,
+            );
+        }));
     }
     let detached_before = runtime.counters().detached_workers;
     runtime.shutdown();
     let detached_after = runtime.counters().detached_workers;
     if detached_after > detached_before {
+        let detached_delta = detached_after - detached_before;
         let reason = runtime
             .last_detach_reason()
             .unwrap_or_else(|| "reason unavailable".to_owned());
         eprintln!(
-            "gitility: delegated runtime shutdown detached {detached_after} worker(s): {reason}"
+            "gitility: delegated runtime shutdown detached {detached_delta} worker(s): {reason}"
         );
     }
 }
@@ -517,12 +535,21 @@ fn runtime_start(config: RuntimeConfigMap) -> NifResult<ResourceArc<RuntimeResou
     let notifications = Arc::new(NotificationSender {
         sender: Mutex::new(Some(notify_tx)),
     });
+    let pump_alive = Arc::new(AtomicBool::new(true));
     let pump_runtime = Arc::clone(&runtime);
+    let pump_liveness = Arc::clone(&pump_alive);
     let pump = thread::Builder::new()
         .name("gitility-notify".to_owned())
         .spawn(move || {
             let _budget_reservation = pump_reservation;
-            notification_pump(pump_runtime, notify_rx)
+            if catch_unwind(AssertUnwindSafe(|| {
+                notification_pump(pump_runtime, notify_rx)
+            }))
+            .is_err()
+                && pump_liveness.swap(false, Ordering::AcqRel)
+            {
+                eprintln!("gitility: notification pump died");
+            }
         })
         .expect("gitility notification pump must start");
 
@@ -535,6 +562,8 @@ fn runtime_start(config: RuntimeConfigMap) -> NifResult<ResourceArc<RuntimeResou
         job_resources: AtomicU64::new(0),
         config,
         pump: Mutex::new(Some(pump)),
+        pump_alive,
+        shutdown_lock: Mutex::new(()),
         shutdown_started: AtomicBool::new(false),
     }))
 }
@@ -547,12 +576,16 @@ fn thread_budget_error(error: thread_budget::BudgetExhausted) -> rustler::Error 
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn runtime_shutdown(runtime: ResourceArc<RuntimeResource>) -> RuntimeShutdownMap {
+    // Keep the winner's core shutdown, channel close, and pump take/join in
+    // one section. Concurrent callers wait here instead of stealing the pump
+    // handle before the winner closes its channel.
+    let _shutdown = lock(&runtime.shutdown_lock);
     if !runtime.shutdown_started.swap(true, Ordering::AcqRel) {
         runtime.runtime.shutdown();
         runtime.notifications.close();
-    }
-    if let Some(pump) = lock(&runtime.pump).take() {
-        let _ = pump.join();
+        if let Some(pump) = lock(&runtime.pump).take() {
+            let _ = pump.join();
+        }
     }
     RuntimeShutdownMap {
         detached_workers: runtime.runtime.counters().detached_workers,
@@ -579,7 +612,8 @@ fn runtime_stats(runtime: ResourceArc<RuntimeResource>) -> RuntimeStatsMap {
         ),
         job_resources: runtime.job_resources.load(Ordering::Acquire),
         owner_count: lock(&runtime.owner_keys).len() as u64,
-        workers: runtime.config.workers as u64,
+        pump_alive: runtime.pump_alive.load(Ordering::Acquire),
+        workers: runtime.runtime.worker_count() as u64,
         max_queue: runtime.config.max_queue as u64,
         max_jobs_per_owner: runtime.config.max_jobs_per_owner as u64,
         shutdown_join_timeout_ms: runtime.config.shutdown_join_timeout_ms,
@@ -1110,7 +1144,7 @@ fn job_take_result<'a>(env: Env<'a>, resource: ResourceArc<JobResource>) -> NifR
         Ok(output) if output_payload_bytes(&output) > resource.max_result_bytes => {
             let error = Error::new(
                 ErrorCode::ResultTooLarge,
-                "job result exceeds max_result_bytes",
+                "job result exceeds max_result_bytes and has been discarded",
             )
             .with_limit("max_result_bytes");
             Ok((atoms::error(), error_map(env, error)?).encode(env))

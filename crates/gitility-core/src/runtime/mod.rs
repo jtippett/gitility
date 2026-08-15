@@ -6,12 +6,15 @@
 //! # Cooperative deadlines
 //!
 //! The runtime deliberately has no timer thread and cannot interrupt arbitrary
-//! Rust code. A job whose deadline has passed at dequeue fails with
-//! [`ErrorCode::Timeout`] without invoking its task. Once running, the task
-//! observes cancellation and its deadline at [`Budget::check`] and charge
-//! points. Timeout latency is therefore bounded by the longest gap between
-//! budget checks, not by a wall-clock interrupt. Provider waits use the same
-//! deadline when callback-backed stores are added.
+//! Rust code. Queue activity (submission or dequeue) sweeps the expired run at
+//! the FIFO head and fails those jobs with [`ErrorCode::Timeout`] without
+//! invoking their tasks. A totally idle runtime still observes an expired
+//! queued job only on its next queue touch; synchronous callers cover that
+//! honest gap by cancelling their owned job when their await grace expires.
+//! Once running, the task observes cancellation and its deadline at
+//! [`Budget::check`] and charge points. Timeout latency is therefore bounded by
+//! the longest gap between budget checks, not by a wall-clock interrupt.
+//! Provider waits use the same deadline when callback-backed stores are added.
 
 mod observer;
 mod sync;
@@ -102,8 +105,9 @@ pub struct JobSpec {
 ///
 /// Implementations must never block for long and must not re-enter
 /// [`Runtime::shutdown`] or [`Runtime::submit`]. In particular, drain callbacks
-/// run inside the shutdown protocol. Observer panics are contained by the
-/// runtime.
+/// run inside the shutdown protocol. [`Runtime::request_shutdown`] and
+/// `Runtime`'s `Drop` implementation can also invoke observers on their caller
+/// thread. Observer panics are contained by the runtime.
 pub trait JobObserver: Send + Sync + 'static {
     fn completed(&self, job: &Job);
 }
@@ -296,6 +300,26 @@ impl Shared {
     }
 }
 
+fn take_expired_queue_head(state: &mut QueueState) -> Vec<Arc<Job>> {
+    let mut expired = Vec::new();
+    while state
+        .queue
+        .front()
+        .is_some_and(|job| job.deadline_expired())
+    {
+        if let Some(job) = state.queue.pop_front() {
+            expired.push(job);
+        }
+    }
+    expired
+}
+
+fn publish_expired_jobs(expired: Vec<Arc<Job>>) {
+    for job in expired {
+        job.expire();
+    }
+}
+
 /// A submitted operation and its take-once result slot.
 pub struct Job {
     id: u64,
@@ -353,6 +377,16 @@ impl Job {
             JobState::Cancelled,
             Err(cancelled_error()),
         ) {
+            self.discard_task();
+        }
+    }
+
+    fn deadline_expired(&self) -> bool {
+        self.budget.deadline_expired()
+    }
+
+    fn expire(&self) {
+        if self.publish_terminal(JobState::Queued, JobState::Failed, Err(timeout_error())) {
             self.discard_task();
         }
     }
@@ -474,6 +508,10 @@ fn cancelled_error() -> Error {
     Error::new(ErrorCode::Cancelled, "operation cancelled")
 }
 
+fn timeout_error() -> Error {
+    Error::new(ErrorCode::Timeout, "operation budget expired")
+}
+
 fn panic_error() -> Error {
     Error::new(
         ErrorCode::BackendError,
@@ -491,11 +529,11 @@ enum ShutdownPhase {
 
 /// An explicit bounded worker pool.
 ///
-/// Dropping the last runtime handle from outside the pool performs the same
-/// cancellation and bounded join sequence as [`Runtime::shutdown`]. If the
-/// last handle is dropped by one of this runtime's workers, `Drop` can only
-/// request shutdown: it detaches the handles rather than attempting to join
-/// itself.
+/// Dropping the last runtime handle only requests shutdown and never blocks or
+/// joins. Worker handles detach when the value is destroyed and their
+/// process-wide budget reservations remain held until the threads actually
+/// exit. Callers that require the bounded join guarantee must invoke
+/// [`Runtime::shutdown`] explicitly.
 pub struct Runtime {
     shared: Arc<Shared>,
     workers: Mutex<Vec<sync::thread::JoinHandle<()>>>,
@@ -583,7 +621,15 @@ impl Runtime {
     /// Admits one job or returns bounded-backpressure metadata.
     pub fn submit(&self, owner: OwnerKey, spec: JobSpec) -> Result<Arc<Job>, SubmitError> {
         let submitted_at = Instant::now();
-        let mut state = sync::lock(&self.shared.queue);
+        let mut state = loop {
+            let mut state = sync::lock(&self.shared.queue);
+            let expired = take_expired_queue_head(&mut state);
+            if expired.is_empty() {
+                break state;
+            }
+            drop(state);
+            publish_expired_jobs(expired);
+        };
         if state.shutting_down {
             self.shared
                 .counters
@@ -658,14 +704,33 @@ impl Runtime {
     /// exits; that slot is the honest cost of uncooperative work. Concurrent
     /// external callers wait for the same bounded completion point. From one
     /// of this runtime's own workers, this is deliberately only a shutdown
-    /// request; a later external call or `Drop` completes the bounded phase.
+    /// request; a later explicit external call completes the bounded phase.
     ///
     /// Observers for jobs drained from the queue run synchronously on this
     /// method's caller thread, inside the shutdown protocol. Observers must not
     /// re-enter this method or [`Runtime::submit`].
     pub fn shutdown(&self) {
         let called_from_worker = self.is_worker_thread();
-        let won_request = self
+        self.request_shutdown();
+
+        if called_from_worker
+            || self.shutdown_phase.load(Ordering::Acquire) == ShutdownPhase::Complete as u8
+        {
+            return;
+        }
+        self.wait_for_or_finish_shutdown();
+    }
+
+    /// Requests cancellation and draining without waiting for or joining any
+    /// worker thread.
+    ///
+    /// This operation is idempotent and safe from every thread, including a
+    /// runtime worker or host scheduler. Workers wake and exit on their own;
+    /// their thread-budget reservations are released by the worker closures.
+    /// Use [`Runtime::shutdown`] when the caller needs the bounded join
+    /// guarantee.
+    pub fn request_shutdown(&self) {
+        if self
             .shutdown_phase
             .compare_exchange(
                 ShutdownPhase::NotStarted as u8,
@@ -673,32 +738,27 @@ impl Runtime {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok();
-
-        if won_request {
-            if !called_from_worker {
-                self.shutdown_join_claimed.store(true, Ordering::Release);
-            }
-            self.request_shutdown();
-            self.publish_shutdown_request();
-
-            if called_from_worker {
-                return;
-            }
-            self.finish_shutdown();
-            return;
-        }
-
-        if self.shutdown_phase.load(Ordering::Acquire) == ShutdownPhase::Complete as u8
-            || called_from_worker
+            .is_ok()
         {
-            return;
+            let jobs = self.shared.begin_shutdown();
+            self.shared.wake.notify_all();
+            for job in jobs {
+                job.cancel();
+            }
+            self.publish_shutdown_request();
         }
-        self.wait_for_or_finish_shutdown();
     }
 
     pub fn queue_len(&self) -> usize {
         sync::lock(&self.shared.queue).queue.len()
+    }
+
+    /// Number of worker threads successfully spawned for this runtime.
+    ///
+    /// This reports the normalized one worker for a `workers: 0`
+    /// configuration and remains stable after shutdown.
+    pub fn worker_count(&self) -> usize {
+        sync::lock(&self.worker_ids).len()
     }
 
     pub fn running_count(&self) -> u64 {
@@ -737,14 +797,6 @@ impl Runtime {
     fn is_worker_thread(&self) -> bool {
         let current = sync::thread::current().id();
         sync::lock(&self.worker_ids).contains(&current)
-    }
-
-    fn request_shutdown(&self) {
-        let jobs = self.shared.begin_shutdown();
-        self.shared.wake.notify_all();
-        for job in jobs {
-            job.cancel();
-        }
     }
 
     fn publish_shutdown_request(&self) {
@@ -840,27 +892,35 @@ impl fmt::Debug for Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        // A last Arc can be released by a task closure on its own worker.
-        // shutdown() recognizes that caller and only requests shutdown, after
-        // which dropping JoinHandles detaches them and avoids a self-join.
-        self.shutdown();
+        // Drop can run on a host scheduler or on one of this runtime's own
+        // workers. It must never block or join; dropping the JoinHandles below
+        // detaches them after this request wakes the pool.
+        self.request_shutdown();
     }
 }
 
 fn worker_loop(shared: Arc<Shared>) {
     loop {
-        let job = {
+        let (expired, job) = {
             let mut state = sync::lock(&shared.queue);
             loop {
+                let expired = take_expired_queue_head(&mut state);
+                if !expired.is_empty() {
+                    break (expired, None);
+                }
                 if let Some(job) = state.queue.pop_front() {
-                    break Some(job);
+                    break (Vec::new(), Some(job));
                 }
                 if state.shutting_down {
-                    break None;
+                    break (Vec::new(), None);
                 }
                 state = sync::wait(&shared.wake, state);
             }
         };
+        if !expired.is_empty() {
+            publish_expired_jobs(expired);
+            continue;
+        }
         let Some(job) = job else {
             return;
         };

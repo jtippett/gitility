@@ -430,7 +430,7 @@ fn owner_ceiling_is_independent_of_queue_capacity() {
 }
 
 #[test]
-fn expired_queued_job_fails_without_invoking_task() {
+fn queue_activity_sweeps_expired_head_without_a_worker_reaching_it() {
     let runtime = Runtime::start(RuntimeConfig {
         workers: 1,
         max_queue: 2,
@@ -465,10 +465,19 @@ fn expired_queued_job_fails_without_invoking_task() {
     spec.timeout_ms = Some(1);
     let expired = runtime.submit(1, spec).expect("expiring job is admitted");
     thread::sleep(Duration::from_millis(5));
-    release_tx.send(()).expect("blocker is released");
 
-    assert!(observer.wait_for(2, Duration::from_secs(2)));
-    wait_for_terminal(&blocker);
+    // The sole worker is still blocked. Submitting a neighbour is the one
+    // queue-activity tick that sweeps the expired FIFO head.
+    let neighbour = runtime
+        .submit(
+            1,
+            observer_spec(observer.clone(), |_| Ok(JobOutput::Oid(oid(12)))),
+        )
+        .expect("expired admission slot is reclaimed for the neighbour");
+    assert!(observer.wait_for(1, Duration::from_secs(2)));
+    assert_eq!(blocker.state(), JobState::Running);
+    assert_eq!(neighbour.state(), JobState::Queued);
+
     assert_eq!(expired.state(), JobState::Failed);
     assert!(!invoked.load(StdOrdering::Acquire));
     let error = expired
@@ -476,6 +485,11 @@ fn expired_queued_job_fails_without_invoking_task() {
         .expect("timeout output exists")
         .expect_err("deadline failure is an error");
     assert_eq!(error.code, ErrorCode::Timeout);
+
+    release_tx.send(()).expect("blocker is released");
+    assert!(observer.wait_for(3, Duration::from_secs(2)));
+    wait_for_terminal(&blocker);
+    wait_for_terminal(&neighbour);
     runtime.shutdown();
 }
 
@@ -933,6 +947,8 @@ fn deterministic_four_worker_mixed_stress_reconciles_counters() {
 mod thread_budget_tests {
     use super::super::thread_budget::{BudgetExhausted, ThreadBudget};
     use super::super::{Runtime, RuntimeConfig};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn leaked_budget(limit: usize) -> &'static ThreadBudget {
         Box::leak(Box::new(ThreadBudget::new(limit)))
@@ -1017,8 +1033,28 @@ mod thread_budget_tests {
         let budget = leaked_budget(4);
         let runtime = Runtime::start_with_budget(config(0), budget).expect("1 of 4 fits");
         assert_eq!(budget.used(), 1);
+        assert_eq!(runtime.worker_count(), 1);
         runtime.shutdown();
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn request_only_shutdown_drains_workers_and_returns_budget_without_joining() {
+        let budget = leaked_budget(4);
+        let runtime = Runtime::start_with_budget(config(2), budget).expect("2 of 4 fits");
+        assert_eq!(runtime.worker_count(), 2);
+        assert_eq!(budget.used(), 2);
+
+        // This models the NIF's last-resort path after losing its notification
+        // pump: no observer thread remains to perform the explicit join.
+        runtime.request_shutdown();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while budget.used() != 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+
+        assert_eq!(budget.used(), 0, "request-only shutdown must release slots");
+        assert_eq!(runtime.worker_count(), 2, "spawned count remains telemetry");
     }
 
     #[test]

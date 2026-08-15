@@ -17,16 +17,27 @@ nif_pump_file="native/gitility/src/lib.rs"
 nif_pump_pattern="thread::Builder::new"
 
 spawn_pattern='(^|[^[:alnum:]_])((std|sync|loom)::)?thread::(spawn|Builder::new)[[:space:]]*[(]'
+bare_builder_pattern='(^|[^[:alnum:]_:])Builder::new[[:space:]]*[(]'
 failed=0
 core_worker_hits=0
 nif_pump_hits=0
 
 scan_file() {
   local relative_file="$1"
+  local pattern="$spawn_pattern"
+
+  # A bare Builder::new() is also a native-thread spawn when Builder was
+  # imported from std::thread. Keep this contextual so unrelated builders do
+  # not become false positives.
+  if grep -Eq \
+    'use[[:space:]]+std::thread(::Builder|::\{[^}]*Builder[^}]*\})' \
+    "$workspace_root/$relative_file"; then
+    pattern="$pattern|$bare_builder_pattern"
+  fi
 
   # Suppress items guarded by #[cfg(test)] (including all()/any() forms).
   # Dedicated tests.rs and loom_tests.rs files are excluded by the caller.
-  awk -v file="$relative_file" -v pattern="$spawn_pattern" '
+  awk -v file="$relative_file" -v pattern="$pattern" '
     function brace_delta(line, copy, opens, closes) {
       copy = line
       opens = gsub(/\{/, "", copy)

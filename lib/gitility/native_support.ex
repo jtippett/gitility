@@ -90,7 +90,12 @@ defmodule Gitility.NativeSupport do
     Error.new(code, message, retryable: retryable, operation: operation, details: details)
   end
 
-  def runtime_and_resource(:default), do: runtime_and_resource(Runtime.default())
+  def runtime_and_resource(:default) do
+    case Runtime.default() do
+      runtime when is_pid(runtime) -> runtime_and_resource(runtime)
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
 
   def runtime_and_resource(runtime) do
     case Runtime.resource(runtime) do
@@ -103,7 +108,7 @@ defmodule Gitility.NativeSupport do
     with {:ok, runtime, runtime_resource} <- runtime_and_resource(runtime) do
       case submit.(runtime_resource) do
         {:ok, {ref, id}} ->
-          {:ok, %Job{ref: ref, id: id, owner: self(), runtime: runtime}}
+          {:ok, %Job{ref: ref, id: id, runtime: runtime}}
 
         {:error, error} ->
           {:error, nif_error(error, operation)}
@@ -126,8 +131,23 @@ defmodule Gitility.NativeSupport do
     case result do
       {:ok, job} ->
         case Job.await(job, timeout_ms + 500) do
-          {:error, %Error{} = error} -> {:error, %{error | operation: operation}}
-          success -> success
+          {:error, %Error{code: :await_timeout}} ->
+            # A synchronous wrapper owns its internal job. Its admission-time
+            # budget has now elapsed, so never abandon it or expose the async
+            # await contract: request cancellation and give the terminal
+            # notification one short bounded grace. A pathological running
+            # task may not observe the interrupt until its next budget check,
+            # but it is no longer unowned.
+            :ok = Job.cancel(job)
+            _terminal = Job.await(job, 1_000)
+
+            {:error, Error.new(:timeout, "operation budget expired", operation: operation)}
+
+          {:error, %Error{} = error} ->
+            {:error, %{error | operation: operation}}
+
+          success ->
+            success
         end
 
       error ->

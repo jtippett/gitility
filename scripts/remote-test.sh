@@ -15,7 +15,7 @@
 #   sync     git-archive HEAD + working tree to the sprite (sources/ and
 #            fixtures/generated are never shipped — fixtures self-generate)
 #   rust     cargo test --workspace, clippy -D warnings, fmt, spawn guard
-#   loom     RUSTFLAGS="--cfg loom" release loom suite (8 models, exact names)
+#   loom     RUSTFLAGS="--cfg loom" release loom suite (9 models, exact names)
 #   mix      GITILITY_BUILD=1 mix test (differential gate included, needs
 #            the pinned git 2.55.0 the provisioning step built)
 #   soak     GITILITY_BUILD=1 mix test --only soak (the 30s runtime soak)

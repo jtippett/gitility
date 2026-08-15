@@ -19,7 +19,13 @@ defmodule Gitility.Job do
   running** — await again, cancel, or abandon it. The job's own
   `timeout_ms` budget expiring cancels the work and completes the job as
   `:timeout`. The synchronous wrappers pass the budget and await it plus a
-  grace period, so sync callers only ever see `:timeout`.
+  grace period; if that await expires, they cancel their internal job, wait
+  once more for terminal delivery, and return `:timeout`. Sync callers never
+  see `:await_timeout` and never abandon their internal work.
+
+  A result rejected as `:result_too_large` has already been removed from its
+  take-once native slot and discarded. It is intentionally unrecoverable: the
+  result byte limit belongs to the job and cannot be raised by awaiting again.
 
   ## Ownership
 
@@ -35,12 +41,11 @@ defmodule Gitility.Job do
   @opaque t :: %__MODULE__{
             ref: term(),
             id: pos_integer(),
-            owner: pid(),
             runtime: Gitility.Runtime.t()
           }
 
-  @enforce_keys [:ref, :id, :owner, :runtime]
-  defstruct [:ref, :id, :owner, :runtime]
+  @enforce_keys [:ref, :id, :runtime]
+  defstruct [:ref, :id, :runtime]
 
   @typedoc "Job lifecycle states."
   @type status :: :queued | :running | :completed | :failed | :cancelled

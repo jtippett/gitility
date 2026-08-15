@@ -317,6 +317,52 @@ fn loom_double_cancel_from_two_threads_fires_once() {
 }
 
 #[test]
+fn loom_cancel_races_deadline_sweep_with_one_terminal_transition() {
+    model(
+        "loom_cancel_races_deadline_sweep_with_one_terminal_transition",
+        || {
+            let runtime = Runtime::start(RuntimeConfig {
+                workers: 1,
+                max_queue: 2,
+                max_jobs_per_owner: 2,
+                retry_after_ms: 1,
+                shutdown_join_timeout_ms: 5_000,
+            });
+            let observation = observer();
+            let mut expired_spec = spec(Arc::clone(&observation.observer));
+            expired_spec.timeout_ms = Some(0);
+            let expired = runtime
+                .submit(1, expired_spec)
+                .expect("expired job is initially admitted");
+            let cancelling_job = Arc::clone(&expired);
+            let canceller = loom::thread::spawn(move || cancelling_job.cancel());
+
+            // Submission is also a sweep point. Depending on the modeled
+            // interleaving, cancellation, the sweep, or worker dequeue wins.
+            let neighbour = runtime.submit(1, spec(observation.observer));
+            canceller.join().expect("canceller does not panic");
+            runtime.shutdown();
+
+            assert!(expired.is_terminal());
+            if let Ok(neighbour) = neighbour {
+                assert!(neighbour.is_terminal());
+            }
+            let counters = runtime.counters();
+            assert_eq!(
+                counters.submitted,
+                counters.completed + counters.failed + counters.cancelled
+            );
+            assert_eq!(
+                observation.calls.load(Ordering::Acquire),
+                counters.submitted
+            );
+            assert!(expired.take_output().is_some());
+            assert_eq!(expired.take_output(), None);
+        },
+    );
+}
+
+#[test]
 fn loom_shutdown_races_reentrant_shutdown_without_deadlock() {
     model(
         "loom_shutdown_races_reentrant_shutdown_without_deadlock",

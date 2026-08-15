@@ -1,7 +1,9 @@
 defmodule Gitility.Milestone2bRuntimeJobTest do
   use ExUnit.Case, async: false
 
-  alias Gitility.{Error, Job, Limits, Object, ODB, OID, Runtime, Snapshot}
+  import ExUnit.CaptureLog
+
+  alias Gitility.{Error, Job, Limits, Native, Object, ODB, OID, Runtime, Snapshot}
 
   @entry_count 80_000
   @shutdown_join_timeout_ms 5_000
@@ -97,9 +99,71 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
     assert Process.alive?(runtime)
   end
 
+  test "five fast default-runtime crashes stay within the library supervisor intensity" do
+    supervisor = Process.whereis(Gitility.Supervisor)
+    assert is_pid(supervisor)
+
+    runtime = Runtime.default()
+    assert is_pid(runtime)
+
+    Enum.reduce(1..5, runtime, fn _iteration, previous ->
+      monitor = Process.monitor(previous)
+      Process.exit(previous, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^previous, :killed}, 5_000
+
+      assert eventually(fn ->
+               case Process.whereis(Gitility.DefaultRuntime) do
+                 pid when is_pid(pid) -> pid != previous
+                 nil -> false
+               end
+             end)
+
+      Process.whereis(Gitility.DefaultRuntime)
+    end)
+
+    assert Process.alive?(supervisor)
+    assert Enum.any?(Application.started_applications(), fn {app, _, _} -> app == :gitility end)
+  end
+
   test "child specs outlast the configured native shutdown join window" do
     assert %{shutdown: 7_000} = Runtime.child_spec([])
     assert %{shutdown: 2_250} = Runtime.child_spec(shutdown_join_timeout_ms: 250)
+
+    assert %{id: first_id} = Runtime.child_spec([])
+    assert %{id: second_id} = Runtime.child_spec([])
+    assert first_id != second_id
+    assert %{id: Gitility.NamedRuntime} = Runtime.child_spec(name: Gitility.NamedRuntime)
+  end
+
+  test "a stopped application turns dead handles and default startup into errors", context do
+    snapshot = snapshot(context.small_objects, context.small_commit, Runtime.default())
+
+    try do
+      assert :ok = Application.stop(:gitility)
+
+      assert {:error, %Error{code: :cancelled, message: "runtime shut down"}} =
+               Gitility.list_tree(snapshot)
+
+      assert {:error,
+              %Error{
+                code: :cancelled,
+                message: "gitility runtime supervisor is not running",
+                retryable: true
+              }} = ODB.from_objects(context.small_objects)
+    after
+      assert {:ok, _started} = Application.ensure_all_started(:gitility)
+    end
+  end
+
+  test "terminate warning formatting is covered without an uncooperative BEAM task" do
+    assert capture_log(fn ->
+             :ok = Runtime.warn_if_detached_workers(0, nil)
+           end) == ""
+
+    assert capture_log(fn ->
+             :ok = Runtime.warn_if_detached_workers(2, "injected detach reason")
+           end) =~
+             "Gitility runtime shutdown detached 2 worker(s): injected detach reason"
   end
 
   test "async list_tree matches sync and results are take-once", context do
@@ -131,6 +195,88 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
     assert length(page.items) == @entry_count
     job_id = job.id
     refute_receive {:gitility_job, ^job_id, :done}
+  end
+
+  @tag timeout: 30_000
+  test "sync wrapper times out and cancels its owned job behind a 150-job backlog", context do
+    runtime = start_runtime(workers: 1, max_queue: 200, max_jobs_per_owner: 200)
+    snapshot = snapshot(context.large_objects, context.large_commit, runtime)
+    backlog_limits = large_limits()
+
+    assert {:ok, running} =
+             Gitility.async_list_tree(snapshot, "",
+               limit: @entry_count,
+               limits: backlog_limits
+             )
+
+    assert eventually(fn -> Job.status(running) == :running end)
+
+    backlog =
+      for _ <- 1..150 do
+        assert {:ok, job} =
+                 Gitility.async_list_tree(snapshot, "",
+                   limit: @entry_count,
+                   limits: backlog_limits
+                 )
+
+        job
+      end
+
+    started = System.monotonic_time(:millisecond)
+
+    assert {:error, %Error{code: :timeout, operation: :list_tree}} =
+             Gitility.list_tree(snapshot, "",
+               limit: @entry_count,
+               limits: large_limits(300)
+             )
+
+    elapsed = System.monotonic_time(:millisecond) - started
+    assert elapsed <= 1_800
+
+    # Only the deliberately retained blocker/backlog may remain active. The
+    # synchronous wrapper's private job was cancelled instead of abandoned.
+    assert Runtime.stats(runtime).active_jobs <= length(backlog) + 1
+
+    Enum.each([running | backlog], &Job.cancel/1)
+    assert eventually(fn -> Runtime.stats(runtime).active_jobs == 0 end, 10_000)
+  end
+
+  test "one queue activity tick expires a queued deadline while the worker stays busy", context do
+    runtime = start_runtime(workers: 1, max_queue: 8, max_jobs_per_owner: 8)
+    snapshot = snapshot(context.large_objects, context.large_commit, runtime)
+
+    assert {:ok, blocker} =
+             Gitility.async_list_tree(snapshot, "",
+               limit: @entry_count,
+               limits: large_limits()
+             )
+
+    assert eventually(fn -> Job.status(blocker) == :running end)
+
+    assert {:ok, expired} =
+             Gitility.async_list_tree(snapshot, "",
+               limit: @entry_count,
+               limits: large_limits(1)
+             )
+
+    Process.sleep(5)
+    assert Job.status(blocker) == :running
+    assert Job.status(expired) == :queued
+
+    # Submission touches the queue and sweeps the expired FIFO head before
+    # admitting its neighbour; the sole worker never reaches `expired`.
+    assert {:ok, neighbour} =
+             Gitility.async_list_tree(snapshot, "",
+               limit: @entry_count,
+               limits: large_limits()
+             )
+
+    assert {:error, %Error{code: :timeout}} = Job.await(expired, 1_000)
+    assert Job.status(expired) == :failed
+    assert Job.status(blocker) == :running
+
+    Job.cancel(blocker)
+    Job.cancel(neighbour)
   end
 
   test "cancellation and the job deadline publish their distinct errors", context do
@@ -198,7 +344,9 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
 
     assert is_integer(retry_after_ms)
 
-    rejected_before = Runtime.stats(queue_runtime).rejected
+    queue_stats = Runtime.stats(queue_runtime)
+    rejected_before = queue_stats.rejected
+    submitted_before_retry = queue_stats.submitted
 
     sync_query =
       Task.async(fn ->
@@ -206,8 +354,14 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
       end)
 
     assert eventually(fn -> Runtime.stats(queue_runtime).rejected > rejected_before end)
-    Job.cancel(running)
     Job.cancel(queued)
+    assert Job.status(queued) == :cancelled
+
+    # Wait until the synchronous wrapper's one retry has claimed the freed
+    # queue slot before releasing the worker. This removes the old race where
+    # cancelling both jobs could let the retry observe either queue state.
+    assert eventually(fn -> Runtime.stats(queue_runtime).submitted > submitted_before_retry end)
+    Job.cancel(running)
     assert {:ok, _page} = Task.await(sync_query, 30_000)
 
     owner_runtime = start_runtime(workers: 1, max_queue: 4, max_jobs_per_owner: 1)
@@ -240,8 +394,120 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
                limits: limits
              )
 
-    assert {:error, %Error{code: :result_too_large, details: %{limit: :max_result_bytes}}} =
-             Job.await(job, 5_000)
+    assert {:error,
+            %Error{
+              code: :result_too_large,
+              message: "job result exceeds max_result_bytes and has been discarded",
+              retryable: false,
+              details: %{limit: :max_result_bytes}
+            }} = Job.await(job, 5_000)
+
+    assert {:error,
+            %Error{
+              code: :invalid_argument,
+              message: "result already taken"
+            }} = Job.await(job, 0)
+  end
+
+  test "raw ShuttingDown submission maps to cancelled runtime shut down", context do
+    runtime = start_runtime(workers: 1)
+    snapshot = snapshot(context.small_objects, context.small_commit, runtime)
+    assert {:ok, resource} = Runtime.resource(runtime)
+
+    # Public shutdown stops the GenServer, so it cannot normally serve a
+    # submission in CoreRuntime::ShuttingDown. Raw shutdown creates that state
+    # solely to exercise the NIF boundary mapping.
+    assert %{detached_workers: 0} = Native.runtime_shutdown(resource)
+
+    assert {:error, %Error{code: :cancelled, message: "runtime shut down"}} =
+             Gitility.async_list_tree(snapshot)
+  end
+
+  test "raw zero-worker normalization and concurrent shutdown report live reality" do
+    baseline = Runtime.stats().thread_budget_used
+    resource = Native.runtime_start(raw_runtime_config(0))
+    stats = Native.runtime_stats(resource)
+
+    assert stats.workers == 1
+    assert stats.pump_alive == true
+
+    results =
+      1..4
+      |> Task.async_stream(fn _ -> Native.runtime_shutdown(resource) end,
+        ordered: false,
+        max_concurrency: 4,
+        timeout: 10_000
+      )
+      |> Enum.to_list()
+
+    assert Enum.all?(results, &match?({:ok, %{detached_workers: 0}}, &1))
+    assert eventually(fn -> Runtime.stats().thread_budget_used == baseline end)
+  end
+
+  test "thread-budget exhaustion fails Runtime.start_link before spawning" do
+    baseline = Runtime.stats().thread_budget_used
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    try do
+      # Trapping exits makes the linked init failure inspectable as the exact
+      # Runtime.start_link/1 error tuple without terminating the ExUnit case.
+      assert {:error, {message, _stack}} = Runtime.start_link(workers: 10_000)
+
+      assert is_binary(message)
+      assert message =~ "gitility thread budget exhausted"
+      assert Runtime.stats().thread_budget_used == baseline
+    after
+      Process.flag(:trap_exit, previous_trap_exit)
+    end
+  end
+
+  test "GC-only teardown of five raw runtimes returns the thread budget" do
+    baseline = Runtime.stats().thread_budget_used
+    parent = self()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        hold_raw_runtimes_until_released(parent, raw_runtime_config(1), 5)
+        :erlang.garbage_collect()
+        send(parent, {:raw_gc_complete, self()})
+
+        receive do
+          :finish -> :ok
+        end
+      end)
+
+    assert_receive {:raw_runtimes_started, ^pid}, 5_000
+    assert eventually(fn -> Runtime.stats().thread_budget_used >= baseline + 10 end)
+    send(pid, :release)
+    assert_receive {:raw_gc_complete, ^pid}, 10_000
+    assert eventually(fn -> Runtime.stats().thread_budget_used == baseline end, 10_000)
+    send(pid, :finish)
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
+  end
+
+  test "completed job resources and owner keys return to zero outside the soak", context do
+    runtime = start_runtime(workers: 1)
+    snapshot = snapshot(context.small_objects, context.small_commit, runtime)
+    parent = self()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        result =
+          with {:ok, job} <- Gitility.async_list_tree(snapshot),
+               {:ok, _page} <- Job.await(job, 5_000) do
+            :ok
+          end
+
+        send(parent, {:one_job_finished, self(), result})
+      end)
+
+    assert_receive {:one_job_finished, ^pid, :ok}, 5_000
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
+
+    assert eventually(fn ->
+             stats = Runtime.stats(runtime)
+             stats.job_resources == 0 and stats.owner_count == 0
+           end)
   end
 
   @tag :soak
@@ -383,6 +649,24 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
       max_results: @entry_count + 1,
       max_result_bytes: max_result_bytes
     )
+  end
+
+  defp raw_runtime_config(workers) do
+    %{
+      workers: workers,
+      max_queue: 8,
+      max_jobs_per_owner: 8,
+      shutdown_join_timeout_ms: @shutdown_join_timeout_ms
+    }
+  end
+
+  defp hold_raw_runtimes_until_released(parent, config, count) do
+    resources = for _ <- 1..count, do: Native.runtime_start(config)
+    send(parent, {:raw_runtimes_started, self()})
+
+    receive do
+      :release -> length(resources)
+    end
   end
 
   defp repository_objects(entry_count, blob_data) do

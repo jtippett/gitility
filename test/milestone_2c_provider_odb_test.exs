@@ -183,6 +183,18 @@ defmodule Gitility.ProviderTestBackend do
     {:ok, Map.new(oids, fn oid -> {oid, Map.get(objects, oid, :not_found)} end)}
   end
 
+  @impl true
+  def terminate(_reason, agent) do
+    if Process.alive?(agent) do
+      case Agent.get(agent, & &1.terminate_observer) do
+        nil -> :ok
+        observer -> send(observer, :provider_backend_terminated)
+      end
+    end
+
+    :ok
+  end
+
   defp enter(agent) do
     Agent.get_and_update(agent, fn state ->
       current = state.current + 1
@@ -322,7 +334,7 @@ defmodule Gitility.Milestone2cProviderOdbTest do
     Enum.each(paths, fn path ->
       assert {:ok, expected} = Gitility.read_file(fixture.local_snapshot, path)
       assert {:ok, actual} = Gitility.read_file(provider_snapshot, path)
-      assert actual == expected
+      assert %{actual | stats: expected.stats} == expected
     end)
 
     assert {:ok, peeled_commit} = Gitility.peel(odb, fixture.tag)
@@ -431,6 +443,32 @@ defmodule Gitility.Milestone2cProviderOdbTest do
     assert :ok = Supervisor.stop(odb.supervisor, :normal)
     assert {:error, %Error{code: :provider_down}} = Job.await(job, 1_000)
     assert System.monotonic_time(:millisecond) - started < 250
+  end
+
+  # Regression: Provider must trap exits, or an orderly supervisor stop kills
+  # it WITHOUT running terminate/2 — the backend's documented terminate/2
+  # never fires and provider_failed is left to the watchdog racing its own
+  # shutdown (~10% of clean stops hung waiters for the full request_timeout).
+  # The clean-shutdown test above passed by winning that race; this one pins
+  # the mechanism: 20 consecutive orderly stops must each run terminate/2
+  # (asserted through the backend's terminate callback) and wake the waiter.
+  test "orderly provider stop always runs terminate/2 and wakes waiters", fixture do
+    for _ <- 1..20 do
+      {odb, agent} =
+        start_provider(fixture.object_map,
+          observer: self(),
+          request_timeout: 10_000,
+          terminate_observer: self()
+        )
+
+      assert {:ok, snapshot} = Snapshot.open(odb, fixture.head)
+      reset_probe(agent, :hang, self())
+      assert {:ok, job} = Gitility.async_list_tree(snapshot)
+      assert_receive :provider_callback_entered, 1_000
+      assert :ok = Supervisor.stop(odb.supervisor, :normal)
+      assert_receive :provider_backend_terminated, 500
+      assert {:error, %Error{code: :provider_down}} = Job.await(job, 250)
+    end
   end
 
   test "a provider ODB is a valid supervisor child and handle accepts pid or name", fixture do
@@ -738,7 +776,14 @@ defmodule Gitility.Milestone2cProviderOdbTest do
     provider_opts =
       [backend: {Backend, agent}]
       |> Keyword.merge(
-        Keyword.drop(opts, [:mode, :observer, :header_kind, :header_size, :refresh_mode])
+        Keyword.drop(opts, [
+          :mode,
+          :observer,
+          :header_kind,
+          :header_size,
+          :refresh_mode,
+          :terminate_observer
+        ])
       )
 
     assert {:ok, provider} = ODB.start_link(provider_opts)
@@ -762,6 +807,7 @@ defmodule Gitility.Milestone2cProviderOdbTest do
           prefetches: [],
           refresh_mode: Keyword.get(opts, :refresh_mode, :normal),
           refresh_calls: 0,
+          terminate_observer: Keyword.get(opts, :terminate_observer),
           batches: []
         }
       end)

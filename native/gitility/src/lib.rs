@@ -153,6 +153,10 @@ impl StoreImpl {
             Self::Local(_) | Self::Static(_) | Self::Layered(_) => None,
         }
     }
+
+    fn is_layered_with_cache(&self) -> bool {
+        matches!(self, Self::Layered(store) if store.has_cache())
+    }
 }
 
 struct StoreResource(StoreImpl);
@@ -224,7 +228,13 @@ impl ObjectDb for SharedStore {
     }
 
     fn refresh(&self, budget: &Budget) -> Result<(), Error> {
-        self.as_dyn().refresh(budget)
+        match &self.0 .0 {
+            StoreImpl::Provider(_) | StoreImpl::Layered(_) => self.as_dyn().refresh(budget),
+            StoreImpl::Local(_) | StoreImpl::Static(_) => Err(Error::new(
+                ErrorCode::UnsupportedOperation,
+                "object store does not support refresh",
+            )),
+        }
     }
 }
 
@@ -545,6 +555,7 @@ struct ErrorMap {
     message: String,
     retryable: bool,
     limit: Option<String>,
+    layer: Option<u64>,
 }
 
 #[derive(NifMap)]
@@ -630,6 +641,7 @@ struct FileMap<'a> {
     total_lines: Option<u32>,
     truncated: bool,
     lfs_pointer: Option<LfsPointerMap>,
+    stats: StatsMap,
 }
 
 enum ObjectOrNotFound<'a> {
@@ -926,6 +938,13 @@ fn layered_store_new<'a>(
     cache: Option<LayeredCacheOptions>,
     cache_index: Option<u64>,
 ) -> NifResult<Term<'a>> {
+    if stores.iter().any(|store| store.0.is_layered_with_cache()) {
+        let error = Error::new(
+            ErrorCode::InvalidArgument,
+            "nested cache layers are not supported in 0.x",
+        );
+        return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+    }
     let cache = match (cache, cache_index) {
         (Some(options), Some(index)) => match usize::try_from(index) {
             Ok(index) => Some((
@@ -1723,6 +1742,7 @@ fn encode_job_output<'a>(
                 oid: pointer.oid,
                 size: pointer.size,
             }),
+            stats: stats_map(file.stats, elapsed_ms, atoms::limit(), provider_spend),
         }
         .encode(env),
         JobOutput::Header(Some(header)) => HeaderMap {
@@ -2020,6 +2040,7 @@ fn error_map(env: Env<'_>, error: Error) -> NifResult<ErrorMap> {
         message: error.message,
         retryable: error.retryable,
         limit: error.limit.map(str::to_owned),
+        layer: error.layer,
     })
 }
 

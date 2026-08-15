@@ -20,7 +20,8 @@ defmodule Gitility.File do
 
   `lfs_pointer` carries parsed Git LFS pointer metadata when the blob is a
   well-formed LFS pointer; the pointer text itself is still in `data`.
-  Gitility identifies pointers but never resolves them.
+  Gitility identifies pointers but never resolves them. `stats` reports the
+  work and cache activity performed by this read.
   """
 
   @enforce_keys [:path, :blob_oid, :mode, :kind, :data]
@@ -34,7 +35,8 @@ defmodule Gitility.File do
     :end_line,
     :total_lines,
     :lfs_pointer,
-    truncated: false
+    truncated: false,
+    stats: %Gitility.Stats{}
   ]
 
   @type kind :: :text | :binary | :symlink | :gitlink
@@ -52,6 +54,7 @@ defmodule Gitility.File do
           end_line: pos_integer() | nil,
           total_lines: non_neg_integer() | nil,
           truncated: boolean(),
-          lfs_pointer: lfs_pointer() | nil
+          lfs_pointer: lfs_pointer() | nil,
+          stats: Gitility.Stats.t()
         }
 end

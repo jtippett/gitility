@@ -142,11 +142,14 @@ pub trait ObjectDb: Send + Sync + 'static {
     }
 
     /// Invalidates availability knowledge — a missing object may have
-    /// arrived in a shallow or incrementally populated store. The default
-    /// does nothing.
+    /// arrived in a shallow or incrementally populated store. Stores without
+    /// refreshable state explicitly refuse the operation.
     fn refresh(&self, budget: &Budget) -> Result<(), Error> {
-        let _ = budget;
-        Ok(())
+        budget.check()?;
+        Err(Error::new(
+            crate::error::ErrorCode::UnsupportedOperation,
+            "object store does not support refresh",
+        ))
     }
 }
 
@@ -254,7 +257,10 @@ mod tests {
         // Defaults are usable through the trait object.
         db.prefetch(&[blob_oid, commit_oid], &budget)
             .expect("prefetch default succeeds");
-        db.refresh(&budget).expect("refresh default succeeds");
+        assert_eq!(
+            db.refresh(&budget).unwrap_err().code,
+            ErrorCode::UnsupportedOperation
+        );
     }
 
     #[test]

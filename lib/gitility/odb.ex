@@ -58,7 +58,16 @@ defmodule Gitility.ODB do
           }
 
   @enforce_keys [:kind, :ref, :hash, :runtime]
-  defstruct [:kind, :ref, :hash, :runtime, :provider, :supervisor, providers: []]
+  defstruct [
+    :kind,
+    :ref,
+    :hash,
+    :runtime,
+    :provider,
+    :supervisor,
+    providers: [],
+    contains_cache: false
+  ]
 
   @default_layer_cache_entries 100_000
 
@@ -248,6 +257,15 @@ defmodule Gitility.ODB do
   allowed. All layers must share a hash algorithm (`:hash_mismatch`) and
   runtime (`:runtime_mismatch`).
 
+  Header queries are answered by the cache when the object is resident,
+  otherwise by the first layer that has it, without fetching payloads.
+  Header queries never populate the cache.
+
+  A layer error fails the read and carries its zero-based position in
+  `error.details.layer`; layers are not failover replicas. A hit before a
+  failing layer still succeeds. Compose caches with one authoritative store;
+  use supervision/retry at the store level for availability.
+
       {:ok, odb} =
         Gitility.ODB.layer([
           Gitility.ODB.cache(max_bytes: 128 * 1024 * 1024),
@@ -272,7 +290,8 @@ defmodule Gitility.ODB do
              ref: resource,
              hash: hash,
              runtime: runtime,
-             providers: layer_providers(stores)
+             providers: layer_providers(stores),
+             contains_cache: cache != nil
            }}
 
         {:error, error} ->
@@ -281,16 +300,24 @@ defmodule Gitility.ODB do
     end
   end
 
-  def layer(_layers), do: layer_error("layers must be provided as a list")
+  def layer(_layers), do: raise(ArgumentError, "layers must be provided as a list")
 
-  @typedoc "A cache layer descriptor produced by `cache/1`."
+  @typedoc """
+  A cache layer descriptor produced by `cache/1`.
+
+  The descriptor is opaque by convention, but Elixir cannot enforce the
+  tuple boundary. Raw `{:cache, opts}` tuples are accepted and validated
+  identically.
+  """
   @opaque cache_spec :: {:cache, keyword()}
 
   @doc """
   A writable in-memory cache layer for `layer/1`: stores verified, inflated
   object payloads under byte, entry, and per-object caps. Bytes enter only
   after a lower store's `verify: :always` path. Because process memory is not
-  a new trust boundary, hits are served without re-hashing. Never disk.
+  a new trust boundary, release-build hits are served without re-hashing.
+  Debug builds verify on insertion and serving as a tripwire, not as the
+  cache's trust guarantee. Never disk.
 
   ## Options
 
@@ -300,14 +327,19 @@ defmodule Gitility.ODB do
       objects bypass the cache and remain readable from lower layers.
   """
   @spec cache(keyword()) :: cache_spec()
-  def cache(opts), do: {:cache, opts}
+  def cache(opts) do
+    validate_layer_cache_types!(opts)
+    {:cache, opts}
+  end
 
   @doc """
   Asks a provider backend to refresh availability state, bounded by its
   `request_timeout`, then clears the native negative cache only after the
   callback succeeds. A layered handle fans this out to every provider it
   contains, then refreshes every native layer. Verified positive cache entries
-  remain valid because Git object IDs are immutable.
+  remain valid because Git object IDs are immutable. A layered refresh returns
+  `:ok` only when at least one layer accepts refresh; when every layer refuses,
+  it returns `:unsupported_operation`.
 
   Local and static handles return `:unsupported_operation` in this milestone.
   """
@@ -498,13 +530,16 @@ defmodule Gitility.ODB do
     stores = Enum.filter(layers, &match?(%__MODULE__{}, &1))
 
     cond do
-      length(cache_specs) > 1 ->
-        layer_error("one cache layer per composition in 0.x")
-
       Enum.any?(layers, fn layer ->
         not match?(%__MODULE__{}, layer) and not match?({:cache, _opts}, layer)
       end) ->
-        layer_error("each layer must be an ODB handle or cache descriptor")
+        raise ArgumentError, "each layer must be an ODB handle or cache descriptor"
+
+      length(cache_specs) > 1 ->
+        layer_error("one cache layer per composition in 0.x")
+
+      Enum.any?(stores, &match?(%__MODULE__{kind: :layered, contains_cache: true}, &1)) ->
+        layer_error("nested cache layers are not supported in 0.x")
 
       stores == [] ->
         layer_error("a layered object database requires at least one store")
@@ -532,43 +567,67 @@ defmodule Gitility.ODB do
   end
 
   defp validate_layer_cache(opts) when is_list(opts) do
-    if Keyword.keyword?(opts) do
-      keys = Keyword.keys(opts)
-      allowed = [:max_bytes, :max_entries, :max_object_bytes]
-      unknown = keys -- allowed
+    validate_layer_cache_types!(opts)
 
-      cond do
-        unknown != [] ->
-          layer_error("unknown cache option: #{inspect(hd(unknown))}")
-
-        length(keys) != MapSet.size(MapSet.new(keys)) ->
-          layer_error("cache options must not contain duplicate keys")
-
-        not Keyword.has_key?(opts, :max_bytes) ->
-          layer_error("cache :max_bytes is required")
-
-        true ->
-          max_bytes = opts[:max_bytes]
-          max_entries = Keyword.get(opts, :max_entries, @default_layer_cache_entries)
-          max_object_bytes = Keyword.get(opts, :max_object_bytes, max_bytes)
-
-          with :ok <- validate_positive_cache_option(max_bytes, :max_bytes),
-               :ok <- validate_positive_cache_option(max_entries, :max_entries),
-               :ok <- validate_positive_cache_option(max_object_bytes, :max_object_bytes) do
-            {:ok,
-             %{
-               max_bytes: max_bytes,
-               max_entries: max_entries,
-               max_object_bytes: max_object_bytes
-             }}
-          end
-      end
+    if not Keyword.has_key?(opts, :max_bytes) do
+      layer_error("cache :max_bytes is required")
     else
-      layer_error("cache options must be a keyword list")
+      max_bytes = Keyword.fetch!(opts, :max_bytes)
+
+      max_entries =
+        Keyword.get(opts, :max_entries, @default_layer_cache_entries)
+
+      max_object_bytes =
+        if Keyword.has_key?(opts, :max_object_bytes) do
+          Keyword.fetch!(opts, :max_object_bytes)
+        else
+          max_bytes
+        end
+
+      with :ok <- validate_positive_cache_option(max_bytes, :max_bytes),
+           :ok <- validate_positive_cache_option(max_entries, :max_entries),
+           :ok <- validate_positive_cache_option(max_object_bytes, :max_object_bytes) do
+        {:ok,
+         %{
+           max_bytes: max_bytes,
+           max_entries: max_entries,
+           max_object_bytes: max_object_bytes
+         }}
+      end
     end
   end
 
-  defp validate_layer_cache(_opts), do: layer_error("cache options must be a keyword list")
+  defp validate_layer_cache(_opts),
+    do: raise(ArgumentError, "cache options must be a keyword list")
+
+  defp validate_layer_cache_types!(opts) when is_list(opts) do
+    unless Keyword.keyword?(opts) do
+      raise ArgumentError, "cache options must be a keyword list"
+    end
+
+    keys = Keyword.keys(opts)
+
+    if length(keys) != MapSet.size(MapSet.new(keys)) do
+      raise ArgumentError, "cache options must not contain duplicate keys"
+    end
+
+    Keyword.validate!(opts,
+      max_bytes: nil,
+      max_entries: @default_layer_cache_entries,
+      max_object_bytes: nil
+    )
+
+    Enum.each(opts, fn {name, value} -> validate_cache_option!(value, name) end)
+  end
+
+  defp validate_layer_cache_types!(_opts),
+    do: raise(ArgumentError, "cache options must be a keyword list")
+
+  defp validate_cache_option!(value, _name) when is_integer(value), do: value
+
+  defp validate_cache_option!(_value, name) do
+    raise ArgumentError, "cache :#{name} must be an integer"
+  end
 
   defp validate_positive_cache_option(value, _name) when is_integer(value) and value > 0,
     do: :ok

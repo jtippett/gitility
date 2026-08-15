@@ -84,6 +84,7 @@ defmodule Gitility.NativeSupport do
     details =
       %{}
       |> maybe_put(:limit, normalize_limit(Map.get(error, :limit)))
+      |> maybe_put(:layer, Map.get(error, :layer))
       |> maybe_put(:retry_after_ms, Map.get(error, :retry_after_ms))
       |> maybe_put(:reason, Map.get(error, :reason))
 
@@ -189,7 +190,8 @@ defmodule Gitility.NativeSupport do
       end_line: file.end_line,
       total_lines: file.total_lines,
       truncated: file.truncated,
-      lfs_pointer: file.lfs_pointer
+      lfs_pointer: file.lfs_pointer,
+      stats: struct!(Stats, Map.to_list(file.stats))
     }
   end
 

@@ -94,7 +94,9 @@ stage_sync() {
     | grep -v -E '^(sources/|fixtures/generated/|_build/|deps/|target/|priv/native/|doc/)' \
     | COPYFILE_DISABLE=1 tar --no-xattrs -czf - -T - \
     | sprite exec -s "$SPRITE_NAME" -- bash -lc "cd $REMOTE_DIR && tar -xzf -"
-  rexec "cd $REMOTE_DIR && ls && git init -q 2>/dev/null; true"
+  # Reviewers/probes drop test/_scratch_*.exs files; a stale one on the remote
+  # (deleted locally after the last sync) silently joins the next full run.
+  rexec "cd $REMOTE_DIR && find test -name '_scratch_*' -delete 2>/dev/null; git init -q 2>/dev/null; true"
   echo "==> sync: done"
 }
 

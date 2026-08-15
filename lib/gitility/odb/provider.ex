@@ -13,6 +13,14 @@ defmodule Gitility.ODB.Provider do
 
   @impl GenServer
   def init(opts) do
+    # Trap exits so an orderly supervisor shutdown runs terminate/2. Without
+    # this the provider dies on the supervisor's exit signal WITHOUT calling
+    # terminate/2: provider_failed never fires from here (waiters hang for
+    # the full request_timeout, ~10% of clean shutdowns in a 60x probe on
+    # Linux — the watchdog's DOWN handler racing its own shutdown was the
+    # only thing waking them) and the backend's documented terminate/2
+    # never runs on clean stop (0/100 in a direct probe).
+    Process.flag(:trap_exit, true)
     {backend, init_arg} = Keyword.fetch!(opts, :backend)
 
     case backend.init(init_arg) do

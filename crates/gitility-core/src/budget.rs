@@ -52,7 +52,10 @@ pub struct Budget {
     limits: BudgetLimits,
     deadline: Option<Instant>,
     cancelled: Arc<AtomicBool>,
+    /// Charges against `max_objects`, including header lookups.
     objects: AtomicU64,
+    /// Payload reads exposed through query stats; headers are not reads.
+    objects_read: AtomicU64,
     object_bytes: AtomicU64,
     provider_requests: AtomicU64,
     provider_bytes: AtomicU64,
@@ -72,6 +75,7 @@ impl Budget {
             deadline,
             cancelled,
             objects: AtomicU64::new(0),
+            objects_read: AtomicU64::new(0),
             object_bytes: AtomicU64::new(0),
             provider_requests: AtomicU64::new(0),
             provider_bytes: AtomicU64::new(0),
@@ -156,6 +160,7 @@ impl Budget {
             .with_limit("max_object_bytes"));
         }
         charge(&self.objects, 1, self.limits.max_objects, "max_objects")?;
+        self.objects_read.fetch_add(1, Ordering::Relaxed);
         charge(
             &self.object_bytes,
             bytes,
@@ -254,11 +259,12 @@ impl Budget {
         Ok(())
     }
 
-    /// Spend so far: `(objects, object_bytes, provider_requests,
-    /// provider_bytes)` — feeds result stats.
+    /// Spend so far: `(payload_objects_read, object_bytes,
+    /// provider_requests, provider_bytes)` — feeds result stats. Header
+    /// lookups still charge `max_objects`, but are not payload reads.
     pub fn spent(&self) -> (u64, u64, u64, u64) {
         (
-            self.objects.load(Ordering::Relaxed),
+            self.objects_read.load(Ordering::Relaxed),
             self.object_bytes.load(Ordering::Relaxed),
             self.provider_requests.load(Ordering::Relaxed),
             self.provider_bytes.load(Ordering::Relaxed),
@@ -338,10 +344,10 @@ mod tests {
     }
 
     #[test]
-    fn header_charge_spends_one_object_and_no_bytes() {
+    fn header_charge_uses_the_object_ceiling_but_is_not_a_payload_read() {
         let budget = Budget::unlimited();
         budget.charge_header().expect("header charge succeeds");
-        assert_eq!(budget.spent(), (1, 0, 0, 0));
+        assert_eq!(budget.spent(), (0, 0, 0, 0));
     }
 
     #[test]

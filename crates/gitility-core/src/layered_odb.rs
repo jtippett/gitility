@@ -3,9 +3,9 @@
 //! [`CacheLayer`] deliberately stores only inflated payloads returned by an
 //! [`ObjectDb`]. Every concrete Gitility store verifies those bytes under the
 //! only supported policy (`verify: always`) before returning them. Memory is
-//! not a later trust boundary, so cache hits are re-served without re-hashing;
-//! a debug-build verification assertion remains as a tripwire for violations
-//! of that store contract.
+//! not a later trust boundary, so release-build cache hits are re-served
+//! without re-hashing; debug-build verification assertions on insertion and
+//! serving remain tripwires for violations of that store contract.
 
 use crate::budget::Budget;
 use crate::error::{Error, ErrorCode};
@@ -72,6 +72,13 @@ impl CacheLayer {
 
     fn get(&self, oid: &Oid, budget: &Budget) -> Option<CachedObject> {
         let value = lock(&self.state).objects.get_cloned(&(oid.kind(), *oid));
+        #[cfg(debug_assertions)]
+        if let Some(cached) = &value {
+            debug_assert!(
+                verify(oid, cached.kind, cached.data.as_slice()).is_ok(),
+                "CacheLayer resident bytes do not match their object ID"
+            );
+        }
         if value.is_some() {
             budget.record_cache_hit();
         } else {
@@ -213,6 +220,11 @@ impl LayeredOdb {
             .as_ref()
             .and_then(|(index, cache)| (*index <= store_index).then_some(cache))
     }
+
+    /// Whether this composition owns a writable cache layer.
+    pub fn has_cache(&self) -> bool {
+        self.cache.is_some()
+    }
 }
 
 impl ObjectDb for LayeredOdb {
@@ -240,16 +252,13 @@ impl ObjectDb for LayeredOdb {
                 }
             }
 
-            if let Some(cache) = self.cache_before(index) {
-                // A payload cache cannot trust or retain header-only metadata.
-                // Read the lower layer's verified payload once, derive its
-                // header, and share that same allocation with the cache.
-                let mut values = layer.try_find_many(&[*oid], budget)?;
-                if let Some((kind, data)) = values.pop().expect("singleton layer read") {
-                    cache.insert(*oid, kind, Arc::clone(&data));
-                    return Ok(Some(verified_header(kind, data.len())));
-                }
-            } else if let Some(read) = layer.try_header_with_provenance(oid, budget)? {
+            // Header-only reads never populate the payload cache. A resident
+            // verified payload answered above; a miss retains the lower
+            // store's own header path and provenance unchanged.
+            if let Some(read) = layer
+                .try_header_with_provenance(oid, budget)
+                .map_err(|error| error.with_layer(index))?
+            {
                 return Ok(Some(read));
             }
         }
@@ -264,7 +273,13 @@ impl ObjectDb for LayeredOdb {
     ) -> Result<Option<ObjectKind>, Error> {
         out.clear();
         let mut values = self.try_find_many(&[*oid], budget)?;
-        match values.pop().expect("singleton layered read") {
+        if values.len() != 1 {
+            return Err(short_batch_error());
+        }
+        let Some(value) = values.pop() else {
+            return Err(short_batch_error());
+        };
+        match value {
             Some((kind, data)) => {
                 out.extend_from_slice(data.as_slice());
                 Ok(Some(kind))
@@ -323,7 +338,12 @@ impl ObjectDb for LayeredOdb {
                     .max_total_bytes
                     .map(|maximum| maximum.saturating_sub(result_bytes)),
             };
-            let values = layer.try_find_many_bounded(&unresolved, budget, remaining)?;
+            let values = layer
+                .try_find_many_bounded(&unresolved, budget, remaining)
+                .map_err(|error| error.with_layer(index))?;
+            if values.len() != unresolved.len() {
+                return Err(short_batch_error().with_layer(index));
+            }
             let mut still_unresolved = Vec::new();
             for (oid, value) in unresolved.into_iter().zip(values) {
                 match value {
@@ -365,27 +385,35 @@ impl ObjectDb for LayeredOdb {
     }
 
     fn cache_stats(&self) -> CacheStats {
-        let mut stats = self
-            .cache
+        self.cache
             .as_ref()
-            .map_or_else(CacheStats::default, |(_, cache)| cache.stats());
-        for layer in &self.layers {
-            let nested = layer.cache_stats();
-            stats.bytes = stats.bytes.saturating_add(nested.bytes);
-            stats.entries = stats.entries.saturating_add(nested.entries);
-            stats.evictions = stats.evictions.saturating_add(nested.evictions);
-        }
-        stats
+            .map_or_else(CacheStats::default, |(_, cache)| cache.stats())
     }
 
     fn refresh(&self, budget: &Budget) -> Result<(), Error> {
+        let mut accepted = false;
+        let mut first_unsupported = None;
         let mut first_error = None;
-        for layer in &self.layers {
-            if let Err(error) = layer.refresh(budget) {
-                first_error.get_or_insert(error);
+        for (index, layer) in self.layers.iter().enumerate() {
+            match layer.refresh(budget) {
+                Ok(()) => accepted = true,
+                Err(error) if error.code == ErrorCode::UnsupportedOperation => {
+                    first_unsupported.get_or_insert_with(|| error.with_layer(index));
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| error.with_layer(index));
+                }
             }
         }
-        first_error.map_or(Ok(()), Err)
+        if let Some(error) = first_error {
+            Err(error)
+        } else if accepted {
+            Ok(())
+        } else {
+            Err(first_unsupported.unwrap_or_else(|| {
+                Error::new(ErrorCode::UnsupportedOperation, "no layer supports refresh")
+            }))
+        }
     }
 }
 
@@ -401,6 +429,13 @@ fn verified_header(kind: ObjectKind, bytes: usize) -> HeaderRead {
 
 fn invalid_argument(message: &'static str) -> Error {
     Error::new(ErrorCode::InvalidArgument, message)
+}
+
+fn short_batch_error() -> Error {
+    Error::new(
+        ErrorCode::BackendError,
+        "layer returned a short batch — ObjectDb contract violation",
+    )
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -463,6 +498,19 @@ mod tests {
             }))
         }
 
+        fn try_header_with_provenance(
+            &self,
+            oid: &Oid,
+            budget: &Budget,
+        ) -> Result<Option<HeaderRead>, Error> {
+            self.try_header(oid, budget).map(|header| {
+                header.map(|header| HeaderRead {
+                    header,
+                    provenance: HeaderProvenance::UnverifiedProvider,
+                })
+            })
+        }
+
         fn try_find(
             &self,
             oid: &Oid,
@@ -492,6 +540,98 @@ mod tests {
         fn refresh(&self, _budget: &Budget) -> Result<(), Error> {
             self.refresh_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        }
+    }
+
+    struct FailingStore {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ObjectDb for FailingStore {
+        fn hash_kind(&self) -> HashKind {
+            HashKind::Sha1
+        }
+
+        fn try_header(&self, _oid: &Oid, _budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(Error::retryable(
+                ErrorCode::BackendError,
+                "authoritative layer is unavailable",
+            ))
+        }
+
+        fn try_find(
+            &self,
+            _oid: &Oid,
+            _out: &mut Vec<u8>,
+            _budget: &Budget,
+        ) -> Result<Option<ObjectKind>, Error> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(Error::retryable(
+                ErrorCode::BackendError,
+                "authoritative layer is unavailable",
+            ))
+        }
+    }
+
+    struct ShortBatchStore;
+
+    impl ObjectDb for ShortBatchStore {
+        fn hash_kind(&self) -> HashKind {
+            HashKind::Sha1
+        }
+
+        fn try_header(&self, _oid: &Oid, _budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
+            Ok(None)
+        }
+
+        fn try_find(
+            &self,
+            _oid: &Oid,
+            _out: &mut Vec<u8>,
+            _budget: &Budget,
+        ) -> Result<Option<ObjectKind>, Error> {
+            Ok(None)
+        }
+
+        fn try_find_many_bounded(
+            &self,
+            _oids: &[Oid],
+            _budget: &Budget,
+            _read_budget: ReadManyBudget,
+        ) -> Result<Vec<ObjectReadResult>, Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    struct LyingStore {
+        oid: Oid,
+    }
+
+    #[cfg(debug_assertions)]
+    impl ObjectDb for LyingStore {
+        fn hash_kind(&self) -> HashKind {
+            HashKind::Sha1
+        }
+
+        fn try_header(&self, _oid: &Oid, _budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
+            Ok(None)
+        }
+
+        fn try_find(
+            &self,
+            oid: &Oid,
+            out: &mut Vec<u8>,
+            budget: &Budget,
+        ) -> Result<Option<ObjectKind>, Error> {
+            out.clear();
+            if *oid != self.oid {
+                return Ok(None);
+            }
+            out.extend_from_slice(b"lying bytes");
+            budget.charge_object(out.len() as u64)?;
+            Ok(Some(ObjectKind::Blob))
         }
     }
 
@@ -584,22 +724,43 @@ mod tests {
     }
 
     #[test]
-    fn header_reads_cache_verified_payloads_not_unverified_metadata() {
+    fn nonresident_headers_use_the_lower_header_path_without_populating() {
         let (lower, oids) = CountingStore::blobs(&[b"header payload"]);
         let layered = LayeredOdb::new(vec![dyn_store(Arc::clone(&lower))], cache(64)).unwrap();
 
-        let first = layered
-            .try_header_with_provenance(&oids[0], &Budget::unlimited())
+        for _ in 0..3 {
+            let read = layered
+                .try_header_with_provenance(&oids[0], &Budget::unlimited())
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.provenance, HeaderProvenance::UnverifiedProvider);
+        }
+        assert_eq!(lower.header_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(lower.object_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(layered.cache_stats().entries, 0);
+    }
+
+    #[test]
+    fn resident_headers_derive_from_verified_payload_and_charge_no_object_read() {
+        let (lower, oids) = CountingStore::blobs(&[b"resident payload"]);
+        let layered = LayeredOdb::new(vec![dyn_store(Arc::clone(&lower))], cache(64)).unwrap();
+        let mut out = Vec::new();
+        layered
+            .try_find(&oids[0], &mut out, &Budget::unlimited())
+            .unwrap();
+        let header_budget = Budget::unlimited();
+
+        let read = layered
+            .try_header_with_provenance(&oids[0], &header_budget)
             .unwrap()
             .unwrap();
-        let second = layered
-            .try_header_with_provenance(&oids[0], &Budget::unlimited())
-            .unwrap()
-            .unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.provenance, HeaderProvenance::Verified);
+
+        assert_eq!(read.provenance, HeaderProvenance::Verified);
+        assert_eq!(read.header.size, out.len() as u64);
         assert_eq!(lower.header_calls.load(Ordering::Relaxed), 0);
         assert_eq!(lower.object_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(header_budget.spent(), (0, 0, 0, 0));
+        assert_eq!(header_budget.cache_spent(), (1, 0));
     }
 
     #[test]
@@ -679,5 +840,184 @@ mod tests {
         assert_eq!(second.prefetch_calls.load(Ordering::Relaxed), 1);
         assert_eq!(first.refresh_calls.load(Ordering::Relaxed), 1);
         assert_eq!(second.refresh_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cache_populates_only_from_stores_after_its_position() {
+        let (first, first_oids) = CountingStore::blobs(&[b"first"]);
+        let (second, second_oids) = CountingStore::blobs(&[b"second"]);
+        let layered = LayeredOdb::new(
+            vec![
+                dyn_store(Arc::clone(&first)),
+                dyn_store(Arc::clone(&second)),
+            ],
+            Some((
+                1,
+                CacheOptions {
+                    max_bytes: 100,
+                    max_entries: 10,
+                    max_object_bytes: 100,
+                },
+            )),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+
+        for _ in 0..2 {
+            layered
+                .try_find(&first_oids[0], &mut out, &Budget::unlimited())
+                .unwrap();
+        }
+        assert_eq!(first.object_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(layered.cache_stats().entries, 0);
+
+        for _ in 0..2 {
+            layered
+                .try_find(&second_oids[0], &mut out, &Budget::unlimited())
+                .unwrap();
+        }
+        assert_eq!(second.object_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(layered.cache_stats().entries, 1);
+    }
+
+    #[test]
+    fn cache_touch_updates_lru_recency_and_eviction_count_exactly() {
+        let (lower, oids) = CountingStore::blobs(&[b"a", b"b", b"c"]);
+        let layered = LayeredOdb::new(
+            vec![dyn_store(Arc::clone(&lower))],
+            Some((
+                0,
+                CacheOptions {
+                    max_bytes: 100,
+                    max_entries: 2,
+                    max_object_bytes: 100,
+                },
+            )),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+
+        for oid in [oids[0], oids[1], oids[0], oids[2]] {
+            layered
+                .try_find(&oid, &mut out, &Budget::unlimited())
+                .unwrap();
+        }
+        assert_eq!(lower.object_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(layered.cache_stats().evictions, 1);
+
+        layered
+            .try_find(&oids[0], &mut out, &Budget::unlimited())
+            .unwrap();
+        assert_eq!(lower.object_calls.load(Ordering::Relaxed), 3);
+
+        layered
+            .try_find(&oids[1], &mut out, &Budget::unlimited())
+            .unwrap();
+        assert_eq!(lower.object_calls.load(Ordering::Relaxed), 4);
+        assert_eq!(layered.cache_stats().evictions, 2);
+    }
+
+    #[test]
+    fn layer_errors_are_fail_fast_and_name_the_store_index() {
+        let (static_store, oids) = CountingStore::blobs(&[b"held"]);
+        let missing = object_id(HashKind::Sha1, ObjectKind::Blob, b"missing").unwrap();
+        let down_calls = Arc::new(AtomicUsize::new(0));
+        let down: Arc<dyn ObjectDb> = Arc::new(FailingStore {
+            calls: Arc::clone(&down_calls),
+        });
+        let mut out = Vec::new();
+
+        let down_first = LayeredOdb::new(
+            vec![Arc::clone(&down), dyn_store(Arc::clone(&static_store))],
+            None,
+        )
+        .unwrap();
+        let error = down_first
+            .try_find(&oids[0], &mut out, &Budget::unlimited())
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BackendError);
+        assert_eq!(error.layer, Some(0));
+
+        down_calls.store(0, Ordering::Relaxed);
+        let down_last = LayeredOdb::new(
+            vec![dyn_store(Arc::clone(&static_store)), Arc::clone(&down)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            down_last
+                .try_find(&oids[0], &mut out, &Budget::unlimited())
+                .unwrap(),
+            Some(ObjectKind::Blob)
+        );
+        assert_eq!(down_calls.load(Ordering::Relaxed), 0);
+
+        let error = down_last
+            .try_find(&missing, &mut out, &Budget::unlimited())
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BackendError);
+        assert_eq!(error.layer, Some(1));
+    }
+
+    #[test]
+    fn short_layer_batch_is_a_protocol_error_instead_of_a_silent_miss() {
+        let oid = object_id(HashKind::Sha1, ObjectKind::Blob, b"requested").unwrap();
+        let layered =
+            LayeredOdb::new(vec![Arc::new(ShortBatchStore) as Arc<dyn ObjectDb>], None).unwrap();
+        let error = layered
+            .try_find_many(&[oid], &Budget::unlimited())
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BackendError);
+        assert_eq!(
+            error.message,
+            "layer returned a short batch — ObjectDb contract violation"
+        );
+        assert_eq!(error.layer, Some(0));
+    }
+
+    #[test]
+    fn all_static_layers_refuse_refresh() {
+        let static_store: Arc<dyn ObjectDb> =
+            Arc::new(StaticOdb::from_objects(HashKind::Sha1, std::iter::empty()).unwrap());
+        let layered = LayeredOdb::new(vec![static_store], None).unwrap();
+        let error = layered.refresh(&Budget::unlimited()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedOperation);
+        assert_eq!(error.layer, Some(0));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "CacheLayer received bytes that do not match their object ID")]
+    fn lying_store_trips_insertion_assertion_in_debug() {
+        let oid = object_id(HashKind::Sha1, ObjectKind::Blob, b"truth").unwrap();
+        let store: Arc<dyn ObjectDb> = Arc::new(LyingStore { oid });
+        let layered = LayeredOdb::new(vec![store], cache(64)).unwrap();
+        let mut out = Vec::new();
+        let _ = layered.try_find(&oid, &mut out, &Budget::unlimited());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "CacheLayer resident bytes do not match their object ID")]
+    fn corrupted_resident_entry_trips_serve_assertion_in_debug() {
+        let data = Arc::new(b"truth".to_vec());
+        let oid = object_id(HashKind::Sha1, ObjectKind::Blob, data.as_slice()).unwrap();
+        let cache = CacheLayer::new(CacheOptions {
+            max_bytes: 64,
+            max_entries: 4,
+            max_object_bytes: 64,
+        })
+        .unwrap();
+        cache.insert(oid, ObjectKind::Blob, data);
+        lock(&cache.state).objects.insert(
+            (HashKind::Sha1, oid),
+            CachedObject {
+                kind: ObjectKind::Blob,
+                data: Arc::new(b"corrupt".to_vec()),
+            },
+            7,
+        );
+
+        let _ = cache.get(&oid, &Budget::unlimited());
     }
 }

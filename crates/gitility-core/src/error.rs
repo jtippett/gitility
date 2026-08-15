@@ -132,6 +132,8 @@ pub struct Error {
     pub retryable: bool,
     /// The stable name of the resource limit that caused this failure.
     pub limit: Option<&'static str>,
+    /// The zero-based layer whose operation failed, when composed.
+    pub layer: Option<u64>,
 }
 
 impl Error {
@@ -141,6 +143,7 @@ impl Error {
             message: message.into(),
             retryable: false,
             limit: None,
+            layer: None,
         }
     }
 
@@ -150,12 +153,20 @@ impl Error {
             message: message.into(),
             retryable: true,
             limit: None,
+            layer: None,
         }
     }
 
     /// Associates this failure with the stable name of an exceeded limit.
     pub fn with_limit(mut self, limit: &'static str) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Associates a lower-store failure with its zero-based composition
+    /// position so callers can distinguish which authoritative layer failed.
+    pub fn with_layer(mut self, layer: usize) -> Self {
+        self.layer = Some(layer as u64);
         self
     }
 }

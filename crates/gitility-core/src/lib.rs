@@ -17,6 +17,7 @@ pub mod cursor;
 pub mod decode;
 pub mod error;
 pub mod file;
+pub mod layered_odb;
 pub mod local_odb;
 pub mod lru;
 pub mod object;
@@ -40,9 +41,12 @@ pub use decode::{
 };
 pub use error::{Error, ErrorCode};
 pub use file::{read_file, FileKind, FileOptions, FileRead, LfsPointer};
+pub use layered_odb::{CacheLayer, CacheOptions, LayeredOdb};
 pub use local_odb::{LocalOdb, LocalOdbOptions, RepositoryLayout};
 pub use object::{HashKind, ObjectHeader, ObjectKind, Oid};
-pub use odb::{HeaderProvenance, HeaderRead, ObjectDb, ObjectReadResult, ReadManyBudget};
+pub use odb::{
+    CacheStats, HeaderProvenance, HeaderRead, ObjectDb, ObjectReadResult, ReadManyBudget,
+};
 pub use provider_odb::{
     PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions,
     ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport, ReplySlot,

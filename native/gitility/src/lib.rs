@@ -9,12 +9,13 @@
 use gitility_core::runtime::thread_budget;
 use gitility_core::{
     list_tree as core_list_tree, peel as core_peel, read_file as core_read_file, Budget,
-    BudgetLimits, BusyReason, Error, ErrorCode, FileKind, FileOptions, HashKind, Job as CoreJob,
-    JobObserver, JobOutput, JobSpec, JobState, LocalOdb, LocalOdbOptions, ObjectDb, ObjectHeader,
-    ObjectKind, Oid, PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb,
-    ProviderOptions, ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport,
-    QueryStats, ReadManyBudget, Runtime as CoreRuntime, RuntimeConfig, Snapshot, StaticOdb,
-    SubmitError, TreeItemKind, TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
+    BudgetLimits, BusyReason, CacheOptions, CacheStats, Error, ErrorCode, FileKind, FileOptions,
+    HashKind, Job as CoreJob, JobObserver, JobOutput, JobSpec, JobState, LayeredOdb, LocalOdb,
+    LocalOdbOptions, ObjectDb, ObjectHeader, ObjectKind, ObjectReadResult, Oid, PeelTarget,
+    PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions,
+    ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport, QueryStats,
+    ReadManyBudget, Runtime as CoreRuntime, RuntimeConfig, Snapshot, StaticOdb, SubmitError,
+    TreeItemKind, TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
 };
 use rustler::{
     types::{map::MapIterator, tuple::get_tuple},
@@ -35,6 +36,7 @@ enum StoreImpl {
     Local(LocalOdb),
     Static(StaticStore),
     Provider(Box<ProviderOdb<NifProviderTransport>>),
+    Layered(LayeredOdb),
 }
 
 #[derive(Clone)]
@@ -141,13 +143,14 @@ impl StoreImpl {
             Self::Local(store) => store,
             Self::Static(store) => store,
             Self::Provider(store) => store.as_ref(),
+            Self::Layered(store) => store,
         }
     }
 
     fn as_provider(&self) -> Option<&ProviderOdb<NifProviderTransport>> {
         match self {
             Self::Provider(store) => Some(store.as_ref()),
-            Self::Local(_) | Self::Static(_) => None,
+            Self::Local(_) | Self::Static(_) | Self::Layered(_) => None,
         }
     }
 }
@@ -156,6 +159,74 @@ struct StoreResource(StoreImpl);
 
 #[rustler::resource_impl]
 impl Resource for StoreResource {}
+
+/// Keeps an existing resource alive while presenting it through the core's
+/// shared `ObjectDb` composition seam. Providers and caches therefore remain
+/// the same instances when a handle is layered.
+struct SharedStore(ResourceArc<StoreResource>);
+
+impl SharedStore {
+    fn as_dyn(&self) -> &dyn ObjectDb {
+        self.0 .0.as_dyn()
+    }
+}
+
+impl ObjectDb for SharedStore {
+    fn hash_kind(&self) -> HashKind {
+        self.as_dyn().hash_kind()
+    }
+
+    fn try_header(&self, oid: &Oid, budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
+        self.as_dyn().try_header(oid, budget)
+    }
+
+    fn try_header_with_provenance(
+        &self,
+        oid: &Oid,
+        budget: &Budget,
+    ) -> Result<Option<gitility_core::HeaderRead>, Error> {
+        self.as_dyn().try_header_with_provenance(oid, budget)
+    }
+
+    fn try_find(
+        &self,
+        oid: &Oid,
+        out: &mut Vec<u8>,
+        budget: &Budget,
+    ) -> Result<Option<ObjectKind>, Error> {
+        self.as_dyn().try_find(oid, out, budget)
+    }
+
+    fn try_find_many(&self, oids: &[Oid], budget: &Budget) -> Result<Vec<ObjectReadResult>, Error> {
+        self.as_dyn().try_find_many(oids, budget)
+    }
+
+    fn try_find_many_bounded(
+        &self,
+        oids: &[Oid],
+        budget: &Budget,
+        read_budget: ReadManyBudget,
+    ) -> Result<Vec<ObjectReadResult>, Error> {
+        self.as_dyn()
+            .try_find_many_bounded(oids, budget, read_budget)
+    }
+
+    fn prefetch(&self, oids: &[Oid], budget: &Budget) -> Result<(), Error> {
+        self.as_dyn().prefetch(oids, budget)
+    }
+
+    fn supports_prefetch(&self) -> bool {
+        self.as_dyn().supports_prefetch()
+    }
+
+    fn cache_stats(&self) -> CacheStats {
+        self.as_dyn().cache_stats()
+    }
+
+    fn refresh(&self, budget: &Budget) -> Result<(), Error> {
+        self.as_dyn().refresh(budget)
+    }
+}
 
 #[derive(Clone, Copy, NifMap)]
 struct RuntimeConfigMap {
@@ -427,6 +498,13 @@ struct ProviderStoreOptions {
 }
 
 #[derive(Clone, Copy, NifMap)]
+struct LayeredCacheOptions {
+    max_bytes: u64,
+    max_entries: u64,
+    max_object_bytes: u64,
+}
+
+#[derive(Clone, Copy, NifMap)]
 struct LimitsMap {
     timeout_ms: u64,
     max_objects: u64,
@@ -515,6 +593,9 @@ struct StatsMap {
     entries_emitted: u64,
     cache_hits: u64,
     cache_misses: u64,
+    cache_bytes: u64,
+    cache_entries: u64,
+    cache_evictions: u64,
     provider_requests: u64,
     provider_bytes: u64,
     decompressed_bytes: u64,
@@ -838,6 +919,57 @@ fn provider_store_new<'a>(
     .encode(env))
 }
 
+#[rustler::nif]
+fn layered_store_new<'a>(
+    env: Env<'a>,
+    stores: Vec<ResourceArc<StoreResource>>,
+    cache: Option<LayeredCacheOptions>,
+    cache_index: Option<u64>,
+) -> NifResult<Term<'a>> {
+    let cache = match (cache, cache_index) {
+        (Some(options), Some(index)) => match usize::try_from(index) {
+            Ok(index) => Some((
+                index,
+                CacheOptions {
+                    max_bytes: options.max_bytes,
+                    max_entries: options.max_entries,
+                    max_object_bytes: options.max_object_bytes,
+                },
+            )),
+            Err(_) => {
+                let error = Error::new(
+                    ErrorCode::InvalidArgument,
+                    "cache layer position is too large",
+                );
+                return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+            }
+        },
+        (None, None) => None,
+        _ => {
+            let error = Error::new(
+                ErrorCode::InvalidArgument,
+                "cache options and position must be supplied together",
+            );
+            return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+        }
+    };
+    let layers = stores
+        .into_iter()
+        .map(|store| Arc::new(SharedStore(store)) as Arc<dyn ObjectDb>)
+        .collect();
+    match LayeredOdb::new(layers, cache) {
+        Ok(store) => {
+            let hash = store.hash_kind();
+            Ok(Result::<_, ErrorMap>::Ok((
+                ResourceArc::new(StoreResource(StoreImpl::Layered(store))),
+                hash_atom(hash),
+            ))
+            .encode(env))
+        }
+        Err(error) => Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    }
+}
+
 /// Copies a provider reply on a dirty CPU scheduler. Binary sizes and object
 /// IDs are checked while still borrowed from the BEAM term, before any
 /// payload is copied into a Rust-owned `Vec`.
@@ -867,11 +999,13 @@ fn provider_failed(store: ResourceArc<StoreResource>) -> Atom {
 
 #[rustler::nif]
 fn provider_refresh<'a>(env: Env<'a>, store: ResourceArc<StoreResource>) -> NifResult<Term<'a>> {
-    let result = match store.0.as_provider() {
-        Some(provider) => provider.refresh(&Budget::unlimited()),
-        None => Err(Error::new(
+    let result = match &store.0 {
+        StoreImpl::Provider(_) | StoreImpl::Layered(_) => {
+            store.0.as_dyn().refresh(&Budget::unlimited())
+        }
+        StoreImpl::Local(_) | StoreImpl::Static(_) => Err(Error::new(
             ErrorCode::UnsupportedOperation,
-            "refresh is supported only for provider stores",
+            "refresh is supported only for provider and layered stores",
         )),
     };
     Ok(match result {
@@ -1735,8 +1869,11 @@ fn stats_map(
         objects_requested: stats.objects_read,
         objects_read: stats.objects_read,
         entries_emitted: stats.entries_emitted,
-        cache_hits: 0,
-        cache_misses: 0,
+        cache_hits: stats.cache_hits,
+        cache_misses: stats.cache_misses,
+        cache_bytes: stats.cache_bytes,
+        cache_entries: stats.cache_entries,
+        cache_evictions: stats.cache_evictions,
         provider_requests: provider_spend.2,
         provider_bytes: provider_spend.3,
         decompressed_bytes: stats.bytes_read,

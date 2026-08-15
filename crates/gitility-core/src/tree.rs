@@ -126,6 +126,11 @@ pub struct QueryStats {
     pub objects_read: u64,
     pub bytes_read: u64,
     pub entries_emitted: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_bytes: u64,
+    pub cache_entries: u64,
+    pub cache_evictions: u64,
     pub stopped_by: Option<&'static str>,
 }
 
@@ -265,6 +270,8 @@ pub fn list_tree(
     };
 
     let (objects_read, bytes_read, _, _) = budget.spent();
+    let (cache_hits, cache_misses) = budget.cache_spent();
+    let cache_stats = store.cache_stats();
     let entries_emitted = walker.entries.len() as u64;
     Ok(TreePage {
         entries: walker.entries,
@@ -274,6 +281,11 @@ pub fn list_tree(
             objects_read,
             bytes_read,
             entries_emitted,
+            cache_hits,
+            cache_misses,
+            cache_bytes: cache_stats.bytes,
+            cache_entries: cache_stats.entries,
+            cache_evictions: cache_stats.evictions,
             stopped_by,
         },
     })

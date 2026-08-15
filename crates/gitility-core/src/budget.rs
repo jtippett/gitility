@@ -57,6 +57,8 @@ pub struct Budget {
     provider_requests: AtomicU64,
     provider_bytes: AtomicU64,
     tree_entries: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
 }
 
 impl Budget {
@@ -74,6 +76,8 @@ impl Budget {
             provider_requests: AtomicU64::new(0),
             provider_bytes: AtomicU64::new(0),
             tree_entries: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
         }
     }
 
@@ -215,6 +219,18 @@ impl Budget {
         )
     }
 
+    /// Records one lookup served by a writable layered cache. Cache counters
+    /// are accounting only: they have no ceiling and never make work fail.
+    pub fn record_cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one lookup that reached a writable layered cache but was not
+    /// resident. Bypassed objects count as misses again on later jobs.
+    pub fn record_cache_miss(&self) {
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Validates a delta-chain depth against the ceiling.
     ///
     /// # Pack-reader integration contract
@@ -252,6 +268,14 @@ impl Budget {
     /// Number of tree-entry emission charges attempted so far.
     pub fn tree_entries_spent(&self) -> u64 {
         self.tree_entries.load(Ordering::Relaxed)
+    }
+
+    /// Layered-cache lookup accounting for this budget/job: `(hits, misses)`.
+    pub fn cache_spent(&self) -> (u64, u64) {
+        (
+            self.cache_hits.load(Ordering::Relaxed),
+            self.cache_misses.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -388,5 +412,15 @@ mod tests {
         assert_eq!(err.limit, Some("max_tree_entries"));
         assert_eq!(budget.spent(), (0, 0, 0, 0));
         assert_eq!(budget.tree_entries_spent(), 2);
+    }
+
+    #[test]
+    fn cache_accounting_is_per_budget_and_unbounded() {
+        let first = Budget::unlimited();
+        first.record_cache_hit();
+        first.record_cache_hit();
+        first.record_cache_miss();
+        assert_eq!(first.cache_spent(), (2, 1));
+        assert_eq!(Budget::unlimited().cache_spent(), (0, 0));
     }
 }

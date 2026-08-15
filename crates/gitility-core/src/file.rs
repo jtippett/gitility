@@ -106,6 +106,8 @@ pub fn read_file(
 
     if entry.kind == TreeItemKind::Gitlink {
         let (objects_read, bytes_read, _, _) = budget.spent();
+        let (cache_hits, cache_misses) = budget.cache_spent();
+        let cache_stats = store.cache_stats();
         return Ok(FileRead {
             path: path.to_vec(),
             blob_oid: entry.oid,
@@ -121,6 +123,11 @@ pub fn read_file(
                 objects_read,
                 bytes_read,
                 entries_emitted: 0,
+                cache_hits,
+                cache_misses,
+                cache_bytes: cache_stats.bytes,
+                cache_entries: cache_stats.entries,
+                cache_evictions: cache_stats.evictions,
                 stopped_by: None,
             },
         });
@@ -151,6 +158,8 @@ pub fn read_file(
     let lfs_pointer = parse_lfs_pointer(&payload);
     let sliced = slice_payload(&payload, opts)?;
     let (objects_read, bytes_read, _, _) = budget.spent();
+    let (cache_hits, cache_misses) = budget.cache_spent();
+    let cache_stats = store.cache_stats();
     Ok(FileRead {
         path: path.to_vec(),
         blob_oid: entry.oid,
@@ -166,6 +175,11 @@ pub fn read_file(
             objects_read,
             bytes_read,
             entries_emitted: 0,
+            cache_hits,
+            cache_misses,
+            cache_bytes: cache_stats.bytes,
+            cache_entries: cache_stats.entries,
+            cache_evictions: cache_stats.evictions,
             stopped_by: sliced.stopped_by,
         },
     })

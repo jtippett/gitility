@@ -10,6 +10,11 @@ defmodule Gitility.Stats do
 
   In Milestone 1, `objects_requested` equals `objects_read`; requests are
   measured separately from the Milestone 2 provider path onward.
+
+  For a layered ODB, `cache_hits` and `cache_misses` count cache lookups made
+  by this job only. `cache_bytes` and `cache_entries` snapshot current
+  residency when the result is built; `cache_evictions` is cumulative for the
+  cache handle, so it remains observable after the job that caused eviction.
   """
 
   defstruct objects_requested: 0,
@@ -17,6 +22,9 @@ defmodule Gitility.Stats do
             entries_emitted: 0,
             cache_hits: 0,
             cache_misses: 0,
+            cache_bytes: 0,
+            cache_entries: 0,
+            cache_evictions: 0,
             provider_requests: 0,
             provider_bytes: 0,
             decompressed_bytes: 0,
@@ -30,6 +38,9 @@ defmodule Gitility.Stats do
           entries_emitted: non_neg_integer(),
           cache_hits: non_neg_integer(),
           cache_misses: non_neg_integer(),
+          cache_bytes: non_neg_integer(),
+          cache_entries: non_neg_integer(),
+          cache_evictions: non_neg_integer(),
           provider_requests: non_neg_integer(),
           provider_bytes: non_neg_integer(),
           decompressed_bytes: non_neg_integer(),

@@ -67,18 +67,28 @@ where
     /// Inserts or replaces an entry. Entries heavier than the entire cache
     /// are not retained.
     pub fn insert(&mut self, key: K, value: V, weight: u64) {
+        let _ = self.insert_counting_evictions(key, value, weight);
+    }
+
+    /// Inserts or replaces an entry and returns the number of resident
+    /// entries evicted to satisfy the weight capacity. Replacing the same key
+    /// is not an eviction, and an entry that bypasses because it is heavier
+    /// than the cache returns zero.
+    pub fn insert_counting_evictions(&mut self, key: K, value: V, weight: u64) -> u64 {
         if let Some(index) = self.indices.get(&key).copied() {
             self.remove_index(index);
         }
         if self.capacity == 0 || weight > self.capacity {
-            return;
+            return 0;
         }
 
+        let mut evictions = 0u64;
         while self.used.saturating_add(weight) > self.capacity {
             let Some(index) = self.least_recent else {
                 break;
             };
             self.remove_index(index);
+            evictions = evictions.saturating_add(1);
         }
 
         let index = self.free.pop().unwrap_or_else(|| {
@@ -101,6 +111,13 @@ where
         self.most_recent = Some(index);
         self.used = self.used.saturating_add(weight);
         self.indices.insert(key, index);
+        evictions
+    }
+
+    /// Evicts and returns the least-recently-used entry.
+    pub fn pop_lru(&mut self) -> Option<(K, V)> {
+        let index = self.least_recent?;
+        self.remove_index(index).map(|node| (node.key, node.value))
     }
 
     /// Removes an entry and returns its value.
@@ -212,14 +229,31 @@ mod tests {
         cache.insert("third", 3, 1);
         assert_eq!(cache.get(&"first"), Some(&1));
 
-        cache.insert("fourth", 4, 1);
+        assert_eq!(cache.insert_counting_evictions("fourth", 4, 1), 1);
         assert_eq!(cache.get(&"second"), None);
         assert_eq!(cache.get(&"first"), Some(&1));
         assert_eq!(cache.used(), 3);
 
-        cache.insert("heavy", 5, 3);
+        assert_eq!(cache.insert_counting_evictions("heavy", 5, 3), 3);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get(&"heavy"), Some(&5));
+    }
+
+    #[test]
+    fn pop_lru_preserves_recency_links_and_weight() {
+        let mut cache = LruCache::new(10);
+        cache.insert("first", 1, 2);
+        cache.insert("second", 2, 3);
+        cache.insert("third", 3, 4);
+        assert_eq!(cache.get(&"first"), Some(&1));
+
+        assert_eq!(cache.pop_lru(), Some(("second", 2)));
+        assert_eq!(cache.used(), 6);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.pop_lru(), Some(("third", 3)));
+        assert_eq!(cache.pop_lru(), Some(("first", 1)));
+        assert!(cache.is_empty());
+        assert_eq!(cache.used(), 0);
     }
 
     #[test]

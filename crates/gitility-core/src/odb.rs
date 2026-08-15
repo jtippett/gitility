@@ -37,6 +37,16 @@ pub struct ReadManyBudget {
     pub max_total_bytes: Option<u64>,
 }
 
+/// Observable state of writable caches reachable through an object-store
+/// handle. Hits and misses live on [`Budget`] because they are per job;
+/// residency and evictions live here because they describe the cache itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub bytes: u64,
+    pub entries: u64,
+    pub evictions: u64,
+}
+
 /// A content-addressed, read-only object store.
 ///
 /// The trait is deliberately `dyn`-compatible: stores are composed and
@@ -123,6 +133,12 @@ pub trait ObjectDb: Send + Sync + 'static {
     /// Whether tree walkers should emit prefetch hints for child trees.
     fn supports_prefetch(&self) -> bool {
         false
+    }
+
+    /// Current cache residency plus cumulative evictions for caches reachable
+    /// through this handle. Non-layered stores have no writable cache.
+    fn cache_stats(&self) -> CacheStats {
+        CacheStats::default()
     }
 
     /// Invalidates availability knowledge — a missing object may have

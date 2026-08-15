@@ -35,7 +35,6 @@ defmodule Gitility.ODB do
     Limits,
     Native,
     NativeSupport,
-    NotImplementedError,
     Object,
     ObjectHeader,
     OID
@@ -59,7 +58,9 @@ defmodule Gitility.ODB do
           }
 
   @enforce_keys [:kind, :ref, :hash, :runtime]
-  defstruct [:kind, :ref, :hash, :runtime, :provider, :supervisor]
+  defstruct [:kind, :ref, :hash, :runtime, :provider, :supervisor, providers: []]
+
+  @default_layer_cache_entries 100_000
 
   @doc """
   Starts a provider-backed ODB serving objects through a
@@ -181,7 +182,8 @@ defmodule Gitility.ODB do
          hash: hash,
          runtime: runtime,
          provider: provider,
-         supervisor: supervisor
+         supervisor: supervisor,
+         providers: [provider]
        }}
     else
       {:error, %Error{} = error} -> {:error, error}
@@ -253,23 +255,49 @@ defmodule Gitility.ODB do
         ])
   """
   @spec layer([t() | cache_spec()]) :: {:ok, t()} | {:error, Error.t()}
-  def layer(layers) do
-    _ = layers
-    NotImplementedError.stub!(:"ODB.layer/1", "Milestone 2")
+  def layer(layers) when is_list(layers) do
+    with {:ok, stores, cache, cache_index} <- validate_layers(layers),
+         :ok <- validate_layer_hashes(stores),
+         :ok <- validate_layer_runtimes(stores),
+         [%__MODULE__{hash: hash, runtime: runtime} | _] <- stores do
+      case Native.layered_store_new(
+             Enum.map(stores, & &1.ref),
+             cache,
+             cache_index
+           ) do
+        {:ok, {resource, ^hash}} ->
+          {:ok,
+           %__MODULE__{
+             kind: :layered,
+             ref: resource,
+             hash: hash,
+             runtime: runtime,
+             providers: layer_providers(stores)
+           }}
+
+        {:error, error} ->
+          {:error, NativeSupport.nif_error(error, :odb_layer)}
+      end
+    end
   end
+
+  def layer(_layers), do: layer_error("layers must be provided as a list")
 
   @typedoc "A cache layer descriptor produced by `cache/1`."
   @opaque cache_spec :: {:cache, keyword()}
 
   @doc """
   A writable in-memory cache layer for `layer/1`: stores verified, inflated
-  object payloads under byte, entry, and per-object caps. Never disk.
+  object payloads under byte, entry, and per-object caps. Bytes enter only
+  after a lower store's `verify: :always` path. Because process memory is not
+  a new trust boundary, hits are served without re-hashing. Never disk.
 
   ## Options
 
     * `:max_bytes` (required) — total payload ceiling.
-    * `:max_entries` — entry-count ceiling.
-    * `:max_object_bytes` — per-object cap; larger objects bypass the cache.
+    * `:max_entries` — entry-count ceiling (default `100_000`).
+    * `:max_object_bytes` — per-object cap (default: `max_bytes`); larger
+      objects bypass the cache and remain readable from lower layers.
   """
   @spec cache(keyword()) :: cache_spec()
   def cache(opts), do: {:cache, opts}
@@ -277,9 +305,11 @@ defmodule Gitility.ODB do
   @doc """
   Asks a provider backend to refresh availability state, bounded by its
   `request_timeout`, then clears the native negative cache only after the
-  callback succeeds.
+  callback succeeds. A layered handle fans this out to every provider it
+  contains, then refreshes every native layer. Verified positive cache entries
+  remain valid because Git object IDs are immutable.
 
-  Other store kinds return `:unsupported_operation` in this milestone.
+  Local and static handles return `:unsupported_operation` in this milestone.
   """
   @spec refresh(t()) :: :ok | {:error, Error.t()}
   def refresh(%__MODULE__{kind: :provider, ref: resource, provider: provider}) do
@@ -289,11 +319,18 @@ defmodule Gitility.ODB do
     end
   end
 
+  def refresh(%__MODULE__{kind: :layered, ref: resource, providers: providers}) do
+    with :ok <- refresh_layer_providers(providers),
+         {:ok, nil} <- native_provider_refresh(resource) do
+      :ok
+    end
+  end
+
   def refresh(%__MODULE__{}) do
     {:error,
      Error.new(
        :unsupported_operation,
-       "refresh is supported only for provider object stores",
+       "refresh is supported only for provider and layered object stores",
        operation: :odb_refresh
      )}
   end
@@ -455,6 +492,135 @@ defmodule Gitility.ODB do
 
   defp parse_oids(_oids),
     do: NativeSupport.invalid_argument("object IDs must be provided as a list")
+
+  defp validate_layers(layers) do
+    cache_specs = Enum.filter(layers, &match?({:cache, _opts}, &1))
+    stores = Enum.filter(layers, &match?(%__MODULE__{}, &1))
+
+    cond do
+      length(cache_specs) > 1 ->
+        layer_error("one cache layer per composition in 0.x")
+
+      Enum.any?(layers, fn layer ->
+        not match?(%__MODULE__{}, layer) and not match?({:cache, _opts}, layer)
+      end) ->
+        layer_error("each layer must be an ODB handle or cache descriptor")
+
+      stores == [] ->
+        layer_error("a layered object database requires at least one store")
+
+      cache_specs == [] ->
+        {:ok, stores, nil, nil}
+
+      true ->
+        cache_position = Enum.find_index(layers, &match?({:cache, _opts}, &1))
+
+        stores_before =
+          layers |> Enum.take(cache_position) |> Enum.count(&match?(%__MODULE__{}, &1))
+
+        if stores_before >= length(stores) do
+          layer_error("a cache layer must precede at least one object store")
+        else
+          [{:cache, opts}] = cache_specs
+
+          case validate_layer_cache(opts) do
+            {:ok, cache} -> {:ok, stores, cache, stores_before}
+            {:error, %Error{} = error} -> {:error, error}
+          end
+        end
+    end
+  end
+
+  defp validate_layer_cache(opts) when is_list(opts) do
+    if Keyword.keyword?(opts) do
+      keys = Keyword.keys(opts)
+      allowed = [:max_bytes, :max_entries, :max_object_bytes]
+      unknown = keys -- allowed
+
+      cond do
+        unknown != [] ->
+          layer_error("unknown cache option: #{inspect(hd(unknown))}")
+
+        length(keys) != MapSet.size(MapSet.new(keys)) ->
+          layer_error("cache options must not contain duplicate keys")
+
+        not Keyword.has_key?(opts, :max_bytes) ->
+          layer_error("cache :max_bytes is required")
+
+        true ->
+          max_bytes = opts[:max_bytes]
+          max_entries = Keyword.get(opts, :max_entries, @default_layer_cache_entries)
+          max_object_bytes = Keyword.get(opts, :max_object_bytes, max_bytes)
+
+          with :ok <- validate_positive_cache_option(max_bytes, :max_bytes),
+               :ok <- validate_positive_cache_option(max_entries, :max_entries),
+               :ok <- validate_positive_cache_option(max_object_bytes, :max_object_bytes) do
+            {:ok,
+             %{
+               max_bytes: max_bytes,
+               max_entries: max_entries,
+               max_object_bytes: max_object_bytes
+             }}
+          end
+      end
+    else
+      layer_error("cache options must be a keyword list")
+    end
+  end
+
+  defp validate_layer_cache(_opts), do: layer_error("cache options must be a keyword list")
+
+  defp validate_positive_cache_option(value, _name) when is_integer(value) and value > 0,
+    do: :ok
+
+  defp validate_positive_cache_option(_value, name),
+    do: layer_error("cache :#{name} must be a positive integer")
+
+  defp validate_layer_hashes([%__MODULE__{hash: hash} | stores]) do
+    if Enum.all?(stores, &(&1.hash == hash)) do
+      :ok
+    else
+      {:error,
+       Error.new(:hash_mismatch, "layered object stores use different hash algorithms",
+         operation: :odb_layer
+       )}
+    end
+  end
+
+  defp validate_layer_runtimes([%__MODULE__{runtime: runtime} | stores]) do
+    if Enum.all?(stores, &(&1.runtime == runtime)) do
+      :ok
+    else
+      {:error,
+       Error.new(:runtime_mismatch, "layered object stores use different runtimes",
+         operation: :odb_layer
+       )}
+    end
+  end
+
+  defp layer_providers(stores) do
+    stores
+    |> Enum.flat_map(fn
+      %__MODULE__{kind: :provider, provider: provider} when is_pid(provider) -> [provider]
+      %__MODULE__{kind: :layered, providers: providers} when is_list(providers) -> providers
+      %__MODULE__{} -> []
+    end)
+    |> Enum.uniq()
+  end
+
+  defp refresh_layer_providers(providers) do
+    Enum.reduce(providers, :ok, fn provider, first_result ->
+      case provider_refresh(provider) do
+        :ok -> first_result
+        {:error, %Error{} = error} when first_result == :ok -> {:error, error}
+        {:error, %Error{}} -> first_result
+      end
+    end)
+  end
+
+  defp layer_error(message) do
+    {:error, Error.new(:invalid_argument, message, operation: :odb_layer)}
+  end
 
   defp validate_provider_backend({module, _init_arg}) when is_atom(module) do
     if function_exported?(module, :init, 1) and function_exported?(module, :read_many, 2) do

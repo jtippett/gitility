@@ -22,6 +22,7 @@ defmodule Gitility.Native do
   def open_local(_path, _opts), do: :erlang.nif_error(:nif_not_loaded)
   def static_from_objects(_objects, _hash), do: :erlang.nif_error(:nif_not_loaded)
   def provider_store_new(_hash, _opts), do: :erlang.nif_error(:nif_not_loaded)
+  def layered_store_new(_stores, _cache, _cache_index), do: :erlang.nif_error(:nif_not_loaded)
   def provider_reply(_request, _reply), do: :erlang.nif_error(:nif_not_loaded)
   def provider_failed(_store), do: :erlang.nif_error(:nif_not_loaded)
   def provider_refresh(_store), do: :erlang.nif_error(:nif_not_loaded)

@@ -4,6 +4,8 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
   alias Gitility.{Error, Job, Limits, Object, ODB, OID, Runtime, Snapshot}
 
   @entry_count 80_000
+  @shutdown_join_timeout_ms 5_000
+  @supervisor_shutdown_margin_ms 2_000
 
   setup_all do
     {large_objects, large_commit} = repository_objects(@entry_count, "x")
@@ -78,7 +80,7 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
       end
 
     assert eventually(fn -> Enum.any?(jobs, &(Job.status(&1) == :running)) end)
-    :ok = GenServer.stop(runtime)
+    :ok = stop_runtime(runtime)
 
     assert Enum.all?(jobs, &(Job.status(&1) == :cancelled))
 
@@ -95,6 +97,11 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
 
     assert [runtime] = Enum.uniq(runtimes)
     assert Process.alive?(runtime)
+  end
+
+  test "child specs outlast the configured native shutdown join window" do
+    assert %{shutdown: 7_000} = Runtime.child_spec([])
+    assert %{shutdown: 2_250} = Runtime.child_spec(shutdown_join_timeout_ms: 250)
   end
 
   test "async list_tree matches sync and results are take-once", context do
@@ -241,7 +248,13 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
 
   @tag :soak
   @tag timeout: 45_000
+  # Incident regression contract: see
+  # docs/reports/2026-08-14-kernel-panic-thread-leak.md. This remains excluded
+  # until its first NIF-loading run is protected by the host thread watchdog;
+  # when enabled, every stop uses the bounded assertion helper and the global
+  # thread budget must return exactly to its pre-soak value.
   test "30 second mixed job soak reconciles counters across two runtimes", context do
+    thread_budget_before_soak = Runtime.stats().thread_budget_used
     runtimes = [start_runtime(workers: 2), start_runtime(workers: 2)]
 
     snapshots =
@@ -261,6 +274,13 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
       assert stats.owner_count == 0
       assert stats.submitted == stats.completed + stats.failed + stats.cancelled
     end)
+
+    Enum.each(runtimes, &stop_runtime/1)
+
+    assert eventually(
+             fn -> Runtime.stats().thread_budget_used == thread_budget_before_soak end,
+             @shutdown_join_timeout_ms + @supervisor_shutdown_margin_ms
+           )
   end
 
   defp soak_loop(snapshots, deadline, iteration) do
@@ -316,16 +336,25 @@ defmodule Gitility.Milestone2bRuntimeJobTest do
 
   defp start_runtime(opts) do
     {:ok, runtime} = Runtime.start_link(opts)
-    on_exit(fn -> stop_runtime(runtime) end)
+    shutdown_join_timeout_ms =
+      Keyword.get(opts, :shutdown_join_timeout_ms, @shutdown_join_timeout_ms)
+
+    on_exit(fn -> stop_runtime(runtime, shutdown_join_timeout_ms) end)
     runtime
   end
 
-  defp stop_runtime(runtime) do
-    try do
-      if Process.alive?(runtime), do: GenServer.stop(runtime)
-    catch
-      :exit, _reason -> :ok
+  defp stop_runtime(runtime, shutdown_join_timeout_ms \\ @shutdown_join_timeout_ms) do
+    if Process.alive?(runtime) do
+      stopper = Task.async(fn -> GenServer.stop(runtime) end)
+
+      assert :ok =
+               Task.await(
+                 stopper,
+                 shutdown_join_timeout_ms + @supervisor_shutdown_margin_ms
+               )
     end
+
+    :ok
   end
 
   defp snapshot(objects, commit_oid, runtime) do

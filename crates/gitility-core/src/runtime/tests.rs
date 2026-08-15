@@ -41,6 +41,7 @@ fn default_config_matches_the_public_contract() {
             max_queue: 1_000,
             max_jobs_per_owner: 16,
             retry_after_ms: 100,
+            shutdown_join_timeout_ms: 5_000,
         }
     );
 }
@@ -259,6 +260,7 @@ fn queue_full_reports_reason_and_retry_delay() {
         max_queue: 1,
         max_jobs_per_owner: 10,
         retry_after_ms: 777,
+        ..RuntimeConfig::default()
     });
     let observer = Arc::new(TestObserver::default());
     let (started_tx, started_rx) = mpsc::channel();
@@ -373,6 +375,7 @@ fn owner_ceiling_is_independent_of_queue_capacity() {
         max_queue: 2,
         max_jobs_per_owner: 1,
         retry_after_ms: 321,
+        ..RuntimeConfig::default()
     });
     let observer = Arc::new(TestObserver::default());
     let (started_tx, started_rx) = mpsc::channel();
@@ -537,6 +540,8 @@ fn shutdown_cancels_drains_and_joins_then_rejects() {
     assert_eq!(runtime.queue_len(), 0);
     assert_eq!(runtime.running_count(), 0);
     assert!(sync::lock(&runtime.workers).is_empty());
+    assert_eq!(runtime.counters().detached_workers, 0);
+    assert_eq!(runtime.last_detach_reason(), None);
     runtime.shutdown();
 
     let rejected = runtime.submit(2, observer_spec(observer, |_| Ok(JobOutput::Oid(oid(14)))));
@@ -628,6 +633,60 @@ fn reentrant_shutdown_request_is_completed_by_later_external_shutdown() {
     assert_eq!(job.state(), JobState::Cancelled);
     assert_eq!(runtime.running_count(), 0);
     assert!(sync::lock(&runtime.workers).is_empty());
+}
+
+#[test]
+fn shutdown_detaches_an_uncooperative_worker_with_its_budget_slot_held() {
+    const JOIN_TIMEOUT_MS: u64 = 50;
+    const SHUTDOWN_MARGIN_MS: u64 = 1_000;
+
+    let budget = Box::leak(Box::new(thread_budget::ThreadBudget::new(1)));
+    let runtime = Runtime::start_with_budget(
+        RuntimeConfig {
+            workers: 1,
+            shutdown_join_timeout_ms: JOIN_TIMEOUT_MS,
+            ..RuntimeConfig::default()
+        },
+        budget,
+    )
+    .expect("one worker fits");
+    let observer = Arc::new(TestObserver::default());
+    let (started_tx, started_rx) = mpsc::channel();
+    let _job = runtime
+        .submit(
+            1,
+            observer_spec(observer, move |_| -> Result<JobOutput, Error> {
+                let _ = started_tx.send(());
+                loop {
+                    // Deliberately no Budget::check: this models a dependency
+                    // wedged outside Gitility's cooperative cancellation path.
+                    thread::sleep(Duration::from_secs(60));
+                }
+            }),
+        )
+        .expect("uncooperative job is admitted");
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("uncooperative job starts");
+
+    let started = Instant::now();
+    runtime.shutdown();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed <= Duration::from_millis(JOIN_TIMEOUT_MS + SHUTDOWN_MARGIN_MS),
+        "shutdown took {elapsed:?}"
+    );
+    assert_eq!(runtime.counters().detached_workers, 1);
+    assert_eq!(
+        runtime.last_detach_reason().as_deref(),
+        Some("worker gitility-worker-0 did not exit within shutdown_join_timeout_ms=50; detached")
+    );
+    assert_eq!(
+        budget.used(),
+        1,
+        "a detached live worker must retain its honest budget cost"
+    );
 }
 
 #[test]
@@ -877,6 +936,7 @@ mod thread_budget_tests {
             max_queue: 4,
             max_jobs_per_owner: 4,
             retry_after_ms: 1,
+            shutdown_join_timeout_ms: 5_000,
         }
     }
 
@@ -938,9 +998,10 @@ mod thread_budget_tests {
         let runtime = Runtime::start_with_budget(config(3), budget).expect("3 of 4 fits");
         assert_eq!(budget.used(), 3);
         runtime.shutdown();
-        // shutdown() joins the workers, and each worker's reservation drops
-        // when its loop returns, so the release is observable here.
+        // These cooperative workers exit within the bounded join phase, and
+        // each reservation drops when its loop returns.
         assert_eq!(budget.used(), 0);
+        assert_eq!(runtime.counters().detached_workers, 0);
     }
 
     #[test]

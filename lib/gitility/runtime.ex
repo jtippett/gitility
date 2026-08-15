@@ -10,6 +10,11 @@ defmodule Gitility.Runtime do
     * `workers: max(System.schedulers_online() div 2, 1)`
     * `max_queue: 1_000`
     * `max_jobs_per_owner: 16`
+    * `shutdown_join_timeout_ms: 5_000`
+
+  The generated child spec gives shutdown `shutdown_join_timeout_ms + 2_000`
+  milliseconds. That margin lets the bounded native worker-join phase finish
+  before a supervisor is allowed to kill the GenServer running `terminate/2`.
 
   Tuning means starting a named runtime in your own supervision tree — the
   Finch/NimblePool convention, and the only shape that lets two subsystems
@@ -41,10 +46,14 @@ defmodule Gitility.Runtime do
 
   use GenServer
 
+  require Logger
+
   alias Gitility.{Error, Native}
 
   @default_name Gitility.DefaultRuntime
   @default_key {__MODULE__, :default}
+  @default_shutdown_join_timeout_ms 5_000
+  @supervisor_shutdown_margin_ms 2_000
 
   @typedoc "A runtime identifier: a registered name or pid."
   @type t :: atom() | pid()
@@ -55,6 +64,7 @@ defmodule Gitility.Runtime do
           | {:workers, pos_integer()}
           | {:max_queue, pos_integer()}
           | {:max_jobs_per_owner, pos_integer()}
+          | {:shutdown_join_timeout_ms, pos_integer()}
 
   @doc """
   Starts a runtime instance. See the moduledoc for options.
@@ -66,7 +76,8 @@ defmodule Gitility.Runtime do
         name: nil,
         workers: default_workers(),
         max_queue: 1_000,
-        max_jobs_per_owner: 16
+        max_jobs_per_owner: 16,
+        shutdown_join_timeout_ms: @default_shutdown_join_timeout_ms
       )
 
     name = opts[:name]
@@ -78,7 +89,8 @@ defmodule Gitility.Runtime do
     config = %{
       workers: positive_option!(opts, :workers),
       max_queue: positive_option!(opts, :max_queue),
-      max_jobs_per_owner: positive_option!(opts, :max_jobs_per_owner)
+      max_jobs_per_owner: positive_option!(opts, :max_jobs_per_owner),
+      shutdown_join_timeout_ms: positive_option!(opts, :shutdown_join_timeout_ms)
     }
 
     case name do
@@ -90,9 +102,16 @@ defmodule Gitility.Runtime do
   @doc false
   @spec child_spec([option()]) :: Supervisor.child_spec()
   def child_spec(opts) do
+    shutdown_join_timeout_ms =
+      opts
+      |> Keyword.get(:shutdown_join_timeout_ms, @default_shutdown_join_timeout_ms)
+      |> positive_value!(:shutdown_join_timeout_ms)
+
     %{
       id: Keyword.get(opts, :name, __MODULE__),
-      start: {__MODULE__, :start_link, [opts]}
+      start: {__MODULE__, :start_link, [opts]},
+      # The supervisor must outlast CoreRuntime's bounded worker-join phase.
+      shutdown: shutdown_join_timeout_ms + @supervisor_shutdown_margin_ms
     }
   end
 
@@ -153,7 +172,17 @@ defmodule Gitility.Runtime do
       :persistent_term.erase(@default_key)
     end
 
-    Native.runtime_shutdown(state.resource)
+    %{detached_workers: detached_workers, last_detach_reason: reason} =
+      Native.runtime_shutdown(state.resource)
+
+    if detached_workers > 0 do
+      suffix = if reason, do: ": #{reason}", else: ""
+
+      Logger.warning(
+        "Gitility runtime shutdown detached #{detached_workers} worker(s)#{suffix}"
+      )
+    end
+
     :ok
   end
 
@@ -205,9 +234,12 @@ defmodule Gitility.Runtime do
   defp default_workers, do: max(div(System.schedulers_online(), 2), 1)
 
   defp positive_option!(opts, key) do
-    case Keyword.fetch!(opts, key) do
-      value when is_integer(value) and value > 0 -> value
-      _ -> raise ArgumentError, ":#{key} must be a positive integer"
-    end
+    opts |> Keyword.fetch!(key) |> positive_value!(key)
+  end
+
+  defp positive_value!(value, _key) when is_integer(value) and value > 0, do: value
+
+  defp positive_value!(_value, key) do
+    raise ArgumentError, ":#{key} must be a positive integer"
   end
 end

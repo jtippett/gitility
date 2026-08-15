@@ -10,6 +10,11 @@
 //! accumulated ~10,000 native threads and took the kernel down with it
 //! (XNU spinlock timeout in the pthread kext), twice.
 //!
+//! A worker detached after the bounded shutdown deadline keeps its reservation:
+//! the guard lives in the worker closure, not its `JoinHandle`, and releases
+//! only if that thread eventually exits. The occupied slot is the honest
+//! process cost of a wedged worker and must remain visible to admission.
+//!
 //! The budget deliberately uses `std` atomics rather than the loom-swapped
 //! [`super::sync`] types: it is process-global bookkeeping, and a `static`
 //! cannot participate in loom's per-model state space. Loom models still

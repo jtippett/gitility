@@ -85,6 +85,7 @@ struct RuntimeConfigMap {
     workers: usize,
     max_queue: usize,
     max_jobs_per_owner: usize,
+    shutdown_join_timeout_ms: u64,
 }
 
 #[derive(NifMap)]
@@ -102,8 +103,17 @@ struct RuntimeStatsMap {
     workers: u64,
     max_queue: u64,
     max_jobs_per_owner: u64,
+    shutdown_join_timeout_ms: u64,
+    detached_workers: u64,
+    last_detach_reason: Option<String>,
     thread_budget_used: u64,
     thread_budget_limit: u64,
+}
+
+#[derive(NifMap)]
+struct RuntimeShutdownMap {
+    detached_workers: u64,
+    last_detach_reason: Option<String>,
 }
 
 struct Notification {
@@ -275,7 +285,17 @@ fn notification_pump(runtime: Arc<CoreRuntime>, receiver: mpsc::Receiver<Notific
             &notification.waiter_state,
         );
     }
+    let detached_before = runtime.counters().detached_workers;
     runtime.shutdown();
+    let detached_after = runtime.counters().detached_workers;
+    if detached_after > detached_before {
+        let reason = runtime
+            .last_detach_reason()
+            .unwrap_or_else(|| "reason unavailable".to_owned());
+        eprintln!(
+            "gitility: delegated runtime shutdown detached {detached_after} worker(s): {reason}"
+        );
+    }
 }
 
 fn notify_waiters(
@@ -482,6 +502,7 @@ fn runtime_start(config: RuntimeConfigMap) -> NifResult<ResourceArc<RuntimeResou
         max_queue: config.max_queue,
         max_jobs_per_owner: config.max_jobs_per_owner,
         retry_after_ms: 100,
+        shutdown_join_timeout_ms: config.shutdown_join_timeout_ms,
     };
     // The pump thread draws on the same process-wide budget as the core
     // workers; reserving it first means a failed core start releases it on
@@ -525,7 +546,7 @@ fn thread_budget_error(error: thread_budget::BudgetExhausted) -> rustler::Error 
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn runtime_shutdown(runtime: ResourceArc<RuntimeResource>) -> Atom {
+fn runtime_shutdown(runtime: ResourceArc<RuntimeResource>) -> RuntimeShutdownMap {
     if !runtime.shutdown_started.swap(true, Ordering::AcqRel) {
         runtime.runtime.shutdown();
         runtime.notifications.close();
@@ -533,7 +554,10 @@ fn runtime_shutdown(runtime: ResourceArc<RuntimeResource>) -> Atom {
     if let Some(pump) = lock(&runtime.pump).take() {
         let _ = pump.join();
     }
-    atoms::ok()
+    RuntimeShutdownMap {
+        detached_workers: runtime.runtime.counters().detached_workers,
+        last_detach_reason: runtime.runtime.last_detach_reason(),
+    }
 }
 
 #[rustler::nif]
@@ -558,6 +582,9 @@ fn runtime_stats(runtime: ResourceArc<RuntimeResource>) -> RuntimeStatsMap {
         workers: runtime.config.workers as u64,
         max_queue: runtime.config.max_queue as u64,
         max_jobs_per_owner: runtime.config.max_jobs_per_owner as u64,
+        shutdown_join_timeout_ms: runtime.config.shutdown_join_timeout_ms,
+        detached_workers: counters.detached_workers,
+        last_detach_reason: runtime.runtime.last_detach_reason(),
         thread_budget_used: thread_budget::global().used() as u64,
         thread_budget_limit: thread_budget::global().limit() as u64,
     }

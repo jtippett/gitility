@@ -96,6 +96,7 @@ fn loom_queue_has_no_lost_wakeup() {
             max_queue: 1,
             max_jobs_per_owner: 1,
             retry_after_ms: 1,
+            shutdown_join_timeout_ms: 5_000,
         });
         let observation = observer();
         let job = runtime
@@ -118,6 +119,7 @@ fn loom_cancel_dequeue_race_has_one_terminal_transition() {
                 max_queue: 1,
                 max_jobs_per_owner: 1,
                 retry_after_ms: 1,
+                shutdown_join_timeout_ms: 5_000,
             });
             let observation = observer();
             let invocations = Arc::new(AtomicU64::new(0));
@@ -159,6 +161,7 @@ fn loom_terminal_state_publishes_output_first() {
             max_queue: 1,
             max_jobs_per_owner: 1,
             retry_after_ms: 1,
+            shutdown_join_timeout_ms: 5_000,
         });
         let observation = observer();
         let job = runtime
@@ -185,6 +188,7 @@ fn loom_shutdown_submit_race_never_strands_a_job() {
             max_queue: 1,
             max_jobs_per_owner: 1,
             retry_after_ms: 1,
+            shutdown_join_timeout_ms: 5_000,
         });
         let submitting_runtime = Arc::clone(&runtime);
         let submitter = loom::thread::spawn(move || {
@@ -216,6 +220,7 @@ fn loom_two_workers_two_jobs_have_no_lost_wakeup() {
             max_queue: 2,
             max_jobs_per_owner: 2,
             retry_after_ms: 1,
+            shutdown_join_timeout_ms: 5_000,
         });
         let observation = observer();
         let first = runtime
@@ -240,6 +245,7 @@ fn loom_shutdown_races_queued_cancel() {
             max_queue: 2,
             max_jobs_per_owner: 2,
             retry_after_ms: 1,
+            shutdown_join_timeout_ms: 5_000,
         });
         let observation = observer();
         let started = Arc::new(AtomicBool::new(false));
@@ -285,6 +291,7 @@ fn loom_double_cancel_from_two_threads_fires_once() {
             max_queue: 1,
             max_jobs_per_owner: 1,
             retry_after_ms: 1,
+            shutdown_join_timeout_ms: 5_000,
         });
         let observation = observer();
         let job = runtime
@@ -319,6 +326,7 @@ fn loom_shutdown_races_reentrant_shutdown_without_deadlock() {
                 max_queue: 1,
                 max_jobs_per_owner: 1,
                 retry_after_ms: 1,
+                shutdown_join_timeout_ms: 5_000,
             });
             let observation = observer();
             let started = Arc::new(AtomicBool::new(false));

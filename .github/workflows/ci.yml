@@ -32,6 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Check native thread spawn allowlist
+        run: scripts/check-thread-spawns.sh
+
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
         with:

@@ -43,6 +43,9 @@ pub struct RuntimeConfig {
     pub max_queue: usize,
     pub max_jobs_per_owner: usize,
     pub retry_after_ms: u64,
+    /// Maximum wall-clock time given to all workers to exit during the join
+    /// phase. A handle still running at the deadline is detached.
+    pub shutdown_join_timeout_ms: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -52,6 +55,7 @@ impl Default for RuntimeConfig {
             max_queue: 1_000,
             max_jobs_per_owner: 16,
             retry_after_ms: 100,
+            shutdown_join_timeout_ms: 5_000,
         }
     }
 }
@@ -171,6 +175,7 @@ pub struct RuntimeCounters {
     pub failed: u64,
     pub cancelled: u64,
     pub rejected: u64,
+    pub detached_workers: u64,
 }
 
 struct Counters {
@@ -180,6 +185,7 @@ struct Counters {
     cancelled: AtomicU64,
     rejected: AtomicU64,
     running: AtomicU64,
+    detached_workers: AtomicU64,
 }
 
 impl Counters {
@@ -191,6 +197,7 @@ impl Counters {
             cancelled: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             running: AtomicU64::new(0),
+            detached_workers: AtomicU64::new(0),
         }
     }
 
@@ -203,6 +210,7 @@ impl Counters {
             failed: self.failed.load(Ordering::Acquire),
             cancelled: self.cancelled.load(Ordering::Acquire),
             rejected: self.rejected.load(Ordering::Acquire),
+            detached_workers: self.detached_workers.load(Ordering::Acquire),
         }
     }
 }
@@ -220,6 +228,7 @@ struct Shared {
     wake: Condvar,
     counters: Counters,
     next_job_id: AtomicU64,
+    last_detach_reason: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -235,7 +244,20 @@ impl Shared {
             wake: Condvar::new(),
             counters: Counters::new(),
             next_job_id: AtomicU64::new(1),
+            last_detach_reason: Mutex::new(None),
         }
+    }
+
+    #[cfg(not(all(test, loom)))]
+    fn record_detached_worker(&self, worker_name: &str) {
+        let reason = format!(
+            "worker {worker_name} did not exit within shutdown_join_timeout_ms={}; detached",
+            self.config.shutdown_join_timeout_ms
+        );
+        *sync::lock(&self.last_detach_reason) = Some(reason);
+        self.counters
+            .detached_workers
+            .fetch_add(1, Ordering::Release);
     }
 
     fn record_terminal(&self, job: &Job, from: JobState, terminal: JobState) {
@@ -470,9 +492,10 @@ enum ShutdownPhase {
 /// An explicit bounded worker pool.
 ///
 /// Dropping the last runtime handle from outside the pool performs the same
-/// cancellation and join sequence as [`Runtime::shutdown`]. If the last handle
-/// is dropped by one of this runtime's workers, `Drop` can only request
-/// shutdown: it detaches the handles rather than attempting to join itself.
+/// cancellation and bounded join sequence as [`Runtime::shutdown`]. If the
+/// last handle is dropped by one of this runtime's workers, `Drop` can only
+/// request shutdown: it detaches the handles rather than attempting to join
+/// itself.
 pub struct Runtime {
     shared: Arc<Shared>,
     workers: Mutex<Vec<sync::thread::JoinHandle<()>>>,
@@ -626,11 +649,16 @@ impl Runtime {
 
     /// Requests cancellation of all queued and running jobs and wakes the pool.
     ///
-    /// From a non-worker thread, this method returns only after every worker
-    /// has been joined and every admitted job is terminal. Concurrent external
-    /// callers wait for that same completion point. From one of this runtime's
-    /// own workers, it is deliberately only a shutdown request and returns
-    /// without joining; a later external call or `Drop` completes the joins.
+    /// From a non-worker thread, this method gives workers up to
+    /// [`RuntimeConfig::shutdown_join_timeout_ms`] to exit. Workers still
+    /// running at that deadline are detached and counted in
+    /// [`RuntimeCounters::detached_workers`], after which shutdown is marked
+    /// complete so external callers cannot wedge. A detached worker retains
+    /// its process-wide thread-budget reservation until its thread actually
+    /// exits; that slot is the honest cost of uncooperative work. Concurrent
+    /// external callers wait for the same bounded completion point. From one
+    /// of this runtime's own workers, this is deliberately only a shutdown
+    /// request; a later external call or `Drop` completes the bounded phase.
     ///
     /// Observers for jobs drained from the queue run synchronously on this
     /// method's caller thread, inside the shutdown protocol. Observers must not
@@ -679,6 +707,11 @@ impl Runtime {
 
     pub fn counters(&self) -> RuntimeCounters {
         self.shared.counters.snapshot()
+    }
+
+    /// The most recently recorded one-line reason for detaching a worker.
+    pub fn last_detach_reason(&self) -> Option<String> {
+        sync::lock(&self.shared.last_detach_reason).clone()
     }
 
     pub fn submitted_count(&self) -> u64 {
@@ -743,14 +776,55 @@ impl Runtime {
 
     fn finish_shutdown(&self) {
         let workers: Vec<_> = sync::lock(&self.workers).drain(..).collect();
-        for worker in workers {
-            let _ = worker.join();
-        }
+        self.join_workers_bounded(workers);
 
         let _wait = sync::lock(&self.shutdown_wait);
         self.shutdown_phase
             .store(ShutdownPhase::Complete as u8, Ordering::Release);
         self.shutdown_wake.notify_all();
+    }
+
+    #[cfg(not(all(test, loom)))]
+    fn join_workers_bounded(&self, workers: Vec<sync::thread::JoinHandle<()>>) {
+        let timeout = Duration::from_millis(self.shared.config.shutdown_join_timeout_ms);
+        let started = Instant::now();
+        let mut pending = workers;
+
+        loop {
+            let mut still_running = Vec::with_capacity(pending.len());
+            for worker in pending {
+                if worker.is_finished() {
+                    let _ = worker.join();
+                } else {
+                    still_running.push(worker);
+                }
+            }
+
+            if still_running.is_empty() {
+                return;
+            }
+            if started.elapsed() >= timeout {
+                for worker in still_running {
+                    let worker_name = worker.thread().name().unwrap_or("unnamed").to_owned();
+                    self.shared.record_detached_worker(&worker_name);
+                    drop(worker);
+                }
+                return;
+            }
+
+            pending = still_running;
+            let remaining = timeout.saturating_sub(started.elapsed());
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+    }
+
+    // Loom has no real-time model. Keep its shutdown join phase unchanged so
+    // the existing concurrency models exercise only synchronization state.
+    #[cfg(all(test, loom))]
+    fn join_workers_bounded(&self, workers: Vec<sync::thread::JoinHandle<()>>) {
+        for worker in workers {
+            let _ = worker.join();
+        }
     }
 }
 

@@ -50,23 +50,24 @@ high-confidence; attribution to a specific line is not possible.
 
 ## Defects identified in the surviving code
 
-1. **Wedgeable shutdown.** `Runtime::finish_shutdown`
-   (`crates/gitility-core/src/runtime/mod.rs:744`) joins every worker
-   unconditionally. A task that blocks without reaching a `Budget::check`
-   point wedges the join forever. Because `runtime_shutdown`
-   (`native/gitility/src/lib.rs:528`) is a DirtyIo NIF, a wedged join
-   permanently occupies one of the BEAM's ~10 dirty IO schedulers and can
+1. **Wedgeable shutdown.** Before the hardening recorded below,
+   `Runtime::finish_shutdown` (now at
+   `crates/gitility-core/src/runtime/mod.rs:777`) joined every worker
+   unconditionally. A task that blocked without reaching a `Budget::check`
+   point wedged the join forever. Because `runtime_shutdown` (now at
+   `native/gitility/src/lib.rs:549`) is a DirtyIo NIF, a wedged join
+   permanently occupied one of the BEAM's ~10 dirty IO schedulers and could
    never be killed.
-2. **Kill-during-join strands threads.** `Gitility.Runtime.terminate/2`
-   (`lib/gitility/runtime.ex:151`) calls that blocking NIF; a supervisor's
-   default 5s shutdown then `:kill`s the GenServer mid-join, silently
-   stranding workers and pump. The soak helper's `catch :exit, _ -> :ok`
-   in `stop_runtime` swallows exactly this evidence.
-3. **Silent teardown-by-detachment.** `RuntimeResource::Drop`
-   (`native/gitility/src/lib.rs:147`) cannot join from a scheduler, so it
-   delegates shutdown to the detached pump
-   (`notification_pump`, `lib.rs:268`). Correct when it works; invisible
-   when it does not — no error, no log.
+2. **Kill-during-join strands threads.** Before hardening,
+   `Gitility.Runtime.terminate/2` (now at `lib/gitility/runtime.ex:170`) called
+   that blocking NIF under the supervisor's default 5s shutdown; `:kill`
+   could strand workers and pump silently. The old soak helper's
+   `catch :exit, _ -> :ok` swallowed exactly this evidence.
+3. **Silent teardown-by-detachment.** `RuntimeResource::Drop` cannot join from
+   a scheduler, so it delegates shutdown to the detached pump
+   (`notification_pump`, now at `native/gitility/src/lib.rs:278`). Before
+   hardening this was correct when it worked and invisible when it did not —
+   no error, no log.
 4. **No process-wide thread cap** — nothing prevented any of the above, or
    any orchestration bug, from growing until the kernel died. **Fixed; see
    below.**
@@ -83,7 +84,7 @@ New module `crates/gitility-core/src/runtime/thread_budget.rs`:
   `GITILITY_THREAD_BUDGET`, read once at first use). At ~6 threads per
   default runtime that admits ~100 concurrent runtimes — far above sane
   use, far below kernel danger.
-- `Runtime::try_start` (`mod.rs:509`) reserves `workers` slots up front and
+- `Runtime::try_start` (`mod.rs:532`) reserves `workers` slots up front and
   returns `Err(BudgetExhausted { requested, used, limit })` instead of
   spawning when the budget is exhausted. `Runtime::start` keeps its
   infallible signature for internal callers and panics with the same
@@ -92,7 +93,7 @@ New module `crates/gitility-core/src/runtime/thread_budget.rs`:
   moved into the thread closure; release happens when the loop returns —
   including by unwind — so joins are never required for the budget to
   recover. The failed-spawn path releases unspawned slots the same way.
-- The NIF pump draws on the same budget: `runtime_start` (`lib.rs:479`)
+- The NIF pump draws on the same budget: `runtime_start` (`lib.rs:499`)
   reserves the pump slot first, then calls `CoreRuntime::try_start`;
   exhaustion raises in Elixir
   (`** (ErlangError) ... "gitility thread budget exhausted: requested N
@@ -108,29 +109,63 @@ per-model state space (rationale in the module doc).
 
 ### Verification
 
-- `cargo test -p gitility-core`: **104 passed** (97 pre-existing + 7 new
-  budget tests covering reserve/release accounting, exhaustion reporting,
-  split-reservation ownership, refused starts reserving nothing, shutdown
-  returning every slot, and zero-worker normalization).
-- `cargo check -p gitility` (NIF crate) and
-  `RUSTFLAGS="--cfg loom" cargo check -p gitility-core --tests`: clean.
-- `cargo fmt --check`: clean.
+- `cargo test -p gitility-core`: **105 passed**, including the seven
+  process-budget tests and the bounded-shutdown regression with an
+  intentionally uncooperative worker.
+- `RUSTFLAGS="--cfg loom" cargo test -p gitility-core --release`: **89
+  passed**, including all eight runtime concurrency models. The real-time
+  timeout is deliberately excluded from loom; its join path remains the
+  prior modeled blocking join.
+- `cargo check -p gitility` (NIF crate), Clippy for the workspace in both
+  normal and loom cfgs with warnings denied, `cargo fmt --all --check`, and
+  the native-thread spawn guard: clean.
 - **Not run, deliberately:** the Elixir suite / anything loading the NIF in
   a BEAM (per James's instruction after the second panic). The 21:21
   `priv/native/gitility.so` is untouched; the new code enters a BEAM only
   after the next `GITILITY_BUILD=1 mix compile`. First `mix test` after
   rebuilding should be run with the watchdog below active.
 
-## Recommended follow-ups (defects 1–3, in order)
+## Recommended follow-ups and current status
 
-1. Make shutdown joins bounded: join with a timeout, escalate to a loudly
-   logged detach. A wedged worker should cost its budget slot and a log
-   line, not a dirty IO scheduler.
-2. Log when pump teardown or a shutdown join exceeds a threshold, so
-   teardown failure stops being silent.
-3. Keep the soak excluded until 1–2 land. When re-enabling it, add an
-   assertion that `thread_budget_used` returns to its pre-suite value at
-   the end of the run.
+1. **Implemented in tree — defect 1:** core shutdown now gives workers a
+   bounded join window (default 5s), detaches and counts any worker still
+   running at the deadline, retains its honest budget cost, and exposes the
+   last one-line detach reason in stats.
+2. **Implemented in tree — defect 2:** the Elixir child spec now outlasts the
+   native join window by 2s, `terminate/2` warns on the detached count returned
+   by the shutdown NIF, and the runtime test helper no longer swallows stop
+   exits.
+3. **Implemented in tree — defect 3:** channel-close teardown remains delegated
+   to the native notification pump, whose final shutdown logs a `gitility:`
+   stderr line only when that delegated phase detaches workers; the same core
+   counter records the failure.
+
+The soak re-enable groundwork is wired: its stop paths use the bounded
+assertion helper and its final assertion requires `thread_budget_used` to
+return to the pre-soak value. It remains tagged `:soak` and globally excluded
+pending the first watchdog-protected NIF-loading run.
+
+The first BEAM run is also still pending and must use the watchdog below. No
+Elixir compile or test was run as part of this hardening pass.
+
+Two further structural follow-ups landed in tree:
+
+- **Spawn guard (D6):** `scripts/check-thread-spawns.sh` scans production Rust
+  sources and permits exactly the budgeted runtime-worker and notification-pump
+  spawn sites. The allowlist is self-verifying and the guard now runs in CI.
+- **`gix-odb` investigation (D7):** the `parallel` feature was removed. In the
+  vendored 0.83.0 sources it gates only `gix-features/parallel`
+  (`sources/gitoxide/gix-odb/Cargo.toml:26`), while Gitility constructs its own
+  `Arc<Store>` and uses `to_handle_arc`
+  (`crates/gitility-core/src/local_odb.rs:117`, `:169`, `:188`), an API the
+  vendored source explicitly provides for threaded applications independently
+  of `OwnShared` (`sources/gitoxide/gix-odb/src/store_impls/dynamic/handle.rs:267`).
+  The opt-in whole-pack checksum scan is Gitility's serial file loop, not a gix
+  `in_parallel` call (`crates/gitility-core/src/local_odb.rs:243`). Removing the
+  feature compiled with these paths intact and removed `crossbeam-channel`
+  from `Cargo.lock`. Rayon and `crossbeam-deque` remain through the Criterion
+  dev dependency; `crossbeam-epoch` remains through both that chain and the
+  separate `f6-spike`/Turso workspace crate. None are pulled by `gix-odb`.
 
 Also: commit working states frequently during native-thread work — the
 actual crash-era bug is unrecoverable only because it never got committed.

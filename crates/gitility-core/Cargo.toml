@@ -13,7 +13,7 @@ gix-config = { version = "=0.59.0", default-features = false }
 gix-glob = { version = "=0.27.0", default-features = false }
 gix-hash = { version = "=0.26.0", default-features = false, features = ["sha1", "sha256"] }
 gix-object = { version = "=0.63.0", default-features = false, features = ["sha1", "sha256"] }
-gix-odb = { version = "=0.83.0", default-features = false, features = ["parallel", "sha1", "sha256"] }
+gix-odb = { version = "=0.83.0", default-features = false, features = ["sha1", "sha256"] }
 sha1-checked = { version = "=0.10.0", default-features = false }
 sha2 = { version = "=0.11.0", default-features = false }
 

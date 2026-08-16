@@ -9,7 +9,10 @@ defmodule Gitility.Differential.BlameHistoryParityTest do
 
   for {case_name, repository_name, head_key, path, git_options, gitility_options} <- [
         {:full, "sha1-blame.git", :sha1_blame_head, "docs/final.txt", [], []},
-        {:range, "sha1-blame.git", :sha1_blame_head, "docs/final.txt", ["-L2,5"], [lines: 2..5]},
+        # The lines: range is a {first, last} tuple here because a Range
+        # struct is not a valid quoted expression inside this generator.
+        {:range, "sha1-blame.git", :sha1_blame_head, "docs/final.txt", ["-L2,5"],
+         [lines: {2, 5}]},
         {:no_follow, "sha1-blame.git", :sha1_blame_head, "docs/final.txt", ["--no-follow"],
          [follow_renames: false]},
         {:post_rename, "sha1-blame.git", :sha1_blame_post_rename, "docs/story.txt", [], []},
@@ -139,15 +142,17 @@ defmodule Gitility.Differential.BlameHistoryParityTest do
   defp fixture(name), do: Path.join(@fixtures, name)
 
   defp fixture_oid(key) do
+    wanted = Atom.to_string(key)
+
     @fixtures
     |> Path.join("OIDS")
     |> File.read!()
     |> String.split("\n", trim: true)
     |> Enum.find_value(fn line ->
       case String.split(line, "=", parts: 2) do
-        [name, oid] when name == Atom.to_string(key) -> oid
+        [^wanted, oid] -> oid
         _ -> nil
       end
-    end)
+    end) || raise "missing OIDS key #{key}"
   end
 end

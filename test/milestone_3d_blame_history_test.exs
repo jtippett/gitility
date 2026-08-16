@@ -107,7 +107,7 @@ defmodule Gitility.Milestone3dBlameHistoryTest do
              Gitility.blame(root, "docs/legacy.txt", lines: {5, 5})
 
     assert {:ok, %Blame{hunks: [%Blame.Hunk{final_range: %Range{first: 2, last: 4, step: 1}}]}} =
-             Gitility.blame(root, "docs/legacy.txt", lines: 4..2)
+             Gitility.blame(root, "docs/legacy.txt", lines: 4..2//-1)
   end
 
   test "out-of-range, missing, tree, budget, and option errors keep conventions", context do

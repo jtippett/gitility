@@ -124,6 +124,36 @@ impl ErrorCode {
     }
 }
 
+/// Log orders that can require an order-specific budget refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorOrder {
+    Topological,
+    Date,
+}
+
+impl ErrorOrder {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Topological => "topological",
+            Self::Date => "date",
+        }
+    }
+}
+
+/// Repository metadata files that can be named in normalized failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorFile {
+    Shallow,
+}
+
+impl ErrorFile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shallow => "shallow",
+        }
+    }
+}
+
 /// A normalized failure. Construct via [`Error::new`] or the focused
 /// helpers; `retryable` follows the same semantics as the Elixir struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +167,10 @@ pub struct Error {
     pub layer: Option<u64>,
     /// The object that caused an object-specific failure, when applicable.
     pub object_oid: Option<Oid>,
+    /// Log order associated with an order-specific refusal.
+    pub order: Option<ErrorOrder>,
+    /// Stable repository metadata filename associated with a parse failure.
+    pub file: Option<ErrorFile>,
 }
 
 impl Error {
@@ -148,6 +182,8 @@ impl Error {
             limit: None,
             layer: None,
             object_oid: None,
+            order: None,
+            file: None,
         }
     }
 
@@ -159,6 +195,8 @@ impl Error {
             limit: None,
             layer: None,
             object_oid: None,
+            order: None,
+            file: None,
         }
     }
 
@@ -178,6 +216,25 @@ impl Error {
     /// Associates an object-specific failure with its exact object ID.
     pub fn with_oid(mut self, oid: Oid) -> Self {
         self.object_oid = Some(oid);
+        self
+    }
+
+    /// Associates an object-specific failure unless a lower layer already
+    /// supplied a more precise object ID.
+    pub fn with_oid_if_none(mut self, oid: Oid) -> Self {
+        self.object_oid.get_or_insert(oid);
+        self
+    }
+
+    /// Associates an order-specific graph refusal.
+    pub fn with_order(mut self, order: ErrorOrder) -> Self {
+        self.order = Some(order);
+        self
+    }
+
+    /// Names stable repository metadata involved in a parse failure.
+    pub fn with_file(mut self, file: ErrorFile) -> Self {
+        self.file = Some(file);
         self
     }
 }

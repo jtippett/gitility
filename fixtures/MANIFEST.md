@@ -18,7 +18,8 @@ The corpus contains:
   four-candidate rename input. Stable `fixture/*` tags name useful queries.
 - `sha1-graph.git`: three branches joined by a four-parent octopus merge, an
   annotated tag on that merge, a criss-cross with exactly two merge bases, a
-  disjoint root, a child whose committer time predates its parent, and a
+  disjoint root, a child whose committer time predates its parent, two
+  four-commit parallel branches sharing one committer second, and a
   deterministic 220-commit linear tail. Stable `fixture/*` tags name every
   graph edge used by log, merge-base, ancestry, cursor, and cancellation tests.
 - `sha1-nested.git`: a three-plus-level tree with sibling directories and
@@ -59,4 +60,6 @@ and receives exactly one mutation:
 
 Git 2.42 or newer is required because SHA-256 repository generation is part
 of every run. `test/test_helper.exs` runs the generator automatically when the
-`generated/OIDS` completion marker is absent.
+`generated/OIDS` completion marker is absent or its `GENERATOR_HASH` does not
+match `generate.sh`. To force a manual rebuild, run
+`rm -rf fixtures/generated` and then `bash fixtures/generate.sh`.

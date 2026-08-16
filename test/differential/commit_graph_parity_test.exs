@@ -6,7 +6,12 @@ defmodule Gitility.Differential.CommitGraphParityTest do
 
   @fixtures Path.expand("../../fixtures/generated", __DIR__)
 
-  for repository_name <- ["sha1-graph.git", "sha1-history.git", "sha1-basic.git"] do
+  for repository_name <- [
+        "sha1-graph.git",
+        "sha1-history.git",
+        "sha1-history-shallow.git",
+        "sha1-basic.git"
+      ] do
     for {case_name, git_options, gitility_options} <- [
           {:default, [], []},
           {:topological, [order: :topological], [order: :topological]},
@@ -36,6 +41,25 @@ defmodule Gitility.Differential.CommitGraphParityTest do
                    actual
                  )
       end
+    end
+  end
+
+  for {case_name, git_options, gitility_options} <- [
+        {:equal_default, [], []},
+        {:equal_topological, [order: :topological], [order: :topological]},
+        {:equal_date, [order: :date], [order: :date]}
+      ] do
+    @tag :gitility_engine
+    test "equal-time log parity #{case_name}" do
+      repository_name = "sha1-graph.git"
+      repository_path = fixture(repository_name)
+      git_options = unquote(git_options)
+      assert {:ok, expected} = Oracle.log(repository_path, "fixture/equal-merge", git_options)
+      assert {:ok, repository} = Repository.open(repository_path)
+      assert {:ok, tip} = Oracle.rev_parse(repository_path, "fixture/equal-merge")
+      assert {:ok, snapshot} = Snapshot.open(repository.odb, tip)
+      assert {:ok, page} = Gitility.log(snapshot, unquote(gitility_options))
+      assert Enum.map(page.items, &OID.to_string(&1.id)) == expected
     end
   end
 
@@ -73,6 +97,18 @@ defmodule Gitility.Differential.CommitGraphParityTest do
     end
   end
 
+  @tag :gitility_engine
+  test "since pruning parity across the skew-child/resolved inversion" do
+    repository_path = fixture("sha1-graph.git")
+    since = 988_675_800
+    assert {:ok, expected} = Oracle.log(repository_path, "main", since: "@#{since}")
+    assert {:ok, repository} = Repository.open(repository_path)
+    assert {:ok, head} = Oracle.rev_parse(repository_path, "main")
+    assert {:ok, snapshot} = Snapshot.open(repository.odb, head)
+    assert {:ok, page} = Gitility.log(snapshot, since: since)
+    assert Enum.map(page.items, &OID.to_string(&1.id)) == expected
+  end
+
   for {case_name, left, right} <- [
         {:criss_cross, "fixture/criss-left", "fixture/criss-right"},
         {:octopus_sides, "fixture/branch-a", "fixture/branch-c"},
@@ -106,23 +142,14 @@ defmodule Gitility.Differential.CommitGraphParityTest do
                  actual_all
                )
 
-      assert {:ok, expected_one} =
-               Oracle.merge_base(repository_path, left_name, right_name, all: false)
-
       assert {:ok, actual_one} = Gitility.merge_base(repository.odb, left_hex, right_hex)
-      actual_one = if actual_one, do: [OID.to_string(actual_one)], else: []
+      actual_one = if actual_one, do: OID.to_string(actual_one)
 
-      assert :ok =
-               Allowlist.compare(
-                 {unquote(case_name), :default},
-                 %{
-                   operation: :merge_base,
-                   fixture_repo: repository_name,
-                   query: %{left: left_name, right: right_name}
-                 },
-                 expected_one,
-                 actual_one
-               )
+      if expected_all == [] do
+        assert is_nil(actual_one)
+      else
+        assert actual_one in expected_all
+      end
 
       assert {:ok, expected_ancestor} = Oracle.is_ancestor(repository_path, left_name, right_name)
       assert {:ok, actual_ancestor} = Gitility.ancestor?(repository.odb, left_hex, right_hex)

@@ -36,9 +36,26 @@ fn ensure_fixtures() {
 fn load_fixtures() -> HashMap<String, String> {
     let root = workspace_root();
     let marker = root.join("fixtures/generated/OIDS");
-    if !marker.is_file() {
+    let generator = root.join("fixtures/generate.sh");
+    let hash_marker = root.join("fixtures/generated/GENERATOR_HASH");
+    let expected_hash = Command::new("git")
+        .args(["hash-object"])
+        .arg(&generator)
+        .current_dir(&root)
+        .output()
+        .expect("git can hash the fixture generator");
+    assert!(
+        expected_hash.status.success(),
+        "git must hash the fixture generator"
+    );
+    let expected_hash = String::from_utf8(expected_hash.stdout)
+        .expect("git object hashes are ASCII")
+        .trim()
+        .to_owned();
+    let actual_hash = std::fs::read_to_string(&hash_marker).ok();
+    if !marker.is_file() || actual_hash.as_deref().map(str::trim) != Some(expected_hash.as_str()) {
         let status = Command::new("bash")
-            .arg(root.join("fixtures/generate.sh"))
+            .arg(generator)
             .current_dir(&root)
             .status()
             .expect("fixture generator can be started");

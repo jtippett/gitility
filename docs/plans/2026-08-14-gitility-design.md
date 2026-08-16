@@ -544,7 +544,7 @@ blob once. A persistent index may implement the same API later.
 ```elixir
 {:ok, page} =
   Gitility.log(snapshot,
-    order: :topological,
+    order: :chronological, # default; :topological and :date are also available
     first_parent: false,
     since: nil,
     until: nil,
@@ -621,8 +621,8 @@ governed by the differential policy below (R2).
 The supported lower-level API is deliberately small:
 
 ```elixir
-Gitility.merge_base(repo_or_odb, left_oid, right_oid)
-Gitility.ancestor?(repo_or_odb, ancestor_oid, descendant_oid)
+Gitility.merge_base(odb_or_snapshot, left_oid, right_oid)
+Gitility.ancestor?(odb_or_snapshot, ancestor_oid, descendant_oid)
 Gitility.peel(repo_or_odb, object_oid, to: :commit)
 
 Gitility.ODB.header(odb, oid)
@@ -631,7 +631,9 @@ Gitility.ODB.read_many(odb, oids, max_total_bytes: 8_000_000)
 ```
 
 Raw object access remains bounded and verifies type, declared size, and object
-hash.
+hash. `merge_base/4` and `ancestor?/4` accept `%Gitility.ODB{}` and
+`%Gitility.Snapshot{}` in Milestone 3; direct `%Gitility.Repository{}`
+acceptance arrives with Milestone 4's repository composition.
 
 ### Jobs, awaiting, and cancellation
 
@@ -1643,6 +1645,13 @@ out multi-GB-sparse or per-node hydration proves wasteful at fleet density;
 until then 1.0's remote story is hydrate-then-query.
 
 ### Milestone 3 — semantic exploration
+
+Decision record (M3a review): chronological/date equal-time ties follow Git's
+FIFO priority-queue insertion order; `since` prunes the parent graph at older
+commits while `until` remains an emit filter; and local `shallow` entries are
+parentless graph roots for log and ancestry. These outcomes supersede the
+earlier OID tie-break and shallow-error text; see
+[`m3a-review-fixes.md`](milestones/m3a-review-fixes.md).
 
 1. Implement literal and safe-regex search.
 2. Implement commit log (including first-parent), ancestry, and merge base.

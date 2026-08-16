@@ -8,15 +8,13 @@
 //! wildmatch and literal patterns select both an exact path and its contents.
 
 use crate::budget::Budget;
-use crate::cursor::{self, Cursor, CursorExpected, OPERATION_LIST_TREE};
+use crate::cursor::{self, Cursor, CursorExpected, MAX_CURSOR_BYTES, OPERATION_LIST_TREE};
 use crate::decode::decode_tree;
 use crate::error::{Error, ErrorCode};
 use crate::object::{HashKind, ObjectKind, Oid};
 use crate::odb::{HeaderProvenance, ObjectDb};
 use crate::pathspec::PathspecMatcher;
 use crate::snapshot::Snapshot;
-
-const MAX_CURSOR_BYTES: usize = 4096;
 
 /// The semantic kind derived from a Git tree entry's mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -13,8 +13,10 @@
 //! with the operation.
 
 use crate::error::{Error, ErrorCode};
+use crate::object::Oid;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// The countable ceilings, mirroring `Gitility.Limits` (the timeout is
@@ -54,6 +56,14 @@ pub struct Budget {
     cancelled: Arc<AtomicBool>,
     /// Charges against `max_objects`, including header lookups.
     objects: AtomicU64,
+    /// Nesting depth for graph reads whose distinct-visit charge is managed by
+    /// the traversal rather than by the object-store call.
+    object_charge_suspensions: AtomicU64,
+    /// Nesting depth for a repeated graph payload whose first read was already
+    /// charged in this job.
+    duplicate_graph_read_suspensions: AtomicU64,
+    /// Object IDs whose graph payload bytes were already accounted once.
+    graph_reads: Mutex<HashSet<Oid>>,
     /// Payload reads exposed through query stats; headers are not reads.
     objects_read: AtomicU64,
     object_bytes: AtomicU64,
@@ -75,6 +85,9 @@ impl Budget {
             deadline,
             cancelled,
             objects: AtomicU64::new(0),
+            object_charge_suspensions: AtomicU64::new(0),
+            duplicate_graph_read_suspensions: AtomicU64::new(0),
+            graph_reads: Mutex::new(HashSet::new()),
             objects_read: AtomicU64::new(0),
             object_bytes: AtomicU64::new(0),
             provider_requests: AtomicU64::new(0),
@@ -159,14 +172,68 @@ impl Budget {
             )
             .with_limit("max_object_bytes"));
         }
-        charge(&self.objects, 1, self.limits.max_objects, "max_objects")?;
-        self.objects_read.fetch_add(1, Ordering::Relaxed);
-        charge(
-            &self.object_bytes,
-            bytes,
-            self.limits.max_total_object_bytes,
-            "max_total_object_bytes",
-        )
+        if self.object_charge_suspensions.load(Ordering::Relaxed) == 0 {
+            charge(&self.objects, 1, self.limits.max_objects, "max_objects")?;
+        }
+        if self
+            .duplicate_graph_read_suspensions
+            .load(Ordering::Relaxed)
+            == 0
+        {
+            self.objects_read.fetch_add(1, Ordering::Relaxed);
+            charge(
+                &self.object_bytes,
+                bytes,
+                self.limits.max_total_object_bytes,
+                "max_total_object_bytes",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Charges one graph-visit against `max_objects` without claiming an
+    /// additional payload read. Commit walks use this because `max_objects`
+    /// governs distinct commits visited rather than payload fetch count.
+    pub(crate) fn charge_object_visit(&self) -> Result<(), Error> {
+        self.check()?;
+        charge(&self.objects, 1, self.limits.max_objects, "max_objects")
+    }
+
+    /// Runs one synchronous object-store read without its normal
+    /// `max_objects` charge. All other limits, counters, cache statistics,
+    /// cancellation, and timeout behavior remain active.
+    pub(crate) fn without_object_charge<T>(&self, oid: Oid, read: impl FnOnce() -> T) -> T {
+        struct Restore<'a> {
+            object: &'a AtomicU64,
+            duplicate: Option<&'a AtomicU64>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.object.fetch_sub(1, Ordering::Relaxed);
+                if let Some(duplicate) = self.duplicate {
+                    duplicate.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let duplicate = !self
+            .graph_reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(oid);
+        self.object_charge_suspensions
+            .fetch_add(1, Ordering::Relaxed);
+        if duplicate {
+            self.duplicate_graph_read_suspensions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let restore = Restore {
+            object: &self.object_charge_suspensions,
+            duplicate: duplicate.then_some(&self.duplicate_graph_read_suspensions),
+        };
+        let result = read();
+        drop(restore);
+        result
     }
 
     /// Charges a header lookup against the object-count ceiling only.

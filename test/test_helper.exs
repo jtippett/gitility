@@ -2,12 +2,21 @@ project_root = Path.expand("..", __DIR__)
 fixture_generator = Path.join([project_root, "fixtures", "generate.sh"])
 generated_fixtures = Path.join([project_root, "fixtures", "generated"])
 completion_marker = Path.join(generated_fixtures, "OIDS")
+hash_marker = Path.join(generated_fixtures, "GENERATOR_HASH")
 
 Code.require_file("differential/oracle.ex", __DIR__)
 Code.require_file("differential/allowlist.ex", __DIR__)
 
-unless File.regular?(completion_marker) do
-  IO.puts("Generated fixture corpus is missing or incomplete; running fixtures/generate.sh")
+{generator_hash, 0} = System.cmd("git", ["hash-object", fixture_generator])
+fixtures_current? =
+  File.regular?(completion_marker) and
+    case File.read(hash_marker) do
+      {:ok, hash} -> String.trim(hash) == String.trim(generator_hash)
+      {:error, _reason} -> false
+    end
+
+unless fixtures_current? do
+  IO.puts("Generated fixture corpus is missing, incomplete, or stale; running fixtures/generate.sh")
 
   case System.cmd("bash", [fixture_generator],
          cd: project_root,

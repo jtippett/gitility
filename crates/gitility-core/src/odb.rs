@@ -10,6 +10,7 @@
 use crate::budget::Budget;
 use crate::error::Error;
 use crate::object::{HashKind, ObjectHeader, ObjectKind, Oid};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// One shared payload result in a batch, retaining misses as `None`.
@@ -56,6 +57,13 @@ pub trait ObjectDb: Send + Sync + 'static {
     /// The hash algorithm every object in this store is addressed by.
     fn hash_kind(&self) -> HashKind;
 
+    /// Commit IDs whose encoded parents are hidden by a local shallow
+    /// boundary. Stores without repository-level shallow metadata return
+    /// `None`; algorithms then use the encoded parents normally.
+    fn shallow_roots(&self) -> Option<&HashSet<Oid>> {
+        None
+    }
+
     /// Reads an object's type and size without its payload, or `None` if
     /// the store does not have it. Charged against the budget by the
     /// implementation.
@@ -85,6 +93,18 @@ pub trait ObjectDb: Send + Sync + 'static {
         out: &mut Vec<u8>,
         budget: &Budget,
     ) -> Result<Option<ObjectKind>, Error>;
+
+    /// Reads a payload while charging bytes and read statistics but leaving
+    /// graph-visit accounting to the caller. Commit-graph algorithms use this
+    /// to avoid charging cursor replay or a DTO reread against `max_objects`.
+    fn try_find_graph(
+        &self,
+        oid: &Oid,
+        out: &mut Vec<u8>,
+        budget: &Budget,
+    ) -> Result<Option<ObjectKind>, Error> {
+        budget.without_object_charge(*oid, || self.try_find(oid, out, budget))
+    }
 
     /// Reads a batch of objects in input order. Providers override this to
     /// make one callback round trip; local stores keep the simple default.

@@ -3,9 +3,10 @@ defmodule Gitility.Commit do
   A decoded commit.
 
   Every byte field remains exactly as Git encoded it. `subject` is the first
-  message line capped at 1 KiB, and `message_raw` is capped at 64 KiB with
-  `message_truncated` making that cap explicit. `signature_headers` contains
-  header names only (`"gpgsig"`, …), never signature payloads.
+  message line capped at 1 KiB with `subject_truncated` making that cap
+  explicit, and `message_raw` is capped at 64 KiB with `message_truncated`
+  doing the same. `signature_headers` contains header names only (`"gpgsig"`,
+  …), never signature payloads.
   """
 
   @enforce_keys [
@@ -15,6 +16,7 @@ defmodule Gitility.Commit do
     :author,
     :committer,
     :subject,
+    :subject_truncated,
     :message_raw,
     :message_truncated
   ]
@@ -23,6 +25,7 @@ defmodule Gitility.Commit do
     :parents,
     :tree_id,
     :subject,
+    :subject_truncated,
     :author,
     :committer,
     :message_raw,
@@ -38,6 +41,7 @@ defmodule Gitility.Commit do
           author: Gitility.Identity.t(),
           committer: Gitility.Identity.t(),
           subject: binary(),
+          subject_truncated: boolean(),
           message_raw: binary(),
           message_truncated: boolean(),
           signature_headers: [binary()],

@@ -3,11 +3,13 @@
 
 use crate::budget::Budget;
 use crate::error::{Error, ErrorCode};
+use crate::lru::LruCache;
 use crate::object::{HashKind, ObjectKind, Oid};
 use crate::odb::ObjectDb;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
+
+const PAYLOAD_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct GixFind<'a> {
@@ -17,8 +19,9 @@ pub(crate) struct GixFind<'a> {
 struct State<'a> {
     store: &'a dyn ObjectDb,
     budget: &'a Budget,
-    objects: HashMap<Oid, (ObjectKind, Vec<u8>)>,
+    objects: LruCache<Oid, (ObjectKind, Vec<u8>)>,
     first_error: Option<Error>,
+    current_oid: Option<Oid>,
 }
 
 impl<'a> GixFind<'a> {
@@ -27,8 +30,9 @@ impl<'a> GixFind<'a> {
             state: Rc::new(RefCell::new(State {
                 store,
                 budget,
-                objects: HashMap::new(),
+                objects: LruCache::new(PAYLOAD_CACHE_BYTES),
                 first_error: None,
+                current_oid: None,
             })),
         }
     }
@@ -39,35 +43,35 @@ impl<'a> GixFind<'a> {
             return Err(Error::new(
                 ErrorCode::NotACommit,
                 format!("object {oid} is not a commit"),
-            ));
+            )
+            .with_oid(oid));
         }
         Ok(())
     }
 
-    pub(crate) fn commit_payload(&self, oid: Oid) -> Result<Vec<u8>, Error> {
-        let (kind, payload) = self.object(oid)?;
-        if kind != ObjectKind::Commit {
-            return Err(Error::new(
-                ErrorCode::MalformedObject,
-                format!("commit graph parent {oid} is not a commit"),
-            ));
-        }
-        Ok(payload)
+    pub(crate) fn clear_error_scope(&self) {
+        let mut state = self.state.borrow_mut();
+        state.first_error = None;
+        state.current_oid = None;
     }
 
-    pub(crate) fn error_or(&self, code: ErrorCode, message: &'static str) -> Error {
-        self.state
-            .borrow()
-            .first_error
-            .clone()
-            .unwrap_or_else(|| Error::new(code, message))
+    pub(crate) fn take_error_or(&self, code: ErrorCode, message: &'static str) -> Error {
+        let mut state = self.state.borrow_mut();
+        state.first_error.take().unwrap_or_else(|| {
+            let error = Error::new(code, message);
+            match state.current_oid {
+                Some(oid) => error.with_oid(oid),
+                None => error,
+            }
+        })
     }
 
     fn object(&self, oid: Oid) -> Result<(ObjectKind, Vec<u8>), Error> {
         let mut state = self.state.borrow_mut();
         state.budget.check()?;
-        if let Some((kind, payload)) = state.objects.get(&oid) {
-            return Ok((*kind, payload.clone()));
+        state.current_oid = Some(oid);
+        if let Some((kind, payload)) = state.objects.get_cloned(&oid) {
+            return Ok((kind, payload));
         }
 
         let mut payload = Vec::new();
@@ -79,13 +83,39 @@ impl<'a> GixFind<'a> {
                 return Err(error);
             }
             Err(error) => {
+                let error = error.with_oid_if_none(oid);
                 record_first_error(&mut state, &error);
                 return Err(error);
             }
         };
-        state.objects.insert(oid, (kind, payload.clone()));
+        if kind == ObjectKind::Commit
+            && state
+                .store
+                .shallow_roots()
+                .is_some_and(|roots| roots.contains(&oid))
+        {
+            payload = without_parent_headers(&payload);
+        }
+        state
+            .objects
+            .insert(oid, (kind, payload.clone()), payload.len() as u64);
         Ok((kind, payload))
     }
+}
+
+fn without_parent_headers(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len());
+    let mut in_headers = true;
+    for line in payload.split_inclusive(|byte| *byte == b'\n') {
+        if in_headers && line == b"\n" {
+            in_headers = false;
+        }
+        if in_headers && line.starts_with(b"parent ") {
+            continue;
+        }
+        out.extend_from_slice(line);
+    }
+    out
 }
 
 impl gix_object::Find for GixFind<'_> {

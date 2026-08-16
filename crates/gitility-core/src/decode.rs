@@ -192,7 +192,7 @@ pub fn decode_tree(payload: &[u8], hash_kind: HashKind) -> TreeIter<'_> {
     }
 }
 
-fn decode_identity(raw: &[u8]) -> Result<Identity, Error> {
+pub(crate) fn decode_identity(raw: &[u8]) -> Result<Identity, Error> {
     let left = raw
         .iter()
         .position(|byte| *byte == b'<')

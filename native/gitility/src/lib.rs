@@ -263,6 +263,10 @@ impl ObjectDb for SharedStore {
         self.as_dyn().hash_kind()
     }
 
+    fn shallow_roots(&self) -> Option<&HashSet<Oid>> {
+        self.as_dyn().shallow_roots()
+    }
+
     fn try_header(&self, oid: &Oid, budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
         self.as_dyn().try_header(oid, budget)
     }
@@ -662,6 +666,8 @@ struct ErrorMap<'a> {
     limit: Option<String>,
     layer: Option<u64>,
     oid: Option<Binary<'a>>,
+    order: Option<String>,
+    file: Option<String>,
 }
 
 #[derive(NifMap)]
@@ -709,7 +715,7 @@ struct IdentityMap<'a> {
     email: Binary<'a>,
     time: i64,
     tz: Binary<'a>,
-    tz_offset_minutes: i32,
+    tz_offset_minutes: Option<i32>,
 }
 
 #[derive(NifMap)]
@@ -720,6 +726,7 @@ struct CommitMap<'a> {
     author: IdentityMap<'a>,
     committer: IdentityMap<'a>,
     subject: Binary<'a>,
+    subject_truncated: bool,
     message_raw: Binary<'a>,
     message_truncated: bool,
     signature_headers: Vec<Binary<'a>>,
@@ -2390,6 +2397,7 @@ fn encode_job_output<'a>(
                         author: identity_map(env, commit.author),
                         committer: identity_map(env, commit.committer),
                         subject: binary(env, &commit.subject),
+                        subject_truncated: commit.subject_truncated,
                         message_raw: binary(env, &commit.message_raw),
                         message_truncated: commit.message_truncated,
                         signature_headers: commit
@@ -2800,6 +2808,8 @@ fn error_map<'a>(env: Env<'a>, error: Error) -> NifResult<ErrorMap<'a>> {
         limit: error.limit.map(str::to_owned),
         layer: error.layer,
         oid: error.object_oid.map(|oid| binary(env, oid.as_bytes())),
+        order: error.order.map(|order| order.as_str().to_owned()),
+        file: error.file.map(|file| file.as_str().to_owned()),
     })
 }
 

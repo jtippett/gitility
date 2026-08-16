@@ -6,7 +6,8 @@ use crate::error::{Error, ErrorCode};
 use crate::object::HashKind;
 
 const VERSION: u8 = 0x01;
-const MAX_CURSOR_BYTES: usize = 4096;
+/// Maximum encoded cursor size accepted or produced by any operation.
+pub const MAX_CURSOR_BYTES: usize = 4096;
 const CRC_BYTES: usize = 4;
 
 /// Frozen v1 operation tag for tree listings.

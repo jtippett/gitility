@@ -4,18 +4,16 @@
 //! skips through the recorded position, so its cost is O(prefix).
 
 use crate::budget::Budget;
-use crate::commit_graph::{from_gix_oid, to_gix_oid, GixFind};
-use crate::cursor::{self, Cursor, CursorExpected, OPERATION_LOG};
-use crate::decode::{decode_commit, Identity};
-use crate::error::{Error, ErrorCode};
-use crate::object::Oid;
+use crate::cursor::{self, Cursor, CursorExpected, MAX_CURSOR_BYTES, OPERATION_LOG};
+use crate::decode::{decode_identity, Identity};
+use crate::error::{Error, ErrorCode, ErrorOrder};
+use crate::object::{HashKind, ObjectKind, Oid};
 use crate::odb::ObjectDb;
 use crate::snapshot::Snapshot;
 use crate::tree::QueryStats;
-use gix_traverse::commit::{simple, topo, Info, Parents, Simple};
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
-const MAX_CURSOR_BYTES: usize = 4096;
 const SUBJECT_BYTES: usize = 1024;
 const MESSAGE_BYTES: usize = 64 * 1024;
 
@@ -63,8 +61,9 @@ pub struct LogIdentity {
     pub time: i64,
     /// The exact raw timezone header, retaining encodings such as `-0000`.
     pub tz: Vec<u8>,
-    /// Parsed UTC offset in minutes. Both `+0000` and `-0000` map to zero.
-    pub tz_offset_minutes: i32,
+    /// Parsed UTC offset in minutes. Malformed or out-of-range raw values are
+    /// retained in `tz` and represented here as `None`.
+    pub tz_offset_minutes: Option<i32>,
 }
 
 /// One bounded, byte-preserving commit result.
@@ -76,6 +75,7 @@ pub struct LogCommit {
     pub author: LogIdentity,
     pub committer: LogIdentity,
     pub subject: Vec<u8>,
+    pub subject_truncated: bool,
     pub message_raw: Vec<u8>,
     pub message_truncated: bool,
     /// Raw signature-bearing header names only, never their payloads.
@@ -124,17 +124,15 @@ pub fn log(
         .map(|bytes| decode_resume(bytes, expected, snapshot.commit_oid.kind()))
         .transpose()?;
 
-    let reader = GixFind::new(store, budget);
-    reader.validate_commit(snapshot.commit_oid)?;
-    let mut walk = StableWalk::new(snapshot.commit_oid, opts, reader.clone())?;
+    let mut walk = Walk::new(store, snapshot.commit_oid, opts, budget)?;
     let mut found_resume = resume.is_none();
     let mut commits = Vec::with_capacity(opts.limit.min(1_024));
     let mut stopped_by = None;
 
     loop {
         budget.check()?;
-        let id = match walk.next() {
-            Some(Ok(id)) => id,
+        let walked = match walk.next(found_resume) {
+            Some(Ok(walked)) => walked,
             Some(Err(error)) if truncatable(&error) && !commits.is_empty() => {
                 stopped_by = Some(error.limit.unwrap_or("budget"));
                 break;
@@ -144,21 +142,44 @@ pub fn log(
         };
 
         if !found_resume {
-            if Some(id) == resume {
+            if Some(walked.id) == resume {
                 found_resume = true;
             }
             continue;
         }
 
-        let decoded = decode_log_commit(id, &reader.commit_payload(id)?)?;
-        if !within_time_bounds(decoded.committer.time, opts) {
+        if !within_time_bounds(walked.time, opts) {
             continue;
         }
         if commits.len() == opts.limit {
             stopped_by = Some("limit");
             break;
         }
+        let payload = match read_payload(store, walked.id, budget, false) {
+            Ok(payload) => payload,
+            Err(error) if truncatable(&error) && !commits.is_empty() => {
+                stopped_by = Some(error.limit.unwrap_or("budget"));
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let shallow = store
+            .shallow_roots()
+            .is_some_and(|roots| roots.contains(&walked.id));
+        let decoded = decode_log_commit(walked.id, &payload, shallow)?;
         commits.push(decoded);
+
+        if let Some(error) = walk.take_pending_error() {
+            if truncatable(&error) && !commits.is_empty() {
+                stopped_by = Some(error.limit.unwrap_or("budget"));
+                break;
+            }
+            return Err(error);
+        }
+        if commits.len() == opts.limit && walk.has_matching(opts) {
+            stopped_by = Some("limit");
+            break;
+        }
     }
 
     if !found_resume {
@@ -223,250 +244,600 @@ pub fn log(
     })
 }
 
-type RawWalk<'a> = Box<dyn Iterator<Item = Result<Info, Error>> + 'a>;
-
-struct StableWalk<'a> {
-    raw: RawWalk<'a>,
-    reader: GixFind<'a>,
-    pending: Option<(Info, i64)>,
-    pending_error: Option<Error>,
-    ready: VecDeque<Info>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitMeta {
+    parents: Vec<Oid>,
+    time: i64,
 }
 
-impl<'a> StableWalk<'a> {
-    fn new(start: Oid, opts: &LogOptions, reader: GixFind<'a>) -> Result<Self, Error> {
-        let start = to_gix_oid(start)?;
-        let parents = if opts.first_parent {
-            Parents::First
-        } else {
-            Parents::All
-        };
-        let errors = reader.clone();
-        let raw: RawWalk<'a> = match opts.order {
-            LogOrder::Chronological => {
-                let walk = Simple::new([start], reader.clone())
-                    .sorting(simple::Sorting::ByCommitTime(
-                        simple::CommitTimeOrder::NewestFirst,
-                    ))
-                    .map_err(|_| {
-                        errors.error_or(
-                            ErrorCode::MalformedObject,
-                            "commit traversal could not decode a commit",
-                        )
-                    })?
-                    .parents(parents);
-                let errors = errors.clone();
-                Box::new(walk.map(move |item| {
-                    item.map_err(|_| {
-                        errors.error_or(
-                            ErrorCode::MalformedObject,
-                            "commit traversal could not decode a commit",
-                        )
-                    })
-                }))
-            }
+#[derive(Debug, PartialEq, Eq)]
+struct TimedCommit {
+    id: Oid,
+    meta: CommitMeta,
+    sequence: u64,
+}
+
+impl Ord for TimedCommit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.meta
+            .time
+            .cmp(&other.meta.time)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+impl PartialOrd for TimedCommit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WalkedCommit {
+    id: Oid,
+    time: i64,
+}
+
+enum Walk<'a> {
+    Chronological(ChronologicalWalk<'a>),
+    Ordered(OrderedWalk),
+}
+
+impl<'a> Walk<'a> {
+    fn new(
+        store: &'a dyn ObjectDb,
+        start: Oid,
+        opts: &'a LogOptions,
+        budget: &'a Budget,
+    ) -> Result<Self, Error> {
+        match opts.order {
+            LogOrder::Chronological => Ok(Self::Chronological(ChronologicalWalk::new(
+                store, start, opts, budget,
+            )?)),
             LogOrder::Topological | LogOrder::DateOrder => {
-                let sorting = match opts.order {
-                    LogOrder::Topological => topo::Sorting::TopoOrder,
-                    LogOrder::DateOrder => topo::Sorting::DateOrder,
-                    LogOrder::Chronological => unreachable!("matched above"),
-                };
-                let walk = topo::Builder::from_iters(
-                    reader.clone(),
-                    [start],
-                    None::<[gix_hash::ObjectId; 0]>,
-                )
-                .sorting(sorting)
-                .parents(parents)
-                .build()
-                .map_err(|_| {
-                    errors.error_or(
-                        ErrorCode::MalformedObject,
-                        "topological traversal could not decode a commit",
-                    )
-                })?;
-                let errors = errors.clone();
-                Box::new(walk.map(move |item| {
-                    item.map_err(|_| {
-                        errors.error_or(
-                            ErrorCode::MalformedObject,
-                            "topological traversal could not decode a commit",
-                        )
-                    })
-                }))
+                Ok(Self::Ordered(OrderedWalk::new(store, start, opts, budget)?))
             }
-        };
+        }
+    }
+
+    fn next(&mut self, charge_visit: bool) -> Option<Result<WalkedCommit, Error>> {
+        match self {
+            Self::Chronological(walk) => walk.next(charge_visit),
+            Self::Ordered(walk) => walk.next(),
+        }
+    }
+
+    fn take_pending_error(&mut self) -> Option<Error> {
+        match self {
+            Self::Chronological(walk) => walk.pending_error.take(),
+            Self::Ordered(_) => None,
+        }
+    }
+
+    fn has_matching(&self, opts: &LogOptions) -> bool {
+        match self {
+            Self::Chronological(walk) => {
+                walk.pending_error.is_some()
+                    || walk
+                        .queue
+                        .iter()
+                        .any(|commit| within_time_bounds(commit.meta.time, opts))
+            }
+            Self::Ordered(walk) => walk.has_matching(opts),
+        }
+    }
+}
+
+struct ChronologicalWalk<'a> {
+    store: &'a dyn ObjectDb,
+    opts: &'a LogOptions,
+    budget: &'a Budget,
+    queue: BinaryHeap<TimedCommit>,
+    seen: HashSet<Oid>,
+    next_sequence: u64,
+    pending_error: Option<Error>,
+}
+
+impl<'a> ChronologicalWalk<'a> {
+    fn new(
+        store: &'a dyn ObjectDb,
+        start: Oid,
+        opts: &'a LogOptions,
+        budget: &'a Budget,
+    ) -> Result<Self, Error> {
+        let meta = read_meta(store, start, opts, budget, true)?;
         Ok(Self {
-            raw,
-            reader,
-            pending: None,
+            store,
+            opts,
+            budget,
+            queue: BinaryHeap::from([TimedCommit {
+                id: start,
+                meta,
+                sequence: 0,
+            }]),
+            seen: HashSet::from([start]),
+            next_sequence: 1,
             pending_error: None,
-            ready: VecDeque::new(),
         })
     }
 
-    fn next(&mut self) -> Option<Result<Oid, Error>> {
-        if let Some(info) = self.ready.pop_front() {
-            return Some(from_gix_oid(info.id.as_ref()));
-        }
+    fn next(&mut self, charge_visit: bool) -> Option<Result<WalkedCommit, Error>> {
         if let Some(error) = self.pending_error.take() {
             return Some(Err(error));
         }
+        let current = self.queue.pop()?;
+        if let Err(error) = if charge_visit {
+            self.budget.charge_object_visit()
+        } else {
+            self.budget.check()
+        } {
+            return Some(Err(error));
+        }
 
-        let (first, time) = match self.pending.take() {
-            Some(value) => value,
-            None => match self.next_timed()? {
-                Ok(value) => value,
-                Err(error) => return Some(Err(error)),
-            },
-        };
-        let mut group = vec![first];
-        loop {
-            match self.next_timed() {
-                Some(Ok((info, next_time))) if next_time == time => group.push(info),
-                Some(Ok(value)) => {
-                    self.pending = Some(value);
-                    break;
+        for parent in &current.meta.parents {
+            if !self.seen.insert(*parent) {
+                continue;
+            }
+            match read_meta(self.store, *parent, self.opts, self.budget, false) {
+                Ok(meta) => {
+                    self.queue.push(TimedCommit {
+                        id: *parent,
+                        meta,
+                        sequence: self.next_sequence,
+                    });
+                    self.next_sequence = self.next_sequence.saturating_add(1);
                 }
-                Some(Err(error)) => {
+                Err(error) => {
                     self.pending_error = Some(error);
                     break;
                 }
-                None => break,
             }
         }
-        self.ready = stable_topological_tie_order(group);
-        self.ready
-            .pop_front()
-            .map(|info| from_gix_oid(info.id.as_ref()))
+
+        Some(Ok(WalkedCommit {
+            id: current.id,
+            time: current.meta.time,
+        }))
+    }
+}
+
+struct OrderedNode {
+    meta: CommitMeta,
+    discovery: u64,
+}
+
+enum OrderedQueue {
+    Topological(Vec<Oid>),
+    Date(BinaryHeap<TimedOid>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TimedOid {
+    id: Oid,
+    time: i64,
+    sequence: u64,
+}
+
+impl Ord for TimedOid {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.time
+            .cmp(&other.time)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+impl PartialOrd for TimedOid {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct OrderedWalk {
+    nodes: HashMap<Oid, OrderedNode>,
+    child_counts: HashMap<Oid, usize>,
+    queue: OrderedQueue,
+    next_sequence: u64,
+    emitted: HashSet<Oid>,
+    residue: VecDeque<Oid>,
+}
+
+impl OrderedWalk {
+    fn new(
+        store: &dyn ObjectDb,
+        start: Oid,
+        opts: &LogOptions,
+        budget: &Budget,
+    ) -> Result<Self, Error> {
+        let mut pending = vec![start];
+        let mut nodes = HashMap::new();
+        let mut discovery = 0u64;
+        while let Some(id) = pending.pop() {
+            if nodes.contains_key(&id) {
+                continue;
+            }
+            budget
+                .charge_object_visit()
+                .map_err(|error| ordered_prepass_error(error, opts.order))?;
+            let meta = read_meta(store, id, opts, budget, id == start)?;
+            for parent in meta.parents.iter().rev() {
+                if !nodes.contains_key(parent) {
+                    pending.push(*parent);
+                }
+            }
+            nodes.insert(id, OrderedNode { meta, discovery });
+            discovery = discovery.saturating_add(1);
+        }
+
+        let mut child_counts = nodes
+            .keys()
+            .copied()
+            .map(|id| (id, 0usize))
+            .collect::<HashMap<_, _>>();
+        for node in nodes.values() {
+            for parent in &node.meta.parents {
+                if let Some(count) = child_counts.get_mut(parent) {
+                    *count += 1;
+                }
+            }
+        }
+        let mut initial = child_counts
+            .iter()
+            .filter_map(|(id, count)| (*count == 0).then_some(*id))
+            .collect::<Vec<_>>();
+        initial.sort_by_key(|id| {
+            let node = &nodes[id];
+            (node.meta.time, node.discovery)
+        });
+        let mut next_sequence = 0u64;
+        let queue = match opts.order {
+            LogOrder::Topological => OrderedQueue::Topological(initial),
+            LogOrder::DateOrder => {
+                let mut queue = BinaryHeap::new();
+                for id in initial.into_iter().rev() {
+                    queue.push(TimedOid {
+                        id,
+                        time: nodes[&id].meta.time,
+                        sequence: next_sequence,
+                    });
+                    next_sequence = next_sequence.saturating_add(1);
+                }
+                OrderedQueue::Date(queue)
+            }
+            LogOrder::Chronological => unreachable!("ordered walk excludes chronological"),
+        };
+        Ok(Self {
+            nodes,
+            child_counts,
+            queue,
+            next_sequence,
+            emitted: HashSet::new(),
+            residue: VecDeque::new(),
+        })
     }
 
-    fn next_timed(&mut self) -> Option<Result<(Info, i64), Error>> {
-        self.raw.next().map(|item| {
-            let info = item?;
-            let id = from_gix_oid(info.id.as_ref())?;
-            let payload = self.reader.commit_payload(id)?;
-            let time = decode_commit(&payload, id.kind())?.committer.time;
-            Ok((info, time))
+    fn next(&mut self) -> Option<Result<WalkedCommit, Error>> {
+        let (id, is_residue) = match self.pop_ready() {
+            Some(id) => (id, false),
+            None => (self.pop_residue()?, true),
+        };
+        let node = &self.nodes[&id];
+        let walked = WalkedCommit {
+            id,
+            time: node.meta.time,
+        };
+        let parents = node.meta.parents.clone();
+        self.emitted.insert(id);
+        if !is_residue {
+            for parent in parents {
+                let count = self
+                    .child_counts
+                    .get_mut(&parent)
+                    .expect("reachable parents have pre-pass child counts");
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.push_ready(parent);
+                }
+            }
+        }
+        Some(Ok(walked))
+    }
+
+    fn pop_ready(&mut self) -> Option<Oid> {
+        match &mut self.queue {
+            OrderedQueue::Topological(queue) => queue.pop(),
+            OrderedQueue::Date(queue) => queue.pop().map(|entry| entry.id),
+        }
+    }
+
+    fn push_ready(&mut self, id: Oid) {
+        match &mut self.queue {
+            OrderedQueue::Topological(queue) => queue.push(id),
+            OrderedQueue::Date(queue) => {
+                queue.push(TimedOid {
+                    id,
+                    time: self.nodes[&id].meta.time,
+                    sequence: self.next_sequence,
+                });
+                self.next_sequence = self.next_sequence.saturating_add(1);
+            }
+        }
+    }
+
+    fn pop_residue(&mut self) -> Option<Oid> {
+        if self.residue.is_empty() && self.emitted.len() < self.nodes.len() {
+            let mut residue = self
+                .nodes
+                .keys()
+                .filter(|id| !self.emitted.contains(id))
+                .copied()
+                .collect::<Vec<_>>();
+            residue.sort_unstable();
+            self.residue = residue.into();
+        }
+        self.residue.pop_back()
+    }
+
+    fn has_matching(&self, opts: &LogOptions) -> bool {
+        self.nodes.iter().any(|(id, node)| {
+            !self.emitted.contains(id) && within_time_bounds(node.meta.time, opts)
         })
     }
 }
 
-fn stable_topological_tie_order(group: Vec<Info>) -> VecDeque<Info> {
-    if group.len() < 2 {
-        return group.into();
+fn ordered_prepass_error(error: Error, order: LogOrder) -> Error {
+    if error.code == ErrorCode::BudgetExceeded && error.limit == Some("max_objects") {
+        let error_order = match order {
+            LogOrder::Topological => ErrorOrder::Topological,
+            LogOrder::DateOrder => ErrorOrder::Date,
+            LogOrder::Chronological => unreachable!("chronological order has no pre-pass"),
+        };
+        let order_name = error_order.as_str();
+        Error::new(
+            ErrorCode::BudgetExceeded,
+            format!(
+                ":{order_name} order requires limits.max_objects at or above the reachable commit count"
+            ),
+        )
+        .with_limit("max_objects")
+        .with_order(error_order)
+    } else {
+        error
     }
-
-    let mut by_id = group
-        .into_iter()
-        .map(|info| (info.id, info))
-        .collect::<HashMap<_, _>>();
-    let mut child_count = by_id
-        .keys()
-        .copied()
-        .map(|id| (id, 0usize))
-        .collect::<HashMap<_, _>>();
-    for info in by_id.values() {
-        for parent in &info.parent_ids {
-            if let Some(count) = child_count.get_mut(parent) {
-                *count += 1;
-            }
-        }
-    }
-    let mut ready = child_count
-        .iter()
-        .filter_map(|(id, count)| (*count == 0).then_some(*id))
-        .collect::<BinaryHeap<_>>();
-    let mut ordered = VecDeque::with_capacity(by_id.len());
-    while let Some(id) = ready.pop() {
-        let info = by_id
-            .remove(&id)
-            .expect("ready IDs originate in the equal-time group");
-        for parent in &info.parent_ids {
-            if let Some(count) = child_count.get_mut(parent) {
-                *count -= 1;
-                if *count == 0 {
-                    ready.push(*parent);
-                }
-            }
-        }
-        ordered.push_back(info);
-    }
-    debug_assert!(
-        by_id.is_empty(),
-        "commit parent links cannot contain cycles"
-    );
-    ordered
 }
 
-fn decode_log_commit(id: Oid, payload: &[u8]) -> Result<LogCommit, Error> {
-    let decoded = decode_commit(payload, id.kind())?;
-    let message_len = decoded.message.len().min(MESSAGE_BYTES);
-    let subject_end = decoded
-        .message
+fn read_meta(
+    store: &dyn ObjectDb,
+    id: Oid,
+    opts: &LogOptions,
+    budget: &Budget,
+    input: bool,
+) -> Result<CommitMeta, Error> {
+    let payload = read_payload(store, id, budget, input)?;
+    let (headers, _) = split_commit(&payload).map_err(|error| error.with_oid_if_none(id))?;
+    let mut parents = Vec::new();
+    let mut time = None;
+    for line in headers.split(|byte| *byte == b'\n') {
+        if line.starts_with(b" ") {
+            continue;
+        }
+        let (name, value) = split_header(line).map_err(|error| error.with_oid_if_none(id))?;
+        match name {
+            b"parent" => parents.push(parse_oid(value, id.kind(), "commit parent", id)?),
+            b"committer" => {
+                time = Some(identity_time(value).map_err(|error| error.with_oid_if_none(id))?)
+            }
+            _ => {}
+        }
+    }
+    let time = time.ok_or_else(|| {
+        Error::new(
+            ErrorCode::MalformedObject,
+            "commit payload is missing its committer header",
+        )
+        .with_oid(id)
+    })?;
+    if opts.first_parent {
+        parents.truncate(1);
+    }
+    if opts.since.is_some_and(|since| time < since)
+        || store
+            .shallow_roots()
+            .is_some_and(|roots| roots.contains(&id))
+    {
+        parents.clear();
+    }
+    Ok(CommitMeta { parents, time })
+}
+
+fn read_payload(
+    store: &dyn ObjectDb,
+    id: Oid,
+    budget: &Budget,
+    input: bool,
+) -> Result<Vec<u8>, Error> {
+    let mut payload = Vec::new();
+    let kind = store
+        .try_find_graph(&id, &mut payload, budget)
+        .map_err(|error| error.with_oid_if_none(id))?
+        .ok_or_else(|| {
+            Error::retryable(
+                ErrorCode::MissingObject,
+                format!("commit object {id} is missing from the object store"),
+            )
+            .with_oid(id)
+        })?;
+    if kind != ObjectKind::Commit {
+        return Err(Error::new(
+            if input {
+                ErrorCode::NotACommit
+            } else {
+                ErrorCode::MalformedObject
+            },
+            format!("object {id} reached by commit traversal is not a commit"),
+        )
+        .with_oid(id));
+    }
+    Ok(payload)
+}
+
+fn decode_log_commit(id: Oid, payload: &[u8], shallow: bool) -> Result<LogCommit, Error> {
+    let (headers, message) = split_commit(payload).map_err(|error| error.with_oid_if_none(id))?;
+    let message_len = message.len().min(MESSAGE_BYTES);
+    let subject_len = message
         .iter()
         .position(|byte| *byte == b'\n')
-        .unwrap_or(decoded.message.len())
-        .min(SUBJECT_BYTES);
-    let encoding = decoded
-        .extra_headers
-        .iter()
-        .find_map(|(name, value)| (name.as_slice() == b"encoding").then(|| value.clone()));
+        .unwrap_or(message.len());
+    let subject_end = subject_len.min(SUBJECT_BYTES);
+    let mut tree_id = None;
+    let mut parents = Vec::new();
+    let mut author = None;
+    let mut committer = None;
+    let mut signature_headers = Vec::new();
+    let mut encoding = None;
+    for line in headers.split(|byte| *byte == b'\n') {
+        if line.starts_with(b" ") {
+            continue;
+        }
+        let (name, value) = split_header(line).map_err(|error| error.with_oid_if_none(id))?;
+        match name {
+            b"tree" => tree_id = Some(parse_oid(value, id.kind(), "commit tree", id)?),
+            b"parent" => parents.push(parse_oid(value, id.kind(), "commit parent", id)?),
+            b"author" => {
+                author = Some(decode_identity(value).map_err(|error| error.with_oid_if_none(id))?)
+            }
+            b"committer" => {
+                committer =
+                    Some(decode_identity(value).map_err(|error| error.with_oid_if_none(id))?)
+            }
+            b"encoding" => encoding = Some(value.to_vec()),
+            name if is_signature_header(name) => signature_headers.push(name.to_vec()),
+            _ => {}
+        }
+    }
+    if shallow {
+        parents.clear();
+    }
     Ok(LogCommit {
         id,
-        parents: decoded.parents,
-        tree_id: decoded.tree_oid,
-        author: log_identity(decoded.author)?,
-        committer: log_identity(decoded.committer)?,
-        subject: decoded.message[..subject_end].to_vec(),
-        message_raw: decoded.message[..message_len].to_vec(),
-        message_truncated: decoded.message.len() > MESSAGE_BYTES,
-        signature_headers: decoded
-            .signature_headers
-            .into_iter()
-            .map(|(name, _payload)| name)
-            .collect(),
+        parents,
+        tree_id: tree_id.ok_or_else(|| malformed_for(id, "commit payload is missing its tree"))?,
+        author: log_identity(
+            author.ok_or_else(|| malformed_for(id, "commit payload is missing its author"))?,
+        ),
+        committer: log_identity(
+            committer
+                .ok_or_else(|| malformed_for(id, "commit payload is missing its committer"))?,
+        ),
+        subject: message[..subject_end].to_vec(),
+        subject_truncated: subject_len > SUBJECT_BYTES,
+        message_raw: message[..message_len].to_vec(),
+        message_truncated: message.len() > MESSAGE_BYTES,
+        signature_headers,
         encoding,
     })
 }
 
-fn log_identity(identity: Identity) -> Result<LogIdentity, Error> {
-    let tz_offset_minutes = timezone_offset_minutes(&identity.tz)?;
-    Ok(LogIdentity {
+fn log_identity(identity: Identity) -> LogIdentity {
+    let tz_offset_minutes = timezone_offset_minutes(&identity.tz);
+    LogIdentity {
         name: identity.name,
         email: identity.email,
         time: identity.time,
         tz: identity.tz,
         tz_offset_minutes,
-    })
+    }
 }
 
-fn timezone_offset_minutes(tz: &[u8]) -> Result<i32, Error> {
+fn timezone_offset_minutes(tz: &[u8]) -> Option<i32> {
     let [sign @ (b'+' | b'-'), h1, h2, m1, m2] = tz else {
-        return Err(Error::new(
-            ErrorCode::MalformedObject,
-            "commit identity timezone is malformed",
-        ));
+        return None;
     };
     if ![h1, h2, m1, m2]
         .into_iter()
         .all(|digit| digit.is_ascii_digit())
     {
-        return Err(Error::new(
-            ErrorCode::MalformedObject,
-            "commit identity timezone is malformed",
-        ));
+        return None;
     }
     let hours = i32::from(h1 - b'0') * 10 + i32::from(h2 - b'0');
     let minutes = i32::from(m1 - b'0') * 10 + i32::from(m2 - b'0');
-    if minutes >= 60 {
-        return Err(Error::new(
-            ErrorCode::MalformedObject,
-            "commit identity timezone has invalid minutes",
-        ));
+    if hours >= 24 || minutes >= 60 {
+        return None;
     }
     let offset = hours * 60 + minutes;
-    Ok(if *sign == b'-' { -offset } else { offset })
+    Some(if *sign == b'-' { -offset } else { offset })
+}
+
+fn split_commit(payload: &[u8]) -> Result<(&[u8], &[u8]), Error> {
+    let separator = payload
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::MalformedObject,
+                "commit payload has no message separator",
+            )
+        })?;
+    Ok((&payload[..separator], &payload[separator + 2..]))
+}
+
+fn split_header(line: &[u8]) -> Result<(&[u8], &[u8]), Error> {
+    let separator = line
+        .iter()
+        .position(|byte| *byte == b' ')
+        .ok_or_else(|| Error::new(ErrorCode::MalformedObject, "commit header is malformed"))?;
+    if separator == 0 || separator + 1 >= line.len() {
+        return Err(Error::new(
+            ErrorCode::MalformedObject,
+            "commit header is malformed",
+        ));
+    }
+    Ok((&line[..separator], &line[separator + 1..]))
+}
+
+fn identity_time(raw: &[u8]) -> Result<i64, Error> {
+    let right = raw
+        .iter()
+        .rposition(|byte| *byte == b'>')
+        .ok_or_else(|| Error::new(ErrorCode::MalformedObject, "commit identity is malformed"))?;
+    let suffix = raw
+        .get(right + 1..)
+        .and_then(|rest| rest.strip_prefix(b" "))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::MalformedObject,
+                "commit identity is missing its timestamp",
+            )
+        })?;
+    let timestamp = suffix
+        .split(|byte| *byte == b' ')
+        .next()
+        .filter(|value| !value.is_empty())
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::MalformedObject,
+                "commit identity timestamp is malformed",
+            )
+        })?;
+    Ok(timestamp)
+}
+
+fn parse_oid(raw: &[u8], kind: HashKind, field: &str, object: Oid) -> Result<Oid, Error> {
+    let text = std::str::from_utf8(raw).map_err(|_| malformed_for(object, field))?;
+    let oid = Oid::parse_hex(text).map_err(|_| malformed_for(object, field))?;
+    if oid.kind() != kind {
+        return Err(malformed_for(object, field));
+    }
+    Ok(oid)
+}
+
+fn is_signature_header(name: &[u8]) -> bool {
+    name == b"gpgsig" || name.starts_with(b"gpgsig-")
+}
+
+fn malformed_for(oid: Oid, message: &str) -> Error {
+    Error::new(ErrorCode::MalformedObject, message).with_oid(oid)
 }
 
 fn within_time_bounds(time: i64, opts: &LogOptions) -> bool {
@@ -529,7 +900,8 @@ mod tests {
     use super::*;
     use crate::budget::BudgetLimits;
     use crate::local_odb::LocalOdb;
-    use crate::object::{HashKind, ObjectKind};
+    use crate::object::{HashKind, ObjectHeader, ObjectKind};
+    use crate::snapshot::{peel, PeelTarget};
     use crate::static_odb::StaticOdb;
     use crate::test_support::{fixture_oid, fixture_repo};
     use crate::verify::object_id;
@@ -626,10 +998,11 @@ mod tests {
             let tied = [page.commits[2].id, page.commits[3].id];
             assert_eq!(
                 tied,
-                if graph.left > graph.right {
-                    [graph.left, graph.right]
-                } else {
-                    [graph.right, graph.left]
+                match order {
+                    LogOrder::Topological => [graph.right, graph.left],
+                    LogOrder::Chronological | LogOrder::DateOrder => {
+                        [graph.left, graph.right]
+                    }
                 }
             );
             assert_eq!(page.commits[4].id, graph.root);
@@ -712,18 +1085,89 @@ mod tests {
         .into_bytes();
         payload.extend_from_slice(&message);
         let id = object_id(HashKind::Sha1, ObjectKind::Commit, &payload).expect("commit hashes");
-        let commit = decode_log_commit(id, &payload).expect("DTO decodes");
+        let commit = decode_log_commit(id, &payload, false).expect("DTO decodes");
         assert_eq!(commit.subject.len(), SUBJECT_BYTES);
+        assert!(commit.subject_truncated);
         assert_eq!(commit.message_raw.len(), MESSAGE_BYTES);
         assert!(commit.message_truncated);
         assert_eq!(commit.author.name, "raw-\u{ff}".as_bytes());
-        assert_eq!(commit.author.tz_offset_minutes, 90);
-        assert_eq!(commit.committer.tz_offset_minutes, -150);
+        assert_eq!(commit.author.tz_offset_minutes, Some(90));
+        assert_eq!(commit.committer.tz_offset_minutes, Some(-150));
         assert_eq!(
             commit.signature_headers,
             [b"gpgsig".to_vec(), b"gpgsig-sha256".to_vec()]
         );
         assert_eq!(commit.encoding, Some(b"ISO-8859-1".to_vec()));
+    }
+
+    #[test]
+    fn malformed_timezones_are_tolerated_and_negative_zero_is_numeric_zero() {
+        let tree = object_id(HashKind::Sha1, ObjectKind::Tree, &[]).expect("tree hashes");
+        for (timezone, expected) in [
+            ("+0099", None),
+            ("0000", None),
+            ("+051800", None),
+            ("-0000", Some(0)),
+        ] {
+            let payload = format!(
+                "tree {}\nauthor A <a@example.invalid> 1 {timezone}\ncommitter C <c@example.invalid> 2 {timezone}\n\nmessage\n",
+                tree.to_hex()
+            )
+            .into_bytes();
+            let id = object_id(HashKind::Sha1, ObjectKind::Commit, &payload)
+                .expect("timezone probe commit hashes");
+            let commit = decode_log_commit(id, &payload, false).expect("timezone is tolerated");
+            assert_eq!(commit.author.tz, timezone.as_bytes());
+            assert_eq!(commit.author.tz_offset_minutes, expected);
+            assert_eq!(commit.committer.tz_offset_minutes, expected);
+        }
+    }
+
+    #[test]
+    fn decode_failures_name_the_commit_and_payload_reads_are_bounded_to_metadata_plus_dto() {
+        let tree = object_id(HashKind::Sha1, ObjectKind::Tree, &[]).expect("tree hashes");
+        let malformed_payload = format!(
+            "tree {}\nauthor malformed 1 +0000\ncommitter C <c@example.invalid> 2 +0000\n\nmessage\n",
+            tree.to_hex()
+        )
+        .into_bytes();
+        let malformed_id = object_id(HashKind::Sha1, ObjectKind::Commit, &malformed_payload)
+            .expect("malformed probe hashes");
+        let malformed_store = StaticOdb::from_addressed_objects(
+            HashKind::Sha1,
+            [(malformed_id, ObjectKind::Commit, malformed_payload)],
+        )
+        .expect("hostile addressed store loads");
+        let error = log(
+            &malformed_store,
+            &Snapshot {
+                commit_oid: malformed_id,
+                tree_oid: tree,
+            },
+            &LogOptions::default(),
+            &Budget::unlimited(),
+        )
+        .expect_err("malformed emitted DTO fails");
+        assert_eq!(error.code, ErrorCode::MalformedObject);
+        assert_eq!(error.object_oid, Some(malformed_id));
+
+        let root_object = commit(tree, &[], 3, b"root\n");
+        let root = root_object.0;
+        let payload_bytes = root_object.2.len() as u64;
+        let store = StaticOdb::from_addressed_objects(HashKind::Sha1, [root_object])
+            .expect("single commit store loads");
+        let page = log(
+            &store,
+            &Snapshot {
+                commit_oid: root,
+                tree_oid: tree,
+            },
+            &LogOptions::default(),
+            &Budget::unlimited(),
+        )
+        .expect("single commit log succeeds");
+        assert_eq!(page.stats.objects_read, 1);
+        assert_eq!(page.stats.bytes_read, payload_bytes);
     }
 
     #[test]
@@ -789,6 +1233,7 @@ mod tests {
         for (repository_name, head_name) in [
             ("sha1-graph.git", "sha1_graph_head"),
             ("sha1-history.git", "sha1_history_head"),
+            ("sha1-history-shallow.git", "sha1_history_head"),
             ("sha1-basic.git", "sha1_basic_head"),
         ] {
             let repository = fixture_repo(repository_name);
@@ -890,6 +1335,343 @@ mod tests {
                 .collect::<Vec<_>>(),
                 git_oids(&repository, &["rev-list", &since_arg, &until_arg, "main"],),
                 "{repository_name} since/until"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_time_skew_shallow_and_annotated_tag_shapes_match_git() {
+        let graph_repo = fixture_repo("sha1-graph.git");
+        let (graph_store, _) =
+            LocalOdb::open(&graph_repo, Default::default()).expect("graph fixture opens");
+        let equal_tip = fixture_oid("sha1_graph_equal_merge");
+        let equal_snapshot =
+            Snapshot::open(&graph_store, equal_tip, &Budget::unlimited()).expect("snapshot opens");
+        for (order, flag) in [
+            (LogOrder::Chronological, None),
+            (LogOrder::Topological, Some("--topo-order")),
+            (LogOrder::DateOrder, Some("--date-order")),
+        ] {
+            let mut arguments = vec!["rev-list"];
+            arguments.extend(flag);
+            arguments.push("fixture/equal-merge");
+            let expected = git_oids(&graph_repo, &arguments);
+            let page = log(
+                &graph_store,
+                &equal_snapshot,
+                &LogOptions {
+                    order,
+                    ..LogOptions::default()
+                },
+                &Budget::unlimited(),
+            )
+            .expect("equal-time walk succeeds");
+            assert_eq!(
+                page.commits
+                    .iter()
+                    .map(|commit| commit.id.to_hex())
+                    .collect::<Vec<_>>(),
+                expected,
+                "equal-time {order:?}"
+            );
+
+            let mut cursor = None;
+            let mut paged = Vec::new();
+            loop {
+                let page = log(
+                    &graph_store,
+                    &equal_snapshot,
+                    &LogOptions {
+                        order,
+                        limit: 3,
+                        cursor,
+                        ..LogOptions::default()
+                    },
+                    &Budget::unlimited(),
+                )
+                .expect("equal-time cursor page succeeds");
+                paged.extend(page.commits.into_iter().map(|commit| commit.id.to_hex()));
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(paged, expected, "equal-time paged {order:?}");
+        }
+
+        let main_snapshot = Snapshot::open(
+            &graph_store,
+            fixture_oid("sha1_graph_head"),
+            &Budget::unlimited(),
+        )
+        .expect("main snapshot opens");
+        for (order, flag) in [
+            (LogOrder::Chronological, None),
+            (LogOrder::Topological, Some("--topo-order")),
+            (LogOrder::DateOrder, Some("--date-order")),
+        ] {
+            for (since, until) in [(Some(988_675_800), None), (None, Some(988_675_800))] {
+                let mut owned_arguments = vec!["rev-list".to_owned()];
+                owned_arguments.extend(flag.map(str::to_owned));
+                owned_arguments.extend(since.map(|value| format!("--since=@{value}")));
+                owned_arguments.extend(until.map(|value| format!("--until=@{value}")));
+                owned_arguments.push("main".to_owned());
+                let arguments = owned_arguments
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    log(
+                        &graph_store,
+                        &main_snapshot,
+                        &LogOptions {
+                            order,
+                            since,
+                            until,
+                            ..LogOptions::default()
+                        },
+                        &Budget::unlimited(),
+                    )
+                    .expect("skew time-bound walk succeeds")
+                    .commits
+                    .into_iter()
+                    .map(|commit| commit.id.to_hex())
+                    .collect::<Vec<_>>(),
+                    git_oids(&graph_repo, &arguments),
+                    "skew {order:?} since={since:?} until={until:?}"
+                );
+            }
+
+            let empty = log(
+                &graph_store,
+                &main_snapshot,
+                &LogOptions {
+                    order,
+                    since: Some(2_000_000_000),
+                    ..LogOptions::default()
+                },
+                &Budget::unlimited(),
+            )
+            .expect("narrow empty window succeeds");
+            assert!(empty.commits.is_empty());
+            assert!(!empty.truncated);
+            assert!(empty.next_cursor.is_none());
+        }
+
+        let shallow_repo = fixture_repo("sha1-history-shallow.git");
+        let (shallow_store, _) =
+            LocalOdb::open(&shallow_repo, Default::default()).expect("shallow fixture opens");
+        let shallow_snapshot = Snapshot::open(
+            &shallow_store,
+            fixture_oid("sha1_history_head"),
+            &Budget::unlimited(),
+        )
+        .expect("shallow snapshot opens");
+        let shallow = log(
+            &shallow_store,
+            &shallow_snapshot,
+            &LogOptions::default(),
+            &Budget::unlimited(),
+        )
+        .expect("shallow walk succeeds");
+        assert_eq!(shallow.commits.len(), 8);
+        assert_eq!(
+            shallow
+                .commits
+                .into_iter()
+                .map(|commit| commit.id.to_hex())
+                .collect::<Vec<_>>(),
+            git_oids(&shallow_repo, &["rev-list", "main"])
+        );
+
+        let tag = fixture_oid("sha1_graph_octopus_tag");
+        let octopus = peel(&graph_store, tag, PeelTarget::Commit, &Budget::unlimited())
+            .expect("annotated octopus tag peels");
+        let tagged_snapshot = Snapshot::open(&graph_store, octopus, &Budget::unlimited())
+            .expect("tag snapshot opens");
+        assert_eq!(
+            log(
+                &graph_store,
+                &tagged_snapshot,
+                &LogOptions::default(),
+                &Budget::unlimited(),
+            )
+            .expect("peeled tag log succeeds")
+            .commits[0]
+                .id,
+            fixture_oid("sha1_graph_octopus")
+        );
+    }
+
+    #[test]
+    fn cursor_prefixes_do_not_recharge_object_visits_and_ordered_refusals_are_actionable() {
+        let repository = fixture_repo("sha1-graph.git");
+        let (store, _) =
+            LocalOdb::open(&repository, Default::default()).expect("graph fixture opens");
+        let snapshot = Snapshot::open(&store, fixture_oid("sha1_graph_head"), &Budget::unlimited())
+            .expect("snapshot opens");
+        let expected = git_oids(&repository, &["rev-list", "main"]);
+        assert_eq!(expected.len(), 231);
+
+        for order in [
+            LogOrder::Chronological,
+            LogOrder::Topological,
+            LogOrder::DateOrder,
+        ] {
+            let max_objects = if order == LogOrder::Chronological {
+                60
+            } else {
+                231
+            };
+            let mut cursor = None;
+            let mut actual = Vec::new();
+            let mut page_sizes = Vec::new();
+            loop {
+                let budget = Budget::new(
+                    BudgetLimits {
+                        max_objects,
+                        ..BudgetLimits::default()
+                    },
+                    None,
+                    Arc::new(AtomicBool::new(false)),
+                );
+                let page = log(
+                    &store,
+                    &snapshot,
+                    &LogOptions {
+                        order,
+                        limit: 60,
+                        cursor,
+                        ..LogOptions::default()
+                    },
+                    &budget,
+                )
+                .expect("constant-budget page succeeds");
+                page_sizes.push(page.commits.len());
+                actual.extend(page.commits.into_iter().map(|commit| commit.id.to_hex()));
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(page_sizes, [60, 60, 60, 51], "{order:?}");
+            assert_eq!(actual, expected, "{order:?}");
+        }
+
+        let fresh_budget = Budget::new(
+            BudgetLimits {
+                max_objects: 60,
+                ..BudgetLimits::default()
+            },
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let fresh = log(&store, &snapshot, &LogOptions::default(), &fresh_budget)
+            .expect("fresh chronological call truncates");
+        assert_eq!(fresh.commits.len(), 60);
+        assert!(fresh.truncated);
+        assert_eq!(fresh.stats.stopped_by, Some("max_objects"));
+
+        for order in [LogOrder::Topological, LogOrder::DateOrder] {
+            let budget = Budget::new(
+                BudgetLimits {
+                    max_objects: 230,
+                    ..BudgetLimits::default()
+                },
+                None,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let error = log(
+                &store,
+                &snapshot,
+                &LogOptions {
+                    order,
+                    ..LogOptions::default()
+                },
+                &budget,
+            )
+            .expect_err("ordered pre-pass refuses an undersized object limit");
+            assert_eq!(error.code, ErrorCode::BudgetExceeded);
+            assert_eq!(error.limit, Some("max_objects"));
+            let expected_order = match order {
+                LogOrder::Topological => "topological",
+                LogOrder::DateOrder => "date",
+                LogOrder::Chronological => unreachable!(),
+            };
+            assert_eq!(error.order.map(ErrorOrder::as_str), Some(expected_order));
+            assert!(error.message.contains("reachable commit count"));
+        }
+    }
+
+    struct CyclicStore {
+        objects: HashMap<Oid, Vec<u8>>,
+    }
+
+    impl ObjectDb for CyclicStore {
+        fn hash_kind(&self) -> HashKind {
+            HashKind::Sha1
+        }
+
+        fn try_header(&self, oid: &Oid, budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
+            budget.charge_header()?;
+            Ok(self.objects.get(oid).map(|payload| ObjectHeader {
+                kind: ObjectKind::Commit,
+                size: payload.len() as u64,
+            }))
+        }
+
+        fn try_find(
+            &self,
+            oid: &Oid,
+            out: &mut Vec<u8>,
+            budget: &Budget,
+        ) -> Result<Option<ObjectKind>, Error> {
+            out.clear();
+            let Some(payload) = self.objects.get(oid) else {
+                return Ok(None);
+            };
+            budget.charge_object(payload.len() as u64)?;
+            out.extend_from_slice(payload);
+            Ok(Some(ObjectKind::Commit))
+        }
+    }
+
+    #[test]
+    fn cyclic_lying_store_emits_ordered_residue_instead_of_dropping_it() {
+        let tree = object_id(HashKind::Sha1, ObjectKind::Tree, &[]).expect("tree hashes");
+        let first = Oid::new(HashKind::Sha1, &[1; 20]).expect("OID is valid");
+        let second = Oid::new(HashKind::Sha1, &[2; 20]).expect("OID is valid");
+        let payload = |parent: Oid, time| {
+            format!(
+                "tree {}\nparent {}\nauthor A <a@example.invalid> {time} +0000\ncommitter C <c@example.invalid> {time} +0000\n\ncycle\n",
+                tree.to_hex(),
+                parent.to_hex()
+            )
+            .into_bytes()
+        };
+        let store = CyclicStore {
+            objects: HashMap::from([(first, payload(second, 2)), (second, payload(first, 1))]),
+        };
+        for order in [LogOrder::Topological, LogOrder::DateOrder] {
+            let page = log(
+                &store,
+                &Snapshot {
+                    commit_oid: first,
+                    tree_oid: tree,
+                },
+                &LogOptions {
+                    order,
+                    ..LogOptions::default()
+                },
+                &Budget::unlimited(),
+            )
+            .expect("cyclic residue is still emitted");
+            assert_eq!(
+                page.commits
+                    .into_iter()
+                    .map(|commit| commit.id)
+                    .collect::<Vec<_>>(),
+                [second, first]
             );
         }
     }

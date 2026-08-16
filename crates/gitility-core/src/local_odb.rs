@@ -4,10 +4,11 @@
 //! never consulted.
 
 use crate::budget::Budget;
-use crate::error::{Error, ErrorCode};
+use crate::error::{Error, ErrorCode, ErrorFile};
 use crate::object::{HashKind, ObjectHeader, ObjectKind, Oid};
 use crate::odb::ObjectDb;
 use crate::verify::{verify, ContentHasher};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
@@ -52,6 +53,7 @@ pub struct LocalOdb {
     objects: PathBuf,
     store: RwLock<Arc<gix_odb::Store>>,
     object_dirs: RwLock<Vec<PathBuf>>,
+    shallow_roots: Option<HashSet<Oid>>,
     verify_pack_checksums: bool,
     integrity: Mutex<Option<Result<(), Error>>>,
 }
@@ -65,6 +67,10 @@ impl std::fmt::Debug for LocalOdb {
                 &self.object_dirs.read().map_or(0, |paths| paths.len()),
             )
             .field("verify_pack_checksums", &self.verify_pack_checksums)
+            .field(
+                "shallow_roots",
+                &self.shallow_roots.as_ref().map_or(0, HashSet::len),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -88,6 +94,7 @@ impl LocalOdb {
             ));
         }
 
+        let shallow_roots = read_shallow_roots(&git_dir, hash)?;
         let (store, object_dirs) = open_dynamic_store(&objects, hash)?;
 
         let layout = RepositoryLayout {
@@ -100,6 +107,7 @@ impl LocalOdb {
                 objects,
                 store: RwLock::new(store),
                 object_dirs: RwLock::new(object_dirs),
+                shallow_roots,
                 verify_pack_checksums: options.verify_pack_checksums,
                 integrity: Mutex::new(None),
             },
@@ -133,6 +141,7 @@ impl LocalOdb {
             objects,
             store: RwLock::new(store),
             object_dirs: RwLock::new(object_dirs),
+            shallow_roots: None,
             verify_pack_checksums: options.verify_pack_checksums,
             integrity: Mutex::new(None),
         })
@@ -181,6 +190,10 @@ impl LocalOdb {
 impl ObjectDb for LocalOdb {
     fn hash_kind(&self) -> HashKind {
         self.hash
+    }
+
+    fn shallow_roots(&self) -> Option<&HashSet<Oid>> {
+        self.shallow_roots.as_ref()
     }
 
     fn try_header(&self, oid: &Oid, budget: &Budget) -> Result<Option<ObjectHeader>, Error> {
@@ -264,6 +277,41 @@ impl ObjectDb for LocalOdb {
         *cached = None;
         Ok(())
     }
+}
+
+fn read_shallow_roots(git_dir: &Path, hash: HashKind) -> Result<Option<HashSet<Oid>>, Error> {
+    let path = git_dir.join("shallow");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(Error::new(
+                ErrorCode::MalformedRef,
+                "could not read repository shallow boundary file",
+            )
+            .with_file(ErrorFile::Shallow))
+        }
+    };
+    let mut roots = HashSet::new();
+    let contents = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    if contents.is_empty() {
+        return Ok(Some(roots));
+    }
+    for line in contents.split(|byte| *byte == b'\n') {
+        let text = std::str::from_utf8(line).ok();
+        let oid = text
+            .and_then(|text| Oid::parse_hex(text).ok())
+            .filter(|oid| oid.kind() == hash)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::MalformedRef,
+                    "repository shallow boundary file contains a malformed object ID",
+                )
+                .with_file(ErrorFile::Shallow)
+            })?;
+        roots.insert(oid);
+    }
+    Ok(Some(roots))
 }
 
 fn open_dynamic_store(
@@ -719,6 +767,25 @@ mod tests {
             );
             std::fs::remove_dir_all(&worktree).expect("temporary worktree is removed");
         }
+    }
+
+    #[test]
+    fn shallow_roots_load_at_open_and_malformed_files_name_the_metadata_file() {
+        let (store, _) =
+            open(fixture_repo("sha1-history-shallow.git")).expect("shallow fixture opens");
+        let roots = store.shallow_roots().expect("shallow metadata is present");
+        assert_eq!(roots.len(), 1);
+
+        let repository = TempRepo::new(
+            b"[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+            None,
+        );
+        std::fs::write(repository.0.join("shallow"), b"not-an-object-id\n")
+            .expect("malformed shallow file is written");
+        let error = open(&repository.0).expect_err("malformed shallow metadata refuses open");
+        assert_eq!(error.code, ErrorCode::MalformedRef);
+        assert_eq!(error.file.map(ErrorFile::as_str), Some("shallow"));
+        assert!(error.message.contains("shallow"));
     }
 
     #[test]

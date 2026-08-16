@@ -6,7 +6,9 @@ defmodule Gitility.Identity do
   Gitility makes none either. `time` is Unix seconds; `tz` is the raw
   timezone field exactly as encoded (e.g. `"+1000"`, including the `-0000`
   that some tools emit). Log results additionally populate
-  `tz_offset_minutes` with the parsed numeric offset.
+  `tz_offset_minutes` with the parsed numeric offset when the raw field is a
+  valid in-range `+HHMM`/`-HHMM` value; Git-tolerated malformed values remain
+  in `tz` and produce `nil` rather than failing the log page.
 
   `display_name/1` and `to_datetime/1` are the lossy conveniences.
   """

@@ -170,6 +170,22 @@ defmodule Gitility do
   @doc """
   Walks commit history from the snapshot's commit.
 
+  `:chronological` matches plain `git log`: newest committer time first, with
+  Git's priority-queue insertion order (FIFO) for equal timestamps.
+  `:topological` and `:date` match `--topo-order` and `--date-order`, including
+  the same equal-time insertion semantics. Shallow roots are treated as
+  parentless.
+
+  A `:since` bound uses Git's graph pruning: an older commit is excluded and
+  traversal does not continue through its parents. `:until` excludes newer
+  commits while continuing through their parents.
+
+  Chronological calls cost O(emitted commits + any cursor prefix).
+  Topological/date calls require an O(history) reachable-graph pre-pass on
+  every call, including cursor resume. If `limits.max_objects` is below the
+  reachable commit count, those orders refuse the call with an actionable
+  `:budget_exceeded` error before emitting a page.
+
   ## Options
 
     * `:order` — `:chronological` (default), `:topological`, or `:date`.
@@ -180,7 +196,9 @@ defmodule Gitility do
   """
   @spec log(Snapshot.t(), keyword()) ::
           {:ok, Page.t(Gitility.Commit.t())} | {:error, Error.t()}
-  def log(%Snapshot{} = snapshot, opts \\ []) do
+  def log(snapshot, opts \\ [])
+
+  def log(%Snapshot{} = snapshot, opts) do
     {opts, limits} = log_options!(opts)
 
     NativeSupport.await_sync(
@@ -188,6 +206,10 @@ defmodule Gitility do
       limits.timeout_ms,
       :log
     )
+  end
+
+  def log(_snapshot, _opts) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Snapshot", operation: :log)}
   end
 
   @doc """
@@ -273,6 +295,11 @@ defmodule Gitility do
   @doc """
   The best common ancestor of two commits, or `nil` when the histories are
   unrelated. Pass `all: true` to return every best common ancestor.
+
+  When there are multiple best common ancestors, canonical Git's single
+  result is unspecified. Gitility deterministically returns the greatest
+  object ID; use `all: true` when the full set matters. Local shallow roots
+  are treated as parentless.
   """
   @spec merge_base(graph_store(), OID.t() | binary(), OID.t() | binary(), keyword()) ::
           {:ok, OID.t() | nil | [OID.t()]} | {:error, Error.t()}
@@ -311,8 +338,10 @@ defmodule Gitility do
   @doc """
   Whether `ancestor_oid` is an ancestor of `descendant_oid`.
 
-  Wrapped in an ok-tuple like everything else — ancestry can fail on
-  missing objects, and the error model does not raise for repository data.
+  This is a short-circuiting reachability walk from the descendant and treats
+  local shallow roots as parentless. It is wrapped in an ok-tuple like
+  everything else: ancestry can fail on missing or malformed objects, and
+  repository-data failures do not raise.
   """
   @spec ancestor?(graph_store(), OID.t() | binary(), OID.t() | binary(), keyword()) ::
           {:ok, boolean()} | {:error, Error.t()}

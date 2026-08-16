@@ -1,3 +1,20 @@
+defmodule Gitility.M3aBlockingBackend do
+  @behaviour Gitility.ODB.Backend
+
+  @impl true
+  def init({objects, observer}), do: {:ok, {objects, observer}}
+
+  @impl true
+  def read_many(oids, {objects, observer}) do
+    send(observer, {:m3a_provider_read_blocked, self()})
+
+    receive do
+      :release_m3a_provider_read ->
+        {:ok, Map.new(oids, &{&1, Map.get(objects, &1, :not_found)})}
+    end
+  end
+end
+
 defmodule Gitility.Milestone3aCommitGraphTest do
   use ExUnit.Case, async: true
 
@@ -57,6 +74,7 @@ defmodule Gitility.Milestone3aCommitGraphTest do
     assert is_binary(commit.author.tz)
     assert is_integer(commit.author.tz_offset_minutes)
     assert is_binary(commit.subject) and byte_size(commit.subject) <= 1_024
+    assert is_boolean(commit.subject_truncated)
     assert is_binary(commit.message_raw) and byte_size(commit.message_raw) <= 64 * 1_024
     assert is_boolean(commit.message_truncated)
     assert Enum.all?(commit.signature_headers, &is_binary/1)
@@ -168,12 +186,36 @@ defmodule Gitility.Milestone3aCommitGraphTest do
              Gitility.log(snapshot)
   end
 
-  test "a tiny sync budget times out during the long commit walk", %{snapshot: snapshot} do
-    assert {:error, %Error{code: :timeout}} =
-             Gitility.log(snapshot,
-               order: :topological,
-               limits: Limits.new(timeout_ms: 1)
-             )
+  test "a blocked provider makes cancellation timeout deterministic", %{
+    repository: repository,
+    runtime: runtime,
+    snapshot: snapshot
+  } do
+    assert {:ok, complete} = Gitility.log(snapshot)
+    commit_oids = Enum.map(complete.items, & &1.id)
+    assert {:ok, values} = ODB.read_many(repository.odb, commit_oids)
+    objects = Map.reject(values, fn {_oid, value} -> value == :not_found end)
+
+    provider =
+      start_supervised!(
+        {ODB,
+         backend: {Gitility.M3aBlockingBackend, {objects, self()}},
+         runtime: runtime,
+         concurrency: 1,
+         request_timeout: 5_000}
+      )
+
+    assert {:ok, provider_odb} = ODB.handle(provider)
+    blocked_snapshot = %{snapshot | odb: provider_odb}
+
+    task =
+      Task.async(fn ->
+        Gitility.log(blocked_snapshot, limits: Limits.new(timeout_ms: 50))
+      end)
+
+    assert_receive {:m3a_provider_read_blocked, callback}, 1_000
+    assert {:error, %Error{code: :timeout}} = Task.await(task, 1_000)
+    send(callback, :release_m3a_provider_read)
   end
 
   test "log, merge-base, and ancestor validate options and graph-store scope", %{
@@ -186,6 +228,7 @@ defmodule Gitility.Milestone3aCommitGraphTest do
     end
 
     assert {:error, %Error{code: :invalid_argument}} = Gitility.log(snapshot, order: :time)
+    assert {:error, %Error{code: :invalid_argument}} = Gitility.log(repository)
     assert_raise ArgumentError, ~r/:since/, fn -> Gitility.log(snapshot, since: "yesterday") end
 
     left = fixture_oid(:sha1_graph_criss_left)

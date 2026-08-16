@@ -9,6 +9,7 @@ script_dir="$(cd "$script_parent" && pwd)"
 output_dir="$script_dir/generated"
 corrupt_helper="$script_dir/corrupt.py"
 checksum_helper="$script_dir/checksums.py"
+generator_hash="$(git hash-object "$script_dir/generate.sh")"
 
 for command in awk cat chmod cmp cp dd env find git ln mkdir mktemp mv python3 rm seq; do
   if ! command -v "$command" >/dev/null 2>&1; then
@@ -56,10 +57,12 @@ if [[ ! "$version_major" =~ ^[0-9]+$ || ! "$version_minor" =~ ^[0-9]+$ ]] ||
   exit 1
 fi
 
-if [[ -f "$output_dir/OIDS" ]]; then
+if [[ -f "$output_dir/GENERATOR_HASH" ]] &&
+  [[ "$(cat "$output_dir/GENERATOR_HASH")" == "$generator_hash" ]] &&
+  [[ -f "$output_dir/OIDS" ]]; then
   cp "$output_dir/OIDS" "$previous_oids"
 fi
-if [[ -f "$output_dir/CHECKSUMS" ]]; then
+if [[ -s "$previous_oids" ]] && [[ -f "$output_dir/CHECKSUMS" ]]; then
   cp "$output_dir/CHECKSUMS" "$previous_checksums"
 fi
 
@@ -321,6 +324,10 @@ make_graph() {
   local criss_right
   local resolved
   local skew_child
+  local equal_left
+  local equal_right
+  local equal_merge
+  local equal_index
   local disjoint
   local tail_tree
   local tail_parent
@@ -398,6 +405,32 @@ make_graph() {
     'Clock-skew child earlier than its parent'
   skew_child="$(git -C "$work_repository" rev-parse HEAD)"
   git -C "$work_repository" tag fixture/skew-child "$skew_child"
+
+  git -C "$work_repository" switch --quiet -c equal-left "$skew_child"
+  for equal_index in $(seq 1 4); do
+    printf 'equal left %s\n' "$equal_index" >>"$work_repository/equal-left.txt"
+    commit_all_at "$work_repository" '2001-05-01T00:12:00+0000' \
+      "Equal-time left $equal_index"
+  done
+  equal_left="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/equal-left "$equal_left"
+
+  git -C "$work_repository" switch --quiet -c equal-right "$skew_child"
+  for equal_index in $(seq 1 4); do
+    printf 'equal right %s\n' "$equal_index" >>"$work_repository/equal-right.txt"
+    commit_all_at "$work_repository" '2001-05-01T00:12:00+0000' \
+      "Equal-time right $equal_index"
+  done
+  equal_right="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/equal-right "$equal_right"
+
+  git -C "$work_repository" switch --quiet -c equal-merge "$equal_left"
+  merge_at "$work_repository" '2001-05-01T00:13:00+0000' equal-right \
+    'Merge the equal-time branches'
+  equal_merge="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/equal-merge "$equal_merge"
+
+  git -C "$work_repository" switch --quiet main
 
   tail_tree="$(git -C "$work_repository" rev-parse HEAD^{tree})"
   disjoint="$(
@@ -671,6 +704,8 @@ nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
   printf 'sha1_graph_head=%s\n' "$graph_head"
   printf 'sha1_graph_octopus=%s\n' \
     "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/octopus)"
+  printf 'sha1_graph_octopus_tag=%s\n' \
+    "$(git -C "$output_dir/sha1-graph.git" rev-parse graph-octopus)"
   printf 'sha1_graph_criss_left=%s\n' \
     "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/criss-left)"
   printf 'sha1_graph_criss_right=%s\n' \
@@ -683,6 +718,8 @@ nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
     "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/disjoint)"
   printf 'sha1_graph_skew_child=%s\n' \
     "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/skew-child)"
+  printf 'sha1_graph_equal_merge=%s\n' \
+    "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/equal-merge)"
   printf 'lfs_pointer_head=%s\n' "$lfs_head"
   printf 'sha1_nested_head=%s\n' "$nested_head"
   printf 'sha1_nested_root_txt=%s\n' \
@@ -696,6 +733,7 @@ nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
   printf 'pack_body_corrupt_oid=%s\n' "$pack_body_corrupt_oid"
 } >"$output_dir/OIDS"
 
+printf '%s\n' "$generator_hash" >"$output_dir/GENERATOR_HASH"
 python3 "$checksum_helper" "$output_dir" >"$output_dir/CHECKSUMS"
 
 if [[ -s "$previous_oids" ]]; then

@@ -101,11 +101,18 @@ defmodule Gitility.NativeSupport do
       |> maybe_put(:limit, normalize_limit(Map.get(error, :limit)))
       |> maybe_put(:layer, Map.get(error, :layer))
       |> maybe_put(:oid, normalize_error_oid(Map.get(error, :oid)))
+      |> maybe_put(:order, normalize_order(Map.get(error, :order)))
+      |> maybe_put(:file, Map.get(error, :file))
       |> maybe_put(:retry_after_ms, Map.get(error, :retry_after_ms))
       |> maybe_put(:reason, Map.get(error, :reason))
 
     Error.new(code, message, retryable: retryable, operation: operation, details: details)
   end
+
+  defp normalize_order("chronological"), do: :chronological
+  defp normalize_order("topological"), do: :topological
+  defp normalize_order("date"), do: :date
+  defp normalize_order(_order), do: nil
 
   def runtime_and_resource(:default) do
     case Runtime.default() do
@@ -204,6 +211,7 @@ defmodule Gitility.NativeSupport do
           author: identity_payload(commit.author),
           committer: identity_payload(commit.committer),
           subject: commit.subject,
+          subject_truncated: commit.subject_truncated,
           message_raw: commit.message_raw,
           message_truncated: commit.message_truncated,
           signature_headers: commit.signature_headers,

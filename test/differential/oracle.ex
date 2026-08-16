@@ -485,7 +485,31 @@ defmodule Gitility.Differential.Oracle do
     end)
   end
 
-  defp parse_patch_line(<<"@@ ", _rest::binary>> = line, {hunks, current}) do
+  # A type-change patch is two git file sections for one path; once a hunk
+  # has consumed exactly its declared line counts, any following non-hunk
+  # line ("diff --git", "--- /dev/null", "+++ b/<path>", index/mode lines)
+  # is metadata, never content. The "\\ No newline" marker must still reach
+  # the completed hunk's last line, so it bypasses the completion flush.
+  defp parse_patch_line(<<"\\ No newline at end of file">> = line, state) do
+    do_parse_patch_line(line, state)
+  end
+
+  defp parse_patch_line(line, {hunks, current}) when not is_nil(current) do
+    if hunk_complete?(current) do
+      do_parse_patch_line(line, {maybe_finish_hunk(hunks, current), nil})
+    else
+      do_parse_patch_line(line, {hunks, current})
+    end
+  end
+
+  defp parse_patch_line(line, state), do: do_parse_patch_line(line, state)
+
+  defp hunk_complete?(hunk) do
+    hunk.old_line - hunk.old_start >= hunk.old_lines and
+      hunk.new_line - hunk.new_start >= hunk.new_lines
+  end
+
+  defp do_parse_patch_line(<<"@@ ", _rest::binary>> = line, {hunks, current}) do
     hunks = maybe_finish_hunk(hunks, current)
 
     # Regex.run omits unmatched TRAILING groups, so git's short-form
@@ -507,16 +531,16 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
-  defp parse_patch_line(
+  defp do_parse_patch_line(
          <<"\\ No newline at end of file">>,
          {hunks, %{lines: [line | rest]} = current}
        ) do
     {hunks, %{current | lines: [%{line | no_newline: true} | rest]}}
   end
 
-  defp parse_patch_line(<<"\\ No newline at end of file">>, state), do: state
+  defp do_parse_patch_line(<<"\\ No newline at end of file">>, state), do: state
 
-  defp parse_patch_line(<<origin, content::binary>>, {hunks, current})
+  defp do_parse_patch_line(<<origin, content::binary>>, {hunks, current})
        when origin in [?\s, ?+, ?-] and not is_nil(current) do
     {line_origin, old_line, new_line, next_old, next_new} =
       case origin do
@@ -543,7 +567,7 @@ defmodule Gitility.Differential.Oracle do
     {hunks, current}
   end
 
-  defp parse_patch_line(_metadata, state), do: state
+  defp do_parse_patch_line(_metadata, state), do: state
 
   defp new_patch_hunk(old_start, old_lines, new_start, new_lines) do
     %{

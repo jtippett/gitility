@@ -189,7 +189,7 @@ These findings are load-bearing; the design references them by ID.
 |----|------|---------|
 | R1 | SHA-256 engine support blocked on upstream (F3) while Git 3.0 makes SHA-256 repos common | Types/cursors/verification hash-agnostic from 0.1; engine returns `:unsupported_hash`; re-evaluate at every Gitoxide release; SHA-256 fixtures exercise the refusal path continuously |
 | R2 | Blame diverges from canonical git on ~7% of lines in rename-heavy history (F4) | Differential testing uses a triaged known-divergence allowlist, not blanket tolerance; each divergence is reproduced, classified, and either fixed or documented; agreement ratio is tracked as a regression metric |
-| R3 | Path history is our own algorithm (F5), including its rename-candidate deviation from Git | Ship behind explicit `follow_renames: true`; differential-test against `git log --follow` with the same allowlist discipline; document the deviation |
+| R3 | Path history is our own algorithm (F5), including its rename-candidate deviation from Git | `follow_renames` defaults to `true` (M3d decision); differential-test against `git log --follow` with the same allowlist discipline; document the deviation |
 | R4 | The lazy remote pack reader is net-new Rust (F2): idx fan-out parsing, inflate-over-ranges, delta resolution | Eager `PackFetch` (stock gix-pack over explicitly fetched bytes) covers the driving ephemeral-node use case with no new Rust; the lazy reader is scoped as Milestone 5 behind checkpoint C1 for large/sparse repos and sits behind F1's trait seam so nothing above it changes |
 | R5 | Gitoxide is pre-1.0 and churns | Exact-pin the `gix` family, commit `Cargo.lock`, forbid gix types in the core's public API and in Elixir; upgrades are deliberate events with the differential suite as the gate |
 | R6 | The async NIF runtime (worker pool, `OwnedEnv` messaging, process monitors, cancellation) is the hardest correctness surface | Milestone 2 is dedicated to it; loom/concurrency tests, fault injection, and soak tests are required exit criteria, not stretch goals |
@@ -577,6 +577,9 @@ step for the path, with `follow_renames: true` engaging `gix-diff` rewrite
 tracking to re-target the path across renames. Its rename-candidate selection
 deviates from canonical Git in documented ways; path history is budgeted
 separately because it may diff many parent trees.
+No Git invocation reproduces its merge rule: `git log --full-history` is the
+nearest oracle and emits additional merges when the path differs only from a
+non-first parent, while Gitility deliberately compares only the first parent.
 
 ### Diff
 

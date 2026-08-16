@@ -638,6 +638,20 @@ pub(crate) fn validate_path(path: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validate a single literal path for operations whose internal diff must not
+/// accidentally reinterpret user input as a pathspec.
+pub(crate) fn validate_literal_path(path: &[u8], operation: &str) -> Result<(), Error> {
+    validate_path(path)?;
+    if path.starts_with(b":(") || path.iter().any(|byte| matches!(byte, b'*' | b'?' | b'[')) {
+        return Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!("{operation} path must be literal, not a pathspec"),
+        )
+        .with_reason("pathspec_not_literal"));
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_query_compatible(
     store: &dyn ObjectDb,
     snapshot: &Snapshot,

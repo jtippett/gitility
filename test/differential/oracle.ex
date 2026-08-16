@@ -274,7 +274,19 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
-  @doc "Runs the closest Git oracle for Gitility's first-parent tree comparison rule."
+  @doc """
+  Runs the nearest Git path-history oracle.
+
+  Without `--follow`, no Git invocation reproduces Gitility's first-parent
+  comparison rule: `--full-history` also emits merges whose path differs
+  only from a non-first parent (the allowlisted `merge_rule` divergences).
+
+  With `--follow`, `--diff-merges=first-parent` is LOAD-BEARING on the
+  pinned git 2.55.0: it switches merge selection to first-parent
+  comparison, which matches Gitility exactly on every fixture (probed
+  2026-08-17: sha1-blame.git docs/final.txt is 11 commits with the flag,
+  10 without — ours is 11). Without `--follow` the same flag is a no-op.
+  """
   @spec path_history(Path.t(), binary(), binary(), keyword()) :: result([binary()])
   def path_history(repository, revision, path, options \\ []) do
     options = Keyword.validate!(options, follow_renames: true)
@@ -284,9 +296,9 @@ defmodule Gitility.Differential.Oracle do
         "log",
         "--format=%H",
         "--no-patch",
-        "--full-history",
-        "--diff-merges=first-parent"
+        "--full-history"
       ] ++
+        optional_flag(options[:follow_renames], "--diff-merges=first-parent") ++
         optional_flag(options[:follow_renames], "--follow") ++
         [revision, "--", path]
 
@@ -719,7 +731,8 @@ defmodule Gitility.Differential.Oracle do
                  do: {current_path, boundary},
                  else: Map.get(path_cache, commit)
                ) do
-            nil -> {:error, "blame record has no original path for #{commit}"}
+            nil ->
+              {:error, "blame record has no original path for #{commit}"}
 
             {path, cached_boundary} ->
               {:ok, path, cached_boundary, rest,

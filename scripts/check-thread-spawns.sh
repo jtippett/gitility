@@ -4,6 +4,9 @@ set -euo pipefail
 # Native-thread guard: every production spawn in our Rust crates must be both
 # budgeted and deliberately allowlisted here. Test-only modules/files are
 # exempt because they do not enter the shipped NIF.
+# Scope: workspace and vendored Rust sources only. crates.io dependencies are
+# audited manually at every pin bump; gix-blame 0.16.0 was audited 2026-08-17
+# and contains no native-thread spawn.
 
 case "${BASH_SOURCE[0]}" in
   */*) script_parent="${BASH_SOURCE[0]%/*}" ;;

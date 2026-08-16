@@ -4,6 +4,12 @@
 //! simplify-history machinery. Commits are visited in the same chronological
 //! order as [`crate::log`], and a commit is emitted when the path's blob or
 //! mode differs from its first parent. A root is emitted when the path exists.
+//! Without `--follow`, no Git invocation reproduces that merge rule:
+//! `git log --full-history` is the nearest oracle, but also emits a merge
+//! when the path differs only from a non-first parent (Gitility's
+//! design-sanctioned R3 rule omits those noise merges). WITH `--follow`,
+//! `--diff-merges=first-parent` empirically switches git 2.55.0's merge
+//! selection to first-parent comparison and matches Gitility exactly.
 //! Rename following is attempted only when that comparison reports an added
 //! destination; the walk then re-targets to the detected source path.
 //!
@@ -20,7 +26,7 @@ use crate::log::{decode_log_commit, read_payload, LogCommit, LogOptions, LogOrde
 use crate::object::Oid;
 use crate::odb::ObjectDb;
 use crate::snapshot::Snapshot;
-use crate::tree::{resolve_path, validate_path, QueryStats, ResolvedPath};
+use crate::tree::{resolve_path, validate_literal_path, QueryStats, ResolvedPath};
 
 /// Options for [`history`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,10 +49,13 @@ impl Default for HistoryOptions {
 
 /// Walk one path's history, newest first, in chronological commit order.
 ///
-/// Unlike Git's default path history, merge commits are compared only with
-/// their first parent. This corresponds most closely to
-/// `git log --full-history --diff-merges=first-parent -- <path>` without
-/// claiming Git's TREESAME simplification semantics.
+/// Unlike Git's path history, merge commits are compared only with their first
+/// parent. Without `--follow`, no Git invocation reproduces that rule: the
+/// nearest oracle is `git log --full-history -- <path>`, which additionally
+/// emits merges whose path differs only from a non-first parent; Gitility
+/// deliberately produces fewer such noise merges under design decision R3.
+/// With `--follow`, adding `--diff-merges=first-parent` makes the pinned git
+/// 2.55.0 match Gitility exactly (empirical; see the differential oracle).
 pub fn history(
     store: &dyn ObjectDb,
     snapshot: &Snapshot,
@@ -55,7 +64,7 @@ pub fn history(
     budget: &Budget,
 ) -> Result<LogPage, Error> {
     crate::commit_graph::ensure_sha1(store, &[snapshot.commit_oid, snapshot.tree_oid])?;
-    validate_path(path)?;
+    validate_literal_path(path, "history")?;
     if path.is_empty() {
         return Err(Error::new(
             ErrorCode::InvalidPath,
@@ -88,7 +97,13 @@ pub fn history(
         limit: usize::MAX,
         ..LogOptions::default()
     };
-    let mut walk = Walk::new(store, snapshot.commit_oid, &walk_options, budget)?;
+    let mut walk = if resume.is_some() {
+        budget.without_object_recharge(|| {
+            Walk::new(store, snapshot.commit_oid, &walk_options, budget)
+        })?
+    } else {
+        Walk::new(store, snapshot.commit_oid, &walk_options, budget)?
+    };
     let mut tracked_path = path.to_vec();
     let mut found_resume = resume.is_none();
     let mut commits = Vec::with_capacity(opts.limit.min(1_024));
@@ -96,7 +111,12 @@ pub fn history(
 
     loop {
         budget.check()?;
-        let walked = match walk.next(found_resume) {
+        let next = if found_resume {
+            walk.next(true)
+        } else {
+            budget.without_object_recharge(|| walk.next(false))
+        };
+        let walked = match next {
             Some(Ok(walked)) => walked,
             Some(Err(error)) if truncatable(&error) && !commits.is_empty() => {
                 stopped_by = Some(error.limit.unwrap_or("budget"));
@@ -106,20 +126,23 @@ pub fn history(
             None => break,
         };
 
-        let shallow = store
-            .shallow_roots()
-            .is_some_and(|roots| roots.contains(&walked.id));
-        let payload = match read_payload(store, walked.id, budget, false) {
-            Ok(payload) => payload,
-            Err(error) if truncatable(&error) && !commits.is_empty() => {
-                stopped_by = Some(error.limit.unwrap_or("budget"));
-                break;
-            }
-            Err(error) => return Err(error),
+        let replaying_prefix = !found_resume;
+        let load_change = || {
+            let shallow = store
+                .shallow_roots()
+                .is_some_and(|roots| roots.contains(&walked.id));
+            let payload = read_payload(store, walked.id, budget, false)?;
+            let commit = decode_log_commit(walked.id, &payload, shallow)?;
+            let change = path_change(store, snapshot, &commit, &tracked_path, opts, budget)?;
+            Ok::<_, Error>((commit, change))
         };
-        let commit = decode_log_commit(walked.id, &payload, shallow)?;
-        let change = match path_change(store, snapshot, &commit, &tracked_path, opts, budget) {
-            Ok(change) => change,
+        let loaded = if replaying_prefix {
+            budget.without_object_recharge(load_change)
+        } else {
+            load_change()
+        };
+        let (commit, change) = match loaded {
+            Ok(loaded) => loaded,
             Err(error) if truncatable(&error) && !commits.is_empty() => {
                 stopped_by = Some(error.limit.unwrap_or("budget"));
                 break;
@@ -374,16 +397,24 @@ mod tests {
     use crate::local_odb::LocalOdb;
     use crate::test_support::{fixture_oid, fixture_repo};
     use std::process::Command;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     #[test]
-    fn generated_fixtures_match_the_closest_full_history_first_parent_diff_oracle() {
-        for (repository_name, head_key, path) in [
+    fn generated_non_deviation_cases_match_the_nearest_full_history_oracle() {
+        for (repository_name, head_key, path, follow_options) in [
             (
                 "sha1-blame.git",
                 "sha1_blame_head",
                 b"docs/final.txt".as_slice(),
+                &[false, true][..],
             ),
-            ("sha1-graph.git", "sha1_graph_head", b"graph.txt".as_slice()),
+            (
+                "sha1-graph.git",
+                "sha1_graph_head",
+                b"graph.txt".as_slice(),
+                &[false, true][..],
+            ),
         ] {
             let repository = fixture_repo(repository_name);
             let (store, _) =
@@ -391,7 +422,7 @@ mod tests {
             let head = fixture_oid(head_key);
             let snapshot =
                 Snapshot::open(&store, head, &Budget::unlimited()).expect("fixture snapshot opens");
-            for follow in [false, true] {
+            for &follow in follow_options {
                 let actual = history(
                     &store,
                     &snapshot,
@@ -419,6 +450,71 @@ mod tests {
     }
 
     #[test]
+    fn nearest_oracle_deviations_are_asserted_for_merge_rule_and_follow_copy_detection() {
+        for (repository_name, head_key, path, follow, expected_counts, class) in [
+            (
+                "sha1-graph.git",
+                "sha1_graph_head",
+                b"criss-left.txt".as_slice(),
+                false,
+                Some((2, 3)),
+                "merge_rule",
+            ),
+            (
+                "sha1-history.git",
+                "sha1_history_head",
+                b"branches/left.txt".as_slice(),
+                false,
+                Some((2, 3)),
+                "merge_rule",
+            ),
+            (
+                "sha1-history.git",
+                "sha1_history_head",
+                b"candidates/selected.txt".as_slice(),
+                true,
+                None,
+                "follow_copy_detection",
+            ),
+        ] {
+            let repository = fixture_repo(repository_name);
+            let (store, _) =
+                LocalOdb::open(&repository, Default::default()).expect("fixture repository opens");
+            let head = fixture_oid(head_key);
+            let snapshot =
+                Snapshot::open(&store, head, &Budget::unlimited()).expect("fixture snapshot opens");
+            let actual = history(
+                &store,
+                &snapshot,
+                path,
+                &HistoryOptions {
+                    follow_renames: follow,
+                    ..HistoryOptions::default()
+                },
+                &Budget::unlimited(),
+            )
+            .expect("core history succeeds")
+            .commits
+            .into_iter()
+            .map(|commit| commit.id.to_hex())
+            .collect::<Vec<_>>();
+            let expected = git_history(&repository, head, path, follow);
+            eprintln!(
+                "ALLOWLISTED {class}: repo={repository_name} path={} follow={follow} git={expected:?} gitility={actual:?}",
+                String::from_utf8_lossy(path)
+            );
+            assert_ne!(
+                actual, expected,
+                "the approved divergence must stay exercised"
+            );
+            if let Some((gitility_count, git_count)) = expected_counts {
+                assert_eq!(actual.len(), gitility_count);
+                assert_eq!(expected.len(), git_count);
+            }
+        }
+    }
+
+    #[test]
     fn cursor_reconstructs_three_pages_and_binds_path_and_follow_option() {
         let repository = fixture_repo("sha1-blame.git");
         let (store, _) =
@@ -426,7 +522,18 @@ mod tests {
         let head = fixture_oid("sha1_blame_head");
         let snapshot =
             Snapshot::open(&store, head, &Budget::unlimited()).expect("fixture snapshot opens");
-        let expected = git_history(&repository, head, b"docs/final.txt", true);
+        let expected = history(
+            &store,
+            &snapshot,
+            b"docs/final.txt",
+            &HistoryOptions::default(),
+            &Budget::unlimited(),
+        )
+        .expect("unpaged history succeeds")
+        .commits
+        .into_iter()
+        .map(|commit| commit.id.to_hex())
+        .collect::<Vec<_>>();
         let mut cursor = None;
         let mut reconstructed = Vec::new();
         let mut page_count = 0;
@@ -482,6 +589,71 @@ mod tests {
             .expect_err("changed fingerprint rejects cursor");
             assert_eq!(error.code, ErrorCode::InvalidCursor);
         }
+
+        for path in [b"*.txt".as_slice(), b":(glob)docs/**".as_slice()] {
+            let error = history(
+                &store,
+                &snapshot,
+                path,
+                &HistoryOptions::default(),
+                &Budget::unlimited(),
+            )
+            .expect_err("history accepts one literal path only");
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert_eq!(error.reason.as_deref(), Some("pathspec_not_literal"));
+        }
+    }
+
+    #[test]
+    fn cursor_prefixes_recompute_retargeting_without_recharging_page_cost() {
+        let repository = fixture_repo("sha1-blame.git");
+        let head = fixture_oid("sha1_blame_pagination_head");
+        let (store, _) =
+            LocalOdb::open(&repository, Default::default()).expect("fixture repository opens");
+        let snapshot =
+            Snapshot::open(&store, head, &Budget::unlimited()).expect("fixture snapshot opens");
+        let mut cursor = None;
+        let mut page_one_objects = 0;
+        let mut page_forty_objects = 0;
+
+        for page_number in 1..=40 {
+            let budget = Budget::new(
+                crate::budget::BudgetLimits {
+                    max_objects: 10,
+                    ..crate::budget::BudgetLimits::default()
+                },
+                None,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let page = history(
+                &store,
+                &snapshot,
+                b"page-cost.txt",
+                &HistoryOptions {
+                    follow_renames: true,
+                    limit: 1,
+                    cursor,
+                },
+                &budget,
+            )
+            .expect("fresh-budget history page succeeds");
+            assert_eq!(page.commits.len(), 1);
+            if page_number == 1 {
+                page_one_objects = page.stats.objects_read;
+            }
+            if page_number == 40 {
+                page_forty_objects = page.stats.objects_read;
+            }
+            cursor = page.next_cursor;
+        }
+
+        eprintln!(
+            "M3 page-cost objects_read: page1={page_one_objects} page40={page_forty_objects}"
+        );
+        assert!(
+            page_forty_objects.abs_diff(page_one_objects) <= 2,
+            "late-page object spend must stay within a small constant of page one"
+        );
     }
 
     fn git_history(
@@ -495,9 +667,13 @@ mod tests {
             "--format=%H".to_owned(),
             "--no-patch".to_owned(),
             "--full-history".to_owned(),
-            "--diff-merges=first-parent".to_owned(),
         ];
         if follow {
+            // Load-bearing WITH --follow on the pinned git 2.55.0: switches
+            // merge selection to first-parent comparison, matching Gitility
+            // exactly (11 vs 10 commits on sha1-blame.git docs/final.txt).
+            // A no-op without --follow.
+            arguments.push("--diff-merges=first-parent".to_owned());
             arguments.push("--follow".to_owned());
         }
         arguments.extend([

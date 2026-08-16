@@ -32,6 +32,7 @@ pub mod path_history;
 pub mod pathspec;
 pub mod provider_odb;
 pub mod refs;
+mod rewrite;
 pub mod runtime;
 pub mod search;
 pub mod snapshot;

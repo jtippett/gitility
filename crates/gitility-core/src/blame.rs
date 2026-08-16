@@ -10,14 +10,15 @@ use crate::error::{Error, ErrorCode};
 use crate::log::{decode_log_commit, LogIdentity};
 use crate::object::{HashKind, ObjectKind, Oid};
 use crate::odb::ObjectDb;
+use crate::rewrite::{self, BinaryPolicy};
 use crate::snapshot::Snapshot;
-use crate::tree::{ensure_query_compatible, resolve_path, QueryStats, ResolvedPath, TreeItemKind};
+use crate::tree::{
+    ensure_query_compatible, resolve_path, validate_literal_path, QueryStats, ResolvedPath,
+    TreeItemKind,
+};
 use bstr::ByteSlice;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-
-const BUDGET_CHECK_BYTES: usize = 64 * 1_024;
 
 /// Options for [`blame`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,7 @@ pub struct Blame {
     pub path: Vec<u8>,
     pub hunks: Vec<BlameHunk>,
     pub stats: QueryStats,
+    pub warnings: Vec<crate::diff::DiffWarning>,
 }
 
 /// Attribute the selected lines of `path` to commits reachable from snapshot.
@@ -70,6 +72,7 @@ pub fn blame(
     budget: &Budget,
 ) -> Result<Blame, Error> {
     ensure_query_compatible(store, snapshot)?;
+    validate_literal_path(path, "blame")?;
     budget.check()?;
     let resolved = resolve_path(store, snapshot, path, budget)?;
     let entry = match resolved {
@@ -136,7 +139,7 @@ pub fn blame(
         None => gix_blame::BlameRanges::WholeFile,
     };
     let rewrites = opts.follow_renames.then(gix_diff::Rewrites::default);
-    let mut platform = rewrite_platform(budget.limits().max_object_bytes);
+    let mut platform = rewrite::platform(budget.limits().max_object_bytes, BinaryPolicy::ForceText);
     let result = gix_blame::file(
         adapter.clone(),
         to_gix_oid(snapshot.commit_oid)?,
@@ -219,6 +222,7 @@ pub fn blame(
             stopped_by: None,
         },
         hunks,
+        warnings: Vec::new(),
     })
 }
 
@@ -265,10 +269,7 @@ fn line_count(bytes: &[u8]) -> Result<u32, Error> {
     })
 }
 
-fn check_bytes(bytes: &[u8], budget: &Budget) -> Result<(), Error> {
-    for _ in bytes.chunks(BUDGET_CHECK_BYTES) {
-        budget.check()?;
-    }
+fn check_bytes(_bytes: &[u8], budget: &Budget) -> Result<(), Error> {
     budget.check()
 }
 
@@ -280,34 +281,9 @@ fn missing(oid: Oid, role: &str) -> Error {
     .with_oid(oid)
 }
 
-fn rewrite_platform(max_object_bytes: u64) -> gix_diff::blob::Platform {
-    let pipeline = gix_diff::blob::Pipeline::new(
-        Default::default(),
-        Default::default(),
-        Vec::new(),
-        gix_diff::blob::pipeline::Options {
-            large_file_threshold_bytes: max_object_bytes,
-            ..Default::default()
-        },
-    );
-    let attributes = gix_worktree::Stack::new(
-        PathBuf::new(),
-        gix_worktree::stack::State::AttributesStack(Default::default()),
-        Default::default(),
-        Vec::new(),
-        Vec::new(),
-    );
-    gix_diff::blob::Platform::new(
-        gix_diff::blob::platform::Options {
-            algorithm: Some(gix_diff::blob::Algorithm::Histogram),
-            ..Default::default()
-        },
-        pipeline,
-        gix_diff::blob::pipeline::Mode::ToGit,
-        attributes,
-    )
-}
-
+/// gix-blame requests owned objects and can revisit them in arbitrary order,
+/// so this adapter retains every commit/blob for the whole blame call. The
+/// operation's `max_total_object_bytes` budget bounds that retained payload.
 #[derive(Clone)]
 struct BlameObjectStore<'a> {
     state: std::rc::Rc<RefCell<AdapterState<'a>>>,
@@ -570,6 +546,72 @@ mod tests {
     }
 
     #[test]
+    fn nul_payloads_use_text_semantics_and_match_git_line_for_line() {
+        for (repository_name, head_key, path) in [
+            (
+                "sha1-blame.git",
+                "sha1_blame_bin1_gamma",
+                b"bin1".as_slice(),
+            ),
+            ("sha1-diff.git", "sha1_diff_head", b"binary.dat".as_slice()),
+            (
+                "sha1-diff.git",
+                "sha1_diff_head",
+                b"text-to-binary.dat".as_slice(),
+            ),
+        ] {
+            let repository = fixture_repo(repository_name);
+            let head = fixture_oid(head_key);
+            let (store, _) =
+                LocalOdb::open(&repository, Default::default()).expect("fixture repository opens");
+            let snapshot =
+                Snapshot::open(&store, head, &Budget::unlimited()).expect("fixture snapshot opens");
+            let actual = blame(
+                &store,
+                &snapshot,
+                path,
+                &BlameOptions::default(),
+                &Budget::unlimited(),
+            )
+            .expect("binary-content blame succeeds")
+            .hunks
+            .into_iter()
+            .map(|hunk| OracleHunk {
+                final_start: hunk.final_start,
+                final_end: hunk.final_end,
+                original_start: hunk.original_start,
+                original_end: hunk.original_end,
+                commit: hunk.commit_id.to_hex(),
+                path: hunk.original_path,
+                boundary: hunk.boundary,
+            })
+            .collect::<Vec<_>>();
+            let expected = git_blame(&repository, head, path, None, true);
+            assert_eq!(actual, expected, "binary blame divergence for {path:?}");
+
+            if path == b"bin1" {
+                assert_eq!(actual.len(), 3);
+                let expected_commits = [
+                    fixture_oid("sha1_blame_bin1_alpha").to_hex(),
+                    fixture_oid("sha1_blame_bin1_beta").to_hex(),
+                    fixture_oid("sha1_blame_bin1_gamma").to_hex(),
+                ];
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|hunk| (hunk.final_start, hunk.final_end, hunk.commit.clone()))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        (1, 1, expected_commits[0].clone()),
+                        (2, 2, expected_commits[1].clone()),
+                        (3, 3, expected_commits[2].clone()),
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn validates_ranges_kinds_and_hard_budget_refusal() {
         let repository = fixture_repo("sha1-blame.git");
         let (store, _) =
@@ -619,6 +661,19 @@ mod tests {
         .expect_err("tree path fails semantically");
         assert_eq!(tree.code, ErrorCode::InvalidArgument);
         assert_eq!(tree.reason.as_deref(), Some("path_kind:tree"));
+
+        for path in [b"*.txt".as_slice(), b":(glob)docs/**".as_slice()] {
+            let error = blame(
+                &store,
+                &snapshot,
+                path,
+                &BlameOptions::default(),
+                &Budget::unlimited(),
+            )
+            .expect_err("blame accepts one literal path only");
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert_eq!(error.reason.as_deref(), Some("pathspec_not_literal"));
+        }
 
         let object_size_budget = Budget::new(
             crate::budget::BudgetLimits {

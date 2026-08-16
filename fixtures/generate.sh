@@ -341,6 +341,8 @@ make_blame() {
   local final_commit
   local final_tree
   local final_payload
+  local pagination_index
+  local pagination_minute
 
   init_work_repo "$work_repository" sha1
   mkdir -p "$work_repository/docs"
@@ -427,6 +429,37 @@ make_blame() {
   final_commit="$(git -C "$work_repository" hash-object -t commit -w --stdin <"$final_payload")"
   git -C "$work_repository" update-ref refs/heads/main "$final_commit" "$merge_commit"
   git -C "$work_repository" tag fixture/blame-final "$final_commit"
+
+  # A separate tagged history keeps the established main/blame OIDs stable
+  # while exercising line attribution when every image is classified as
+  # binary by the usual first-8-KiB NUL heuristic.
+  git -C "$work_repository" switch --quiet -c blame-binary-history
+  printf 'alpha\n' >"$work_repository/bin1"
+  commit_as_at "$work_repository" '2001-08-01T00:10:00+0000' \
+    'Alice Attribution' 'alice@gitility.invalid' 'Add binary-history alpha'
+  git -C "$work_repository" tag fixture/blame-bin1-alpha HEAD
+  printf 'alpha\nbeta\000nul\n' >"$work_repository/bin1"
+  commit_as_at "$work_repository" '2001-08-01T00:11:00+0000' \
+    'Bob Bytes' 'bob@gitility.invalid' 'Add binary-history beta'
+  git -C "$work_repository" tag fixture/blame-bin1-beta HEAD
+  printf 'alpha\nbeta\000nul\ngamma\n' >"$work_repository/bin1"
+  commit_as_at "$work_repository" '2001-08-01T00:12:00+0000' \
+    'Cara Committer' 'cara@gitility.invalid' 'Add binary-history gamma'
+  git -C "$work_repository" tag fixture/blame-bin1-gamma HEAD
+  git -C "$work_repository" switch --quiet main
+
+  # Forty-plus emitted commits make late-page replay costs measurable without
+  # moving the stable main ref or its OIDS entries.
+  git -C "$work_repository" switch --quiet -c blame-history-pagination
+  for pagination_index in $(seq 1 45); do
+    printf 'pagination revision %02d\n' "$pagination_index" \
+      >"$work_repository/page-cost.txt"
+    pagination_minute="$(printf '%02d' "$pagination_index")"
+    commit_all_at "$work_repository" "2001-08-01T01:${pagination_minute}:00+0000" \
+      "Path-history pagination revision $pagination_index"
+  done
+  git -C "$work_repository" tag fixture/blame-history-pagination-tip HEAD
+  git -C "$work_repository" switch --quiet main
 
   export_bare "$work_repository" "$bare_repository" sha1
   git -C "$bare_repository" fsck --full --strict --no-dangling >/dev/null
@@ -1068,17 +1101,28 @@ diff_head="$(git -C "$output_dir/sha1-diff.git" rev-parse fixture/diff-head)"
   printf 'replace_target=%s\n' "$replace_target"
   printf 'replace_with=%s\n' "$replace_oid"
   printf 'pack_body_corrupt_oid=%s\n' "$pack_body_corrupt_oid"
+  printf 'sha1_blame_bin1_alpha=%s\n' \
+    "$(git -C "$output_dir/sha1-blame.git" rev-parse fixture/blame-bin1-alpha)"
+  printf 'sha1_blame_bin1_beta=%s\n' \
+    "$(git -C "$output_dir/sha1-blame.git" rev-parse fixture/blame-bin1-beta)"
+  printf 'sha1_blame_bin1_gamma=%s\n' \
+    "$(git -C "$output_dir/sha1-blame.git" rev-parse fixture/blame-bin1-gamma)"
+  printf 'sha1_blame_pagination_head=%s\n' \
+    "$(git -C "$output_dir/sha1-blame.git" rev-parse fixture/blame-history-pagination-tip)"
 } >"$output_dir/OIDS"
 
 printf '%s\n' "$generator_hash" >"$output_dir/GENERATOR_HASH"
 python3 "$checksum_helper" "$output_dir" >"$output_dir/CHECKSUMS"
 
 if [[ -s "$previous_oids" ]]; then
-  if ! cmp -s "$previous_oids" "$output_dir/OIDS"; then
+  previous_oid_lines="$(wc -l <"$previous_oids")"
+  awk -v lines="$previous_oid_lines" 'NR <= lines' "$output_dir/OIDS" \
+    >"$scratch_dir/current-oids-prefix"
+  if ! cmp -s "$previous_oids" "$scratch_dir/current-oids-prefix"; then
     printf 'error: generated OIDS changed or were reordered\n' >&2
     exit 1
   fi
-  printf 'Verified byte-identical deterministic OIDS.\n'
+  printf 'Verified byte-identical pre-existing deterministic OIDS.\n'
 fi
 if [[ -s "$previous_checksums" ]]; then
   # Extending the generated corpus legitimately adds inventory records and

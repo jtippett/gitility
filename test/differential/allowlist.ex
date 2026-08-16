@@ -5,7 +5,8 @@ defmodule Gitility.Differential.Allowlist do
   `compare/4` records an allowlisted mismatch in the calling test process only
   when both its case id and operation/fixture/query context exactly match the
   triaged entry. Exact matches do not need an entry, and unknown or
-  context-mismatched divergences fail immediately.
+  context-mismatched divergences fail immediately. Callers may additionally
+  assert result-specific expectations stored on the returned entry.
   """
 
   import ExUnit.Assertions, only: [flunk: 1]
@@ -129,6 +130,9 @@ defmodule Gitility.Differential.Allowlist do
       not valid_git_version?(entry.git_version_triaged) ->
         {:error, "allowlist entry #{inspect(entry.id)} has no valid triaged Git version"}
 
+      not valid_expected_results?(Map.get(entry, :expected_results)) ->
+        {:error, "allowlist entry #{inspect(entry.id)} has invalid expected results"}
+
       true ->
         :ok
     end
@@ -159,6 +163,15 @@ defmodule Gitility.Differential.Allowlist do
   end
 
   defp valid_git_version?(_version), do: false
+
+  defp valid_expected_results?(nil), do: true
+
+  defp valid_expected_results?(%{git: git, gitility: gitility})
+       when is_list(git) and is_list(gitility) do
+    Enum.all?(git, &nonempty_binary?/1) and Enum.all?(gitility, &nonempty_binary?/1)
+  end
+
+  defp valid_expected_results?(_other), do: false
 
   defp record(entry) do
     Process.put(@record_key, [entry | Process.get(@record_key, [])])

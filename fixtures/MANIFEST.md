@@ -16,11 +16,14 @@ The corpus contains:
 - `sha1-history.git`: a criss-cross merge, exact and similarity renames,
   blame/follow history, delete/re-add history, an exact copy, and a
   four-candidate rename input. Stable `fixture/*` tags name useful queries.
-- `sha1-blame.git`: eleven deterministic commits with three interleaved raw
+- `sha1-blame.git`: eleven deterministic mainline commits with three interleaved raw
   identities, append/delete/middle rewrites, exact and edited renames, a merge
   whose two parents changed the blamed file, CRLF and Latin-1 content, and a
-  final file without a trailing newline. Stable tags and `OIDS` keys name every
-  attribution boundary.
+  final file without a trailing newline. A separately tagged three-commit
+  `bin1` history adds `alpha`, `beta\0nul`, and `gamma` one line per commit.
+  A second tagged branch changes `page-cost.txt` 45 times for late-cursor cost
+  regressions. Stable tags and `OIDS` keys name all attribution and pagination
+  boundaries used by tests.
 - `sha1-graph.git`: three branches joined by a four-parent octopus merge, an
   annotated tag on that merge, a criss-cross with exactly two merge bases, a
   disjoint root, a child whose committer time predates its parent, two

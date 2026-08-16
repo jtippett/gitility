@@ -12,6 +12,7 @@ use crate::error::{Error, ErrorCode};
 use crate::object::{HashKind, ObjectHeader, ObjectKind, Oid};
 use crate::odb::{CacheStats, HeaderProvenance, HeaderRead, ObjectDb};
 use crate::pathspec::PathspecMatcher;
+use crate::rewrite::{self, BinaryPolicy};
 use crate::search::{is_binary_payload, MAX_CONTEXT_LINES};
 use crate::snapshot::Snapshot;
 use crate::tree::{ensure_query_compatible, join_path, QueryStats};
@@ -24,7 +25,6 @@ use gix_object::TreeRefIter;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
 
 const DIFF_CHECK_BYTES: usize = 64 * 1_024;
 
@@ -233,7 +233,7 @@ pub fn diff(
     let adapter = GixObjectStore::new(&union, budget, opts.max_object_bytes, prepared.projected);
     let mut changes = Vec::with_capacity(opts.max_diff_files.min(1_024));
     let mut walk_stopped_by = None;
-    let mut platform = rewrite_platform(opts.max_object_bytes);
+    let mut platform = rewrite::platform(opts.max_object_bytes, BinaryPolicy::Detect);
     let rewrite_options = match opts.renames {
         RenameTracking::Disabled => None,
         RenameTracking::Similarity => Some(gix_diff::Rewrites {
@@ -1059,34 +1059,6 @@ fn finish(
         warnings,
         truncated,
     }
-}
-
-fn rewrite_platform(max_object_bytes: u64) -> gix_diff::blob::Platform {
-    let pipeline = gix_diff::blob::Pipeline::new(
-        Default::default(),
-        Default::default(),
-        Vec::new(),
-        gix_diff::blob::pipeline::Options {
-            large_file_threshold_bytes: max_object_bytes,
-            ..Default::default()
-        },
-    );
-    let attributes = gix_worktree::Stack::new(
-        PathBuf::new(),
-        gix_worktree::stack::State::AttributesStack(Default::default()),
-        Default::default(),
-        Vec::new(),
-        Vec::new(),
-    );
-    gix_diff::blob::Platform::new(
-        gix_diff::blob::platform::Options {
-            algorithm: Some(Algorithm::Histogram),
-            ..Default::default()
-        },
-        pipeline,
-        gix_diff::blob::pipeline::Mode::ToGit,
-        attributes,
-    )
 }
 
 fn map_tree_diff_error(error: gix_diff::tree_with_rewrites::Error) -> Error {

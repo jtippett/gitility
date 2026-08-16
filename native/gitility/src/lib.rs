@@ -3038,7 +3038,14 @@ fn encode_job_output<'a>(
                 })
                 .collect(),
             stats: stats_map(blame.stats, elapsed_ms, atoms::limit(), provider_spend),
-            warnings: Vec::new(),
+            warnings: blame
+                .warnings
+                .into_iter()
+                .map(|warning| DiffWarningMap {
+                    code: diff_warning_atom(warning.code),
+                    message: warning.message,
+                })
+                .collect(),
         }
         .encode(env),
         JobOutput::File(file) => FileMap {

@@ -100,33 +100,30 @@ defmodule Gitility.Milestone3dBlameHistoryTest do
             }} =
              Gitility.blame(root, "docs/legacy.txt")
 
-    assert {:ok,
-            %Blame{hunks: [%Blame.Hunk{final_range: %Range{first: 1, last: 1, step: 1}}]}} =
+    assert {:ok, %Blame{hunks: [%Blame.Hunk{final_range: %Range{first: 1, last: 1, step: 1}}]}} =
              Gitility.blame(root, "docs/legacy.txt", lines: 1..1)
 
-    assert {:ok,
-            %Blame{hunks: [%Blame.Hunk{final_range: %Range{first: 5, last: 5, step: 1}}]}} =
+    assert {:ok, %Blame{hunks: [%Blame.Hunk{final_range: %Range{first: 5, last: 5, step: 1}}]}} =
              Gitility.blame(root, "docs/legacy.txt", lines: {5, 5})
 
-    assert {:ok,
-            %Blame{hunks: [%Blame.Hunk{final_range: %Range{first: 2, last: 4, step: 1}}]}} =
+    assert {:ok, %Blame{hunks: [%Blame.Hunk{final_range: %Range{first: 2, last: 4, step: 1}}]}} =
              Gitility.blame(root, "docs/legacy.txt", lines: 4..2)
   end
 
   test "out-of-range, missing, tree, budget, and option errors keep conventions", context do
-    assert {:error,
-            %Error{code: :invalid_argument, details: %{line_count: 7}}} =
+    assert {:error, %Error{code: :invalid_argument, details: %{line_count: 7}}} =
              Gitility.blame(context.snapshot, "docs/final.txt", lines: 1..8)
+
+    assert {:error, %Error{code: :invalid_argument}} =
+             Gitility.blame(context.snapshot, "docs/final.txt", lines: 1..7//2)
 
     assert {:error, %Error{code: :invalid_path}} =
              Gitility.blame(context.snapshot, "docs/missing.txt")
 
-    assert {:error,
-            %Error{code: :invalid_argument, details: %{reason: "path_kind:tree"}}} =
+    assert {:error, %Error{code: :invalid_argument, details: %{reason: "path_kind:tree"}}} =
              Gitility.blame(context.snapshot, "docs")
 
-    assert {:error,
-            %Error{code: :object_too_large, details: %{limit: :max_object_bytes}}} =
+    assert {:error, %Error{code: :object_too_large, details: %{limit: :max_object_bytes}}} =
              Gitility.blame(context.snapshot, "docs/final.txt",
                limits: Limits.new(max_object_bytes: 80)
              )
@@ -228,6 +225,14 @@ defmodule Gitility.Milestone3dBlameHistoryTest do
     assert_raise ArgumentError, fn ->
       Gitility.history(context.snapshot, "docs/final.txt", first_parent: true)
     end
+
+    for path <- ["*.txt", ":(glob)docs/**"] do
+      assert {:error,
+              %Error{
+                code: :invalid_argument,
+                details: %{reason: "pathspec_not_literal"}
+              }} = Gitility.history(context.snapshot, path)
+    end
   end
 
   test "async blame and history mirror synchronous results", context do
@@ -250,7 +255,8 @@ defmodule Gitility.Milestone3dBlameHistoryTest do
     assert async_page.truncated == sync_page.truncated
   end
 
-  test "a blocked blob read makes mid-blame cancellation deterministic", context do
+  test "the mandatory HEAD-blob read blocks long enough for deterministic blame cancellation",
+       context do
     objects = repository_objects(context.repository, fixture_oid(:sha1_blame_head))
 
     provider =
@@ -267,9 +273,7 @@ defmodule Gitility.Milestone3dBlameHistoryTest do
 
     task =
       Task.async(fn ->
-        Gitility.blame(blocked_snapshot, "docs/final.txt",
-          limits: Limits.new(timeout_ms: 50)
-        )
+        Gitility.blame(blocked_snapshot, "docs/final.txt", limits: Limits.new(timeout_ms: 50))
       end)
 
     assert_receive {:m3d_blob_read_blocked, callback}, 1_000

@@ -4,6 +4,10 @@ defmodule Gitility.Blame do
 
   Hunk form is substantially more compact for agents — a 200-line file
   last touched by three commits is three hunks, not two hundred rows.
+
+  Blame accepts regular blobs only. Symlink and gitlink paths return
+  `:invalid_argument` by design (R2); unlike canonical Git, Gitility does not
+  attribute the bytes of a symlink target.
   """
 
   @enforce_keys [:path, :hunks]
@@ -49,7 +53,7 @@ defmodule Gitility.Blame do
             original_path: binary(),
             author: Gitility.Identity.t() | nil,
             committer: Gitility.Identity.t() | nil,
-            summary: String.t() | nil,
+            summary: binary() | nil,
             boundary: boolean()
           }
   end

@@ -196,7 +196,10 @@ impl Budget {
     /// governs distinct commits visited rather than payload fetch count.
     pub(crate) fn charge_object_visit(&self) -> Result<(), Error> {
         self.check()?;
-        charge(&self.objects, 1, self.limits.max_objects, "max_objects")
+        if self.object_charge_suspensions.load(Ordering::Relaxed) == 0 {
+            charge(&self.objects, 1, self.limits.max_objects, "max_objects")?;
+        }
+        Ok(())
     }
 
     /// Runs one synchronous object-store read without its normal
@@ -236,13 +239,46 @@ impl Budget {
         result
     }
 
+    /// Replays cursor-prefix work without spending object-count or payload
+    /// byte/read accounting a second time. The underlying reads and all
+    /// decoding/diff work still happen, and cancellation, deadlines,
+    /// per-object size checks, provider ceilings, and cache accounting remain
+    /// active. Path history uses this while rebuilding rename-retarget state.
+    pub(crate) fn without_object_recharge<T>(&self, replay: impl FnOnce() -> T) -> T {
+        struct Restore<'a> {
+            objects: &'a AtomicU64,
+            payloads: &'a AtomicU64,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.objects.fetch_sub(1, Ordering::Relaxed);
+                self.payloads.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        self.object_charge_suspensions
+            .fetch_add(1, Ordering::Relaxed);
+        self.duplicate_graph_read_suspensions
+            .fetch_add(1, Ordering::Relaxed);
+        let restore = Restore {
+            objects: &self.object_charge_suspensions,
+            payloads: &self.duplicate_graph_read_suspensions,
+        };
+        let result = replay();
+        drop(restore);
+        result
+    }
+
     /// Charges a header lookup against the object-count ceiling only.
     ///
     /// Header reads intentionally do not spend byte budget because they do not
     /// return or retain an inflated payload.
     pub fn charge_header(&self) -> Result<(), Error> {
         self.check()?;
-        charge(&self.objects, 1, self.limits.max_objects, "max_objects")
+        if self.object_charge_suspensions.load(Ordering::Relaxed) == 0 {
+            charge(&self.objects, 1, self.limits.max_objects, "max_objects")?;
+        }
+        Ok(())
     }
 
     /// Charges one tree entry that is about to be emitted.

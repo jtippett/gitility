@@ -253,10 +253,17 @@ defmodule Gitility do
   many parent trees. Its worst-case cost is O(history × path-depth), with an
   additional bounded change-set pass at each rename candidate.
 
-  A merge is emitted exactly when the tracked path state differs from the
-  merge's first parent. Gitility does not apply Git's TREESAME pruning across
-  any parent; the closest canonical oracle is
-  `git log --no-patch --full-history --diff-merges=first-parent -- <path>`.
+  A merge is emitted exactly when the tracked path state differs from its first
+  parent. Without rename following, no Git invocation reproduces this rule: the
+  nearest oracle, `git log --full-history -- <path>`, additionally emits merges
+  whose path changed only relative to a non-first parent; Gitility's
+  design-sanctioned R3 rule deliberately produces fewer such noise merges. With
+  `follow_renames: true`, `git log --full-history --diff-merges=first-parent
+  --follow -- <path>` matches Gitility exactly on the pinned git 2.55.0.
+
+  `path` is always one literal repository path; pathspec magic and wildmatch
+  metacharacters are rejected. A path that never existed returns an empty page,
+  matching `git log`; the corresponding blame query returns `:invalid_path`.
 
   ## Options
 
@@ -352,6 +359,10 @@ defmodule Gitility do
   ceiling fails the whole call; narrow `:lines` to reduce work. Because the
   final file is mandatory input, a HEAD blob above `max_object_bytes` returns
   `:object_too_large` rather than a warning or truncated result.
+
+  The path is literal, not a pathspec. Symlink and gitlink paths return
+  `:invalid_argument` by design (R2); canonical Git instead blames a symlink's
+  target text, which is an intentional capability difference.
   """
   @spec blame(Snapshot.t(), binary(), keyword()) :: {:ok, Blame.t()} | {:error, Error.t()}
   def blame(snapshot, path, opts \\ [])
@@ -596,10 +607,15 @@ defmodule Gitility do
 
   defp validate_blame_lines(nil), do: {:ok, nil}
 
-  defp validate_blame_lines(%Range{first: first, last: last})
-       when is_integer(first) and is_integer(last) do
+  defp validate_blame_lines(%Range{first: first, last: last, step: step})
+       when is_integer(first) and is_integer(last) and
+              ((first <= last and step == 1) or (first > last and step == -1)) do
     validate_blame_line_pair(min(first, last), max(first, last))
   end
+
+  defp validate_blame_lines(%Range{first: first, last: last})
+       when is_integer(first) and is_integer(last),
+       do: NativeSupport.invalid_argument(":lines Range step must be 1 or -1")
 
   defp validate_blame_lines({first, last})
        when is_integer(first) and is_integer(last) do

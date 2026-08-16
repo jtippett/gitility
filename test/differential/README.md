@@ -16,7 +16,9 @@ The differential gate is enabled by default. Engine-backed comparisons carry
 the `:gitility_engine` tag so developers can select that gate explicitly (for
 example, `mix test --only gitility_engine`). Unknown mismatches fail; only
 cases whose id, operation, fixture repository, and query all exactly match a
-record in `allowlist.exs` pass with a visible allowlist record.
+record in `allowlist.exs` pass with a visible allowlist record. Entries for
+ordered history results also pin the exact Git and Gitility commit sequences,
+so a different mismatch in the same context still fails.
 
 Content-search parity uses `git grep -F` for literal byte patterns, `-i` only
 for the certified ASCII folding cases, `-I` for the default binary policy, and
@@ -33,9 +35,13 @@ than normalized in the adapter.
 
 Blame parity uses byte-oriented porcelain parsing and compares coalesced hunk
 boundaries, commit IDs, original paths, and boundary flags. Path-history parity
-uses `git log --format=%H --no-patch --full-history
---diff-merges=first-parent [--follow] -- <path>`. This is the closest oracle for
-Gitility's explicit rule (compare every commit with its first parent), but it
-does not redefine Gitility in terms of Git's TREESAME simplification. Exact
-sequence differences, including rewrite-candidate selection under `--follow`,
-remain triaged divergences rather than normalized output.
+uses `git log --format=%H --no-patch --full-history [--diff-merges=first-parent
+--follow] -- <path>`. Without `--follow`, no Git invocation reproduces
+Gitility's explicit first-parent comparison rule: the nearest oracle
+additionally emits a merge when the path differs only from a non-first parent,
+and Gitility deliberately produces fewer such noise merges under design R3.
+With `--follow`, `--diff-merges=first-parent` is load-bearing on the pinned
+git 2.55.0 — it switches merge selection to first-parent comparison and
+matches Gitility exactly (a no-op without `--follow`). Exact sequence differences, including Git's copy detection
+under `--follow`, remain asserted, tightly allowlisted divergences rather than
+normalized output.

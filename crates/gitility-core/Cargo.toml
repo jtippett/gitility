@@ -9,6 +9,7 @@ rust-version.workspace = true
 # Before changing them, run `../../scripts/check-public-api.sh` with
 # cargo-public-api installed; its rustdoc JSON input currently needs nightly.
 bstr = { version = "=1.13.1", default-features = false, features = ["std"] }
+gix-blame = { version = "=0.16.0", default-features = false, features = ["sha1"] }
 gix-config = { version = "=0.59.0", default-features = false }
 gix-diff = { path = "vendor/gix-diff", version = "=0.66.0", default-features = false, features = ["blob", "sha1", "sha256"] }
 gix-glob = { version = "=0.27.0", default-features = false }

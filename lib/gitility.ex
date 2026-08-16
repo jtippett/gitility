@@ -247,23 +247,39 @@ defmodule Gitility do
   budgeted commit walk that tree-diffs each step for the path.
   `follow_renames: true` engages rename tracking to re-target the path
   across renames; its rename-candidate selection deviates from canonical
-  Git in documented ways (see the design doc), which is why it is opt-in.
+  Git in documented ways (see the design doc).
 
   Path history is budgeted separately from `log/2` because it may diff
-  many parent trees.
+  many parent trees. Its worst-case cost is O(history × path-depth), with an
+  additional bounded change-set pass at each rename candidate.
+
+  A merge is emitted exactly when the tracked path state differs from the
+  merge's first parent. Gitility does not apply Git's TREESAME pruning across
+  any parent; the closest canonical oracle is
+  `git log --no-patch --full-history --diff-merges=first-parent -- <path>`.
 
   ## Options
 
-    * `:follow_renames` — follow the path across renames (default `false`).
-    * `:first_parent` — default `false`.
+    * `:follow_renames` — follow the path across renames (default `true`).
     * `:limit`, `:cursor` — pagination.
     * `:limits` — a `Gitility.Limits` override.
   """
   @spec history(Snapshot.t(), binary(), keyword()) ::
           {:ok, Page.t(Gitility.Commit.t())} | {:error, Error.t()}
-  def history(snapshot, path, opts \\ []) do
-    _ = {snapshot, path, opts}
-    NotImplementedError.stub!(:"history/3", "Milestone 3")
+  def history(snapshot, path, opts \\ [])
+
+  def history(%Snapshot{} = snapshot, path, opts) do
+    {opts, limits} = history_options!(opts)
+
+    NativeSupport.await_sync(
+      fn -> submit_history(snapshot, path, opts, limits, false) end,
+      limits.timeout_ms,
+      :history
+    )
+  end
+
+  def history(_snapshot, _path, _opts) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Snapshot", operation: :history)}
   end
 
   ## ————————————————————————————————————————————————————————————————
@@ -326,18 +342,32 @@ defmodule Gitility do
     * `:lines` — a 1-based inclusive `Range` to blame (much cheaper than
       whole-file for large files).
     * `:follow_renames` — track the content across renames (default `true`).
-    * `:since` — don't attribute past this bound; older lines land in
-      boundary hunks.
     * `:limits` — a `Gitility.Limits` override.
 
   There is deliberately no `first_parent:` option in 0.x: upstream has no
   first-parent blame, and a silently-wrong emulation would be worse than
   the missing option.
+
+  Blame never paginates or returns a partial attribution. A timeout or budget
+  ceiling fails the whole call; narrow `:lines` to reduce work. Because the
+  final file is mandatory input, a HEAD blob above `max_object_bytes` returns
+  `:object_too_large` rather than a warning or truncated result.
   """
   @spec blame(Snapshot.t(), binary(), keyword()) :: {:ok, Blame.t()} | {:error, Error.t()}
-  def blame(snapshot, path, opts \\ []) do
-    _ = {snapshot, path, opts}
-    NotImplementedError.stub!(:"blame/3", "Milestone 3")
+  def blame(snapshot, path, opts \\ [])
+
+  def blame(%Snapshot{} = snapshot, path, opts) do
+    {opts, limits} = blame_options!(opts)
+
+    NativeSupport.await_sync(
+      fn -> submit_blame(snapshot, path, opts, limits, false) end,
+      limits.timeout_ms,
+      :blame
+    )
+  end
+
+  def blame(_snapshot, _path, _opts) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Snapshot", operation: :blame)}
   end
 
   ## ————————————————————————————————————————————————————————————————
@@ -564,6 +594,34 @@ defmodule Gitility do
     end
   end
 
+  defp validate_blame_lines(nil), do: {:ok, nil}
+
+  defp validate_blame_lines(%Range{first: first, last: last})
+       when is_integer(first) and is_integer(last) do
+    validate_blame_line_pair(min(first, last), max(first, last))
+  end
+
+  defp validate_blame_lines({first, last})
+       when is_integer(first) and is_integer(last) do
+    validate_blame_line_pair(first, last)
+  end
+
+  defp validate_blame_lines(%Range{}),
+    do: raise(ArgumentError, ":lines Range endpoints must be integers")
+
+  defp validate_blame_lines({_first, _last}),
+    do: raise(ArgumentError, ":lines tuple endpoints must be integers")
+
+  defp validate_blame_lines(_value),
+    do: raise(ArgumentError, ":lines must be a Range, {start, end}, or nil")
+
+  defp validate_blame_line_pair(first, last)
+       when first > 0 and first <= last and last <= 4_294_967_295,
+       do: {:ok, {first, last}}
+
+  defp validate_blame_line_pair(_first, _last),
+    do: NativeSupport.invalid_argument(":lines must have positive 1-based ordered endpoints")
+
   defp effective_max_bytes(max_bytes, hard_limit)
        when is_integer(max_bytes) and max_bytes >= 0,
        do: {:ok, min(max_bytes, hard_limit)}
@@ -716,6 +774,27 @@ defmodule Gitility do
     {opts, limits}
   end
 
+  defp history_options!(opts) do
+    opts =
+      Keyword.validate!(opts,
+        follow_renames: true,
+        limit: 1_000,
+        cursor: nil,
+        limits: nil
+      )
+
+    limits = opts[:limits] || Limits.new()
+    _limits_map = NativeSupport.limits_map!(limits)
+    {opts, limits}
+  end
+
+  defp blame_options!(opts) do
+    opts = Keyword.validate!(opts, lines: nil, follow_renames: true, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    _limits_map = NativeSupport.limits_map!(limits)
+    {opts, limits}
+  end
+
   defp search_options!(opts) do
     opts =
       Keyword.validate!(opts,
@@ -825,6 +904,61 @@ defmodule Gitility do
             limit: limit,
             cursor: cursor
           },
+          limits_map,
+          detach
+        )
+      end)
+    end
+  end
+
+  defp submit_history(
+         %Snapshot{odb: %ODB{ref: resource, runtime: runtime}} = snapshot,
+         path,
+         opts,
+         limits,
+         detach
+       ) do
+    limits_map = NativeSupport.limits_map!(limits)
+    follow_renames = NativeSupport.boolean_option!(opts, :follow_renames)
+
+    with :ok <- validate_binary(path, "history path"),
+         {:ok, limit} <- effective_page_limit(opts[:limit], limits.max_results),
+         {:ok, cursor} <- decode_cursor(opts[:cursor]) do
+      NativeSupport.submit_job(runtime, :history, fn runtime_resource ->
+        Native.job_submit_history(
+          runtime_resource,
+          resource,
+          snapshot.commit_oid.bytes,
+          snapshot.tree_oid.bytes,
+          path,
+          %{follow_renames: follow_renames, limit: limit, cursor: cursor},
+          limits_map,
+          detach
+        )
+      end)
+    end
+  end
+
+  defp submit_blame(
+         %Snapshot{odb: %ODB{ref: resource, runtime: runtime}} = snapshot,
+         path,
+         opts,
+         limits,
+         detach
+       ) do
+    limits_map = NativeSupport.limits_map!(limits)
+    follow_renames = NativeSupport.boolean_option!(opts, :follow_renames)
+
+    with :ok <- validate_binary(path, "blame path"),
+         {:ok, lines} <- validate_blame_lines(opts[:lines]) do
+      NativeSupport.submit_job(runtime, :blame, fn runtime_resource ->
+        Native.job_submit_blame(
+          runtime_resource,
+          resource,
+          snapshot.commit_oid.bytes,
+          snapshot.tree_oid.bytes,
+          path,
+          %{lines: lines, follow_renames: follow_renames},
           limits_map,
           detach
         )
@@ -1020,9 +1154,25 @@ defmodule Gitility do
   @doc "Asynchronous `history/3`; returns the `Gitility.Job`."
   @spec async_history(Snapshot.t(), binary(), keyword()) ::
           {:ok, Job.t()} | {:error, Error.t()}
-  def async_history(snapshot, path, opts \\ []) do
-    _ = {snapshot, path, opts}
-    NotImplementedError.stub!(:"async_history/3", "Milestone 3")
+  def async_history(snapshot, path, opts \\ [])
+
+  def async_history(%Snapshot{} = snapshot, path, opts) do
+    opts =
+      Keyword.validate!(opts,
+        follow_renames: true,
+        limit: 1_000,
+        cursor: nil,
+        limits: nil,
+        detach: false
+      )
+
+    detach = NativeSupport.boolean_option!(opts, :detach)
+    {opts, limits} = opts |> Keyword.delete(:detach) |> history_options!()
+    submit_history(snapshot, path, opts, limits, detach)
+  end
+
+  def async_history(_snapshot, _path, _opts) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Snapshot", operation: :history)}
   end
 
   @doc "Asynchronous `diff/3`; returns the `Gitility.Job`."
@@ -1055,9 +1205,24 @@ defmodule Gitility do
   @doc "Asynchronous `blame/3`; returns the `Gitility.Job`."
   @spec async_blame(Snapshot.t(), binary(), keyword()) ::
           {:ok, Job.t()} | {:error, Error.t()}
-  def async_blame(snapshot, path, opts \\ []) do
-    _ = {snapshot, path, opts}
-    NotImplementedError.stub!(:"async_blame/3", "Milestone 3")
+  def async_blame(snapshot, path, opts \\ [])
+
+  def async_blame(%Snapshot{} = snapshot, path, opts) do
+    opts =
+      Keyword.validate!(opts,
+        lines: nil,
+        follow_renames: true,
+        limits: nil,
+        detach: false
+      )
+
+    detach = NativeSupport.boolean_option!(opts, :detach)
+    {opts, limits} = opts |> Keyword.delete(:detach) |> blame_options!()
+    submit_blame(snapshot, path, opts, limits, detach)
+  end
+
+  def async_blame(_snapshot, _path, _opts) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Snapshot", operation: :blame)}
   end
 
   ## ————————————————————————————————————————————————————————————————

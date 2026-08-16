@@ -16,3 +16,9 @@ rust-version = "1.82"
 [workspace.dependencies]
 gitility-core = { path = "crates/gitility-core" }
 rustler = "0.38"
+
+# gix-blame 0.16.0 names gix-diff with a crates.io range. Force that edge,
+# along with our direct one, through the audited thread-free vendor copy so
+# type identity and the NIF's no-background-thread policy stay intact.
+[patch.crates-io]
+gix-diff = { path = "crates/gitility-core/vendor/gix-diff" }

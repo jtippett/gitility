@@ -24,8 +24,8 @@ defmodule Gitility.Blame do
     `final_range` is the 1-based inclusive line range in the blamed (final)
     file; `original_range` is the corresponding range in `original_path` as
     it existed in `commit_oid`. `boundary` marks hunks attributed to a
-    boundary commit (the walk stopped there, e.g. at a `since:` bound —
-    attribution is "at least this old", not exact).
+    boundary commit (the walk stopped at a root or local shallow boundary —
+    attribution is "at least this old", not exact at a shallow boundary).
     """
 
     @enforce_keys [:final_range, :original_range, :commit_oid, :original_path]

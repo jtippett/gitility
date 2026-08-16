@@ -119,6 +119,20 @@ commit_all_at() {
     git -C "$repository" commit --quiet -m "$message"
 }
 
+commit_as_at() {
+  local repository=$1
+  local timestamp=$2
+  local author_name=$3
+  local author_email=$4
+  local message=$5
+
+  git -C "$repository" add --all
+  env GIT_AUTHOR_NAME="$author_name" GIT_AUTHOR_EMAIL="$author_email" \
+    GIT_AUTHOR_DATE="$timestamp" GIT_COMMITTER_NAME="$author_name" \
+    GIT_COMMITTER_EMAIL="$author_email" GIT_COMMITTER_DATE="$timestamp" \
+    git -C "$repository" commit --quiet -m "$message"
+}
+
 merge_at() {
   local repository=$1
   local timestamp=$2
@@ -308,6 +322,117 @@ make_history() {
   git -C "$work_repository" tag fixture/candidates-after HEAD
 
   export_bare "$work_repository" "$bare_repository" sha1
+}
+
+make_blame() {
+  local work_repository=$1
+  local bare_repository=$2
+  local root_commit
+  local append_commit
+  local delete_commit
+  local rewrite_commit
+  local rename_commit
+  local post_rename_commit
+  local edited_rename_commit
+  local branch_base
+  local feature_commit
+  local main_commit
+  local merge_commit
+  local final_commit
+  local final_tree
+  local final_payload
+
+  init_work_repo "$work_repository" sha1
+  mkdir -p "$work_repository/docs"
+  printf 'alpha\r\nbravo\r\ncharlie\ndelta\necho\n' >"$work_repository/docs/legacy.txt"
+  printf 'independent root\n' >"$work_repository/independent.txt"
+  commit_as_at "$work_repository" '2001-08-01T00:00:00+0000' \
+    'Alice Attribution' 'alice@gitility.invalid' 'Blame root with CRLF lines'
+  root_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/blame-root "$root_commit"
+
+  printf 'foxtrot\n' >>"$work_repository/docs/legacy.txt"
+  commit_as_at "$work_repository" '2001-08-01T00:01:00+0000' \
+    'Bob Bytes' 'bob@gitility.invalid' 'Append one blamed line'
+  append_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/blame-append "$append_commit"
+
+  printf 'alpha\r\ncharlie\ndelta\necho\nfoxtrot\n' >"$work_repository/docs/legacy.txt"
+  commit_as_at "$work_repository" '2001-08-01T00:02:00+0000' \
+    'Cara Committer' 'cara@gitility.invalid' 'Delete one blamed line'
+  delete_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/blame-delete "$delete_commit"
+
+  printf 'alpha\r\ncharlie rewritten\ndelta\necho\nfoxtrot\n' \
+    >"$work_repository/docs/legacy.txt"
+  printf 'independent rewrite marker\n' >>"$work_repository/independent.txt"
+  commit_as_at "$work_repository" '2001-08-01T00:03:00+0000' \
+    'Alice Attribution' 'alice@gitility.invalid' 'Rewrite the blamed middle'
+  rewrite_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/blame-rewrite "$rewrite_commit"
+
+  git -C "$work_repository" mv docs/legacy.txt docs/story.txt
+  commit_as_at "$work_repository" '2001-08-01T00:04:00+0000' \
+    'Bob Bytes' 'bob@gitility.invalid' 'Rename the blamed file exactly'
+  rename_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/blame-rename "$rename_commit"
+
+  printf 'alpha\r\ncharlie rewritten\ndelta\necho revised\nfoxtrot\n' \
+    >"$work_repository/docs/story.txt"
+  commit_as_at "$work_repository" '2001-08-01T00:05:00+0000' \
+    'Cara Committer' 'cara@gitility.invalid' 'Edit after the exact rename'
+  post_rename_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/blame-post-rename "$post_rename_commit"
+
+  git -C "$work_repository" mv docs/story.txt docs/final.txt
+  printf 'golf\n' >>"$work_repository/docs/final.txt"
+  commit_as_at "$work_repository" '2001-08-01T00:06:00+0000' \
+    'Alice Attribution' 'alice@gitility.invalid' 'Rename while editing the blamed file'
+  edited_rename_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/blame-edited-rename "$edited_rename_commit"
+  branch_base="$edited_rename_commit"
+
+  git -C "$work_repository" switch --quiet -c blame-feature
+  printf 'alpha feature\r\ncharlie rewritten\ndelta\necho revised\nfoxtrot\ngolf\n' \
+    >"$work_repository/docs/final.txt"
+  commit_as_at "$work_repository" '2001-08-01T00:07:00+0000' \
+    'Bob Bytes' 'bob@gitility.invalid' 'Feature parent touches blamed file'
+  feature_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/blame-feature "$feature_commit"
+
+  git -C "$work_repository" switch --quiet main
+  test "$(git -C "$work_repository" rev-parse HEAD)" = "$branch_base"
+  printf 'alpha\r\ncharlie rewritten\ndelta main\necho revised\nfoxtrot\ngolf\n' \
+    >"$work_repository/docs/final.txt"
+  commit_as_at "$work_repository" '2001-08-01T00:08:00+0000' \
+    'Cara Committer' 'cara@gitility.invalid' 'Main parent touches blamed file'
+  main_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/blame-main "$main_commit"
+
+  env GIT_AUTHOR_NAME='Alice Attribution' GIT_AUTHOR_EMAIL='alice@gitility.invalid' \
+    GIT_AUTHOR_DATE='2001-08-01T00:09:00+0000' \
+    GIT_COMMITTER_NAME='Alice Attribution' GIT_COMMITTER_EMAIL='alice@gitility.invalid' \
+    GIT_COMMITTER_DATE='2001-08-01T00:09:00+0000' GIT_MERGE_AUTOEDIT=no \
+    git -C "$work_repository" merge --quiet --no-ff --no-edit \
+      -m 'Merge both blamed-file edits' blame-feature
+  merge_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/blame-merge "$merge_commit"
+
+  printf 'latin-1 ol\351' >>"$work_repository/docs/final.txt"
+  git -C "$work_repository" add --all
+  final_tree="$(git -C "$work_repository" write-tree)"
+  final_payload="$scratch_dir/blame-final-commit"
+  printf 'tree %s\nparent %s\nauthor B\351b Bytes <bob@gitility.invalid> 996624600 +0000\ncommitter B\351b Bytes <bob@gitility.invalid> 996624600 +0000\n\nAdd Latin-1 without a trailing newline\n' \
+    "$final_tree" "$merge_commit" >"$final_payload"
+  final_commit="$(git -C "$work_repository" hash-object -t commit -w --stdin <"$final_payload")"
+  git -C "$work_repository" update-ref refs/heads/main "$final_commit" "$merge_commit"
+  git -C "$work_repository" tag fixture/blame-final "$final_commit"
+
+  export_bare "$work_repository" "$bare_repository" sha1
+  git -C "$bare_repository" fsck --full --strict --no-dangling >/dev/null
+  test "$(git -C "$bare_repository" rev-list --count HEAD)" = 11
+  test "$(git -C "$bare_repository" rev-list --parents -n 1 fixture/blame-merge | awk '{ print NF }')" = 3
+  test "$(git -C "$bare_repository" show fixture/blame-final:docs/final.txt | tail -c 1 | wc -l | awk '{ print $1 }')" = 0
 }
 
 make_graph() {
@@ -700,6 +825,7 @@ make_diff() {
 sha1_work="$scratch_dir/sha1-basic-work"
 sha256_work="$scratch_dir/sha256-basic-work"
 history_work="$scratch_dir/sha1-history-work"
+blame_work="$scratch_dir/sha1-blame-work"
 graph_work="$scratch_dir/sha1-graph-work"
 lfs_work="$scratch_dir/lfs-pointer-work"
 nested_work="$scratch_dir/sha1-nested-work"
@@ -709,6 +835,7 @@ diff_work="$scratch_dir/sha1-diff-work"
 make_basic sha1 "$sha1_work" "$output_dir/sha1-basic.git"
 make_basic sha256 "$sha256_work" "$output_dir/sha256-basic.git"
 make_history "$history_work" "$output_dir/sha1-history.git"
+make_blame "$blame_work" "$output_dir/sha1-blame.git"
 make_graph "$graph_work" "$output_dir/sha1-graph.git"
 make_lfs_pointer "$lfs_work" "$output_dir/lfs-pointer.git"
 make_nested "$nested_work" "$output_dir/sha1-nested.git"
@@ -885,6 +1012,7 @@ PY
 sha1_head="$(git -C "$output_dir/sha1-basic.git" rev-parse HEAD)"
 sha256_head="$(git -C "$output_dir/sha256-basic.git" rev-parse HEAD)"
 history_head="$(git -C "$output_dir/sha1-history.git" rev-parse HEAD)"
+blame_head="$(git -C "$output_dir/sha1-blame.git" rev-parse HEAD)"
 graph_head="$(git -C "$output_dir/sha1-graph.git" rev-parse HEAD)"
 lfs_head="$(git -C "$output_dir/lfs-pointer.git" rev-parse HEAD)"
 nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
@@ -898,6 +1026,11 @@ diff_head="$(git -C "$output_dir/sha1-diff.git" rev-parse fixture/diff-head)"
   printf 'sha1_basic_readme=%s\n' "$missing_oid"
   printf 'sha256_basic_head=%s\n' "$sha256_head"
   printf 'sha1_history_head=%s\n' "$history_head"
+  printf 'sha1_blame_head=%s\n' "$blame_head"
+  for blame_key in root append delete rewrite rename post-rename edited-rename feature main merge final; do
+    printf 'sha1_blame_%s=%s\n' "${blame_key//-/_}" \
+      "$(git -C "$output_dir/sha1-blame.git" rev-parse "fixture/blame-$blame_key")"
+  done
   printf 'sha1_history_criss_left=%s\n' \
     "$(git -C "$output_dir/sha1-history.git" rev-parse fixture/criss-left)"
   printf 'sha1_history_criss_right=%s\n' \

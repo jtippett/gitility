@@ -274,6 +274,27 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
+  @doc "Runs the closest Git oracle for Gitility's first-parent tree comparison rule."
+  @spec path_history(Path.t(), binary(), binary(), keyword()) :: result([binary()])
+  def path_history(repository, revision, path, options \\ []) do
+    options = Keyword.validate!(options, follow_renames: true)
+
+    arguments =
+      [
+        "log",
+        "--format=%H",
+        "--no-patch",
+        "--full-history",
+        "--diff-merges=first-parent"
+      ] ++
+        optional_flag(options[:follow_renames], "--follow") ++
+        [revision, "--", path]
+
+    with {:ok, output} <- git(repository, arguments) do
+      {:ok, metadata_lines(output)}
+    end
+  end
+
   @spec log_follow(Path.t(), binary(), binary(), [binary()]) :: result([map()])
   def log_follow(repository, revision, path, options \\ []) do
     format = "--format=format:%H%x00%P%x00"
@@ -661,13 +682,14 @@ defmodule Gitility.Differential.Oracle do
   defp parse_blame_lines(output, path_cache, lines) do
     with {:ok, header, rest} <- take_line(output),
          {:ok, commit, original_line, final_line} <- parse_blame_header(header),
-         {:ok, original_path, remaining, next_cache} <-
-           consume_blame_metadata(rest, commit, path_cache, nil) do
+         {:ok, original_path, boundary, remaining, next_cache} <-
+           consume_blame_metadata(rest, commit, path_cache, nil, false) do
       line = %{
         commit: commit,
         original_line: original_line,
         final_line: final_line,
-        original_path: original_path
+        original_path: original_path,
+        boundary: boundary
       }
 
       parse_blame_lines(remaining, next_cache, [line | lines])
@@ -689,22 +711,31 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
-  defp consume_blame_metadata(output, commit, path_cache, current_path) do
+  defp consume_blame_metadata(output, commit, path_cache, current_path, boundary) do
     with {:ok, line, rest} <- take_line(output) do
       case line do
         <<"\t", _source_line::binary>> ->
-          case current_path || Map.get(path_cache, commit) do
+          case if(current_path,
+                 do: {current_path, boundary},
+                 else: Map.get(path_cache, commit)
+               ) do
             nil -> {:error, "blame record has no original path for #{commit}"}
-            path -> {:ok, path, rest, Map.put(path_cache, commit, path)}
+
+            {path, cached_boundary} ->
+              {:ok, path, cached_boundary, rest,
+               Map.put(path_cache, commit, {path, cached_boundary})}
           end
 
         <<"filename ", encoded_path::binary>> ->
           with {:ok, path} <- unquote_git_path(encoded_path) do
-            consume_blame_metadata(rest, commit, path_cache, path)
+            consume_blame_metadata(rest, commit, path_cache, path, boundary)
           end
 
+        <<"boundary">> ->
+          consume_blame_metadata(rest, commit, path_cache, current_path, true)
+
         _metadata ->
-          consume_blame_metadata(rest, commit, path_cache, current_path)
+          consume_blame_metadata(rest, commit, path_cache, current_path, boundary)
       end
     end
   end
@@ -718,6 +749,7 @@ defmodule Gitility.Differential.Oracle do
           {last_final_start, last_final_end} = last.final_range
 
           if last.commit == line.commit and last.original_path == line.original_path and
+               last.boundary == line.boundary and
                last_original_end + 1 == line.original_line and
                last_final_end + 1 == line.final_line do
             [
@@ -744,7 +776,8 @@ defmodule Gitility.Differential.Oracle do
       commit: line.commit,
       original_path: line.original_path,
       original_range: {line.original_line, line.original_line},
-      final_range: {line.final_line, line.final_line}
+      final_range: {line.final_line, line.final_line},
+      boundary: line.boundary
     }
   end
 

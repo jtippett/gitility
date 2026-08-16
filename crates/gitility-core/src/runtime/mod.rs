@@ -20,6 +20,7 @@ mod observer;
 mod sync;
 pub mod thread_budget;
 
+use crate::blame::Blame;
 use crate::budget::{Budget, BudgetLimits};
 use crate::diff::Diff;
 use crate::error::{Error, ErrorCode};
@@ -74,6 +75,8 @@ pub enum JobOutput {
     Tree(TreePage),
     Search(SearchPage),
     Log(LogPage),
+    History(LogPage),
+    Blame(Blame),
     File(FileRead),
     Header(Option<ObjectHeader>),
     Object { kind: ObjectKind, data: Vec<u8> },

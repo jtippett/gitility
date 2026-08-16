@@ -2,6 +2,7 @@ defmodule Gitility.NativeSupport do
   @moduledoc false
 
   alias Gitility.{
+    Blame,
     Commit,
     Diff,
     Error,
@@ -107,6 +108,7 @@ defmodule Gitility.NativeSupport do
       |> maybe_put(:file, Map.get(error, :file))
       |> maybe_put(:retry_after_ms, Map.get(error, :retry_after_ms))
       |> maybe_put(:reason, Map.get(error, :reason))
+      |> maybe_put(:line_count, Map.get(error, :line_count))
 
     Error.new(code, message, retryable: retryable, operation: operation, details: details)
   end
@@ -200,6 +202,31 @@ defmodule Gitility.NativeSupport do
       truncated: page.truncated,
       stats: struct!(Stats, Map.to_list(stats)),
       warnings: page_warnings(page.truncated, stats.stopped_by)
+    }
+  end
+
+  def job_payload(%{path: path, hunks: hunks, stats: stats, warnings: warnings}) do
+    %Blame{
+      path: path,
+      hunks:
+        Enum.map(hunks, fn hunk ->
+          %Blame.Hunk{
+            final_range: %Range{first: hunk.final_start, last: hunk.final_end, step: 1},
+            original_range: %Range{
+              first: hunk.original_start,
+              last: hunk.original_end,
+              step: 1
+            },
+            commit_oid: job_oid(hunk.commit_oid),
+            original_path: hunk.original_path,
+            author: identity_payload(hunk.author),
+            committer: identity_payload(hunk.committer),
+            summary: hunk.summary,
+            boundary: hunk.boundary
+          }
+        end),
+      stats: struct!(Stats, Map.to_list(stats)),
+      warnings: warnings
     }
   end
 

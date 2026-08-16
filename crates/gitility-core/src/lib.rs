@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ancestry;
+pub mod blame;
 pub mod budget;
 mod commit_graph;
 pub mod cursor;
@@ -27,6 +28,7 @@ pub mod lru;
 pub mod object;
 pub mod odb;
 pub mod packfetch;
+pub mod path_history;
 pub mod pathspec;
 pub mod provider_odb;
 pub mod refs;
@@ -41,6 +43,7 @@ pub mod verify;
 mod test_support;
 
 pub use ancestry::{is_ancestor, merge_base};
+pub use blame::{blame, Blame, BlameHunk, BlameOptions};
 pub use budget::{Budget, BudgetLimits};
 pub use cursor::{decode as decode_cursor, encode as encode_cursor, Cursor, CursorExpected};
 pub use decode::{
@@ -64,6 +67,7 @@ pub use packfetch::{
     PackFetchOptions, PackManifest, RangePayload, RangePendingTable, RangeReplySlot, RangeRequest,
     RangeRequestKind, RangeRequestSender, RangeTransport,
 };
+pub use path_history::{history, HistoryOptions};
 pub use provider_odb::{
     PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions,
     ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport, ReplySlot,

@@ -278,18 +278,18 @@ impl PartialOrd for TimedCommit {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct WalkedCommit {
-    id: Oid,
-    time: i64,
+pub(crate) struct WalkedCommit {
+    pub(crate) id: Oid,
+    pub(crate) time: i64,
 }
 
-enum Walk<'a> {
+pub(crate) enum Walk<'a> {
     Chronological(ChronologicalWalk<'a>),
     Ordered(OrderedWalk),
 }
 
 impl<'a> Walk<'a> {
-    fn new(
+    pub(crate) fn new(
         store: &'a dyn ObjectDb,
         start: Oid,
         opts: &'a LogOptions,
@@ -305,14 +305,14 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn next(&mut self, charge_visit: bool) -> Option<Result<WalkedCommit, Error>> {
+    pub(crate) fn next(&mut self, charge_visit: bool) -> Option<Result<WalkedCommit, Error>> {
         match self {
             Self::Chronological(walk) => walk.next(charge_visit),
             Self::Ordered(walk) => walk.next(),
         }
     }
 
-    fn take_pending_error(&mut self) -> Option<Error> {
+    pub(crate) fn take_pending_error(&mut self) -> Option<Error> {
         match self {
             Self::Chronological(walk) => walk.pending_error.take(),
             Self::Ordered(_) => None,
@@ -333,7 +333,7 @@ impl<'a> Walk<'a> {
     }
 }
 
-struct ChronologicalWalk<'a> {
+pub(crate) struct ChronologicalWalk<'a> {
     store: &'a dyn ObjectDb,
     opts: &'a LogOptions,
     budget: &'a Budget,
@@ -437,7 +437,7 @@ impl PartialOrd for TimedOid {
     }
 }
 
-struct OrderedWalk {
+pub(crate) struct OrderedWalk {
     nodes: HashMap<Oid, OrderedNode>,
     child_counts: HashMap<Oid, usize>,
     queue: OrderedQueue,
@@ -654,7 +654,7 @@ fn read_meta(
     Ok(CommitMeta { parents, time })
 }
 
-fn read_payload(
+pub(crate) fn read_payload(
     store: &dyn ObjectDb,
     id: Oid,
     budget: &Budget,
@@ -685,7 +685,11 @@ fn read_payload(
     Ok(payload)
 }
 
-fn decode_log_commit(id: Oid, payload: &[u8], shallow: bool) -> Result<LogCommit, Error> {
+pub(crate) fn decode_log_commit(
+    id: Oid,
+    payload: &[u8],
+    shallow: bool,
+) -> Result<LogCommit, Error> {
     let (headers, message) = split_commit(payload).map_err(|error| error.with_oid_if_none(id))?;
     let message_len = message.len().min(MESSAGE_BYTES);
     let subject_len = message

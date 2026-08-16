@@ -30,3 +30,12 @@ obtain those raw paths and invoke one histogram diff per path, so patch headers
 are never used as a path parser. Rename/copy candidate selection may differ
 between Git and gitoxide; every exact differing case must be triaged rather
 than normalized in the adapter.
+
+Blame parity uses byte-oriented porcelain parsing and compares coalesced hunk
+boundaries, commit IDs, original paths, and boundary flags. Path-history parity
+uses `git log --format=%H --no-patch --full-history
+--diff-merges=first-parent [--follow] -- <path>`. This is the closest oracle for
+Gitility's explicit rule (compare every commit with its first parent), but it
+does not redefine Gitility in terms of Git's TREESAME simplification. Exact
+sequence differences, including rewrite-candidate selection under `--follow`,
+remain triaged divergences rather than normalized output.

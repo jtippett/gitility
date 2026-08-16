@@ -174,7 +174,9 @@ pub struct Error {
     /// A sanitized machine-readable reason for failures whose underlying
     /// engine provides useful diagnostics (for example safe-regex compilation
     /// or an upstream defect class behind an unsupported operation).
-    pub reason: Option<String>,
+    pub reason: Option<Box<str>>,
+    /// File line count associated with a range-validation failure.
+    pub line_count: Option<u32>,
 }
 
 impl Error {
@@ -189,6 +191,7 @@ impl Error {
             order: None,
             file: None,
             reason: None,
+            line_count: None,
         }
     }
 
@@ -203,6 +206,7 @@ impl Error {
             order: None,
             file: None,
             reason: None,
+            line_count: None,
         }
     }
 
@@ -246,8 +250,19 @@ impl Error {
 
     /// Attaches a sanitized engine reason to this failure.
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
-        self.reason = Some(reason.into());
+        self.reason = Some(reason.into().into_boxed_str());
         self
+    }
+
+    /// Associates the blamed file's total line count with a range failure.
+    pub fn with_line_count(mut self, line_count: u32) -> Self {
+        self.line_count = Some(line_count);
+        self
+    }
+
+    /// Returns the blamed file's total line count for a range failure.
+    pub fn line_count(&self) -> Option<u32> {
+        self.line_count
     }
 }
 

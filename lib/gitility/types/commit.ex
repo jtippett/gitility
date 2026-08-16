@@ -2,32 +2,45 @@ defmodule Gitility.Commit do
   @moduledoc """
   A decoded commit.
 
-  `message` is the raw message bytes; `subject` is the decoded first line
-  as a printable string (lossy convenience). `signature_headers` carries
-  raw signature-bearing headers (`gpgsig`, …) when present — Gitility exposes
-  them but does not verify signatures in 1.0.
+  Every byte field remains exactly as Git encoded it. `subject` is the first
+  message line capped at 1 KiB, and `message_raw` is capped at 64 KiB with
+  `message_truncated` making that cap explicit. `signature_headers` contains
+  header names only (`"gpgsig"`, …), never signature payloads.
   """
 
-  @enforce_keys [:oid, :tree_oid, :parents, :message, :author, :committer]
-  defstruct [
-    :oid,
-    :tree_oid,
+  @enforce_keys [
+    :id,
     :parents,
-    :message,
+    :tree_id,
+    :author,
+    :committer,
+    :subject,
+    :message_raw,
+    :message_truncated
+  ]
+  defstruct [
+    :id,
+    :parents,
+    :tree_id,
     :subject,
     :author,
     :committer,
-    signature_headers: []
+    :message_raw,
+    :message_truncated,
+    signature_headers: [],
+    encoding: nil
   ]
 
   @type t :: %__MODULE__{
-          oid: Gitility.OID.t(),
-          tree_oid: Gitility.OID.t(),
+          id: Gitility.OID.t(),
           parents: [Gitility.OID.t()],
-          message: binary(),
-          subject: String.t() | nil,
+          tree_id: Gitility.OID.t(),
           author: Gitility.Identity.t(),
           committer: Gitility.Identity.t(),
-          signature_headers: [{binary(), binary()}]
+          subject: binary(),
+          message_raw: binary(),
+          message_truncated: boolean(),
+          signature_headers: [binary()],
+          encoding: binary() | nil
         }
 end

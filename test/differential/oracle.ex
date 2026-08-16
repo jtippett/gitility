@@ -76,6 +76,36 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
+  @spec log(Path.t(), binary(), keyword()) :: result([binary()])
+  def log(repository, revision, options \\ []) do
+    options =
+      Keyword.validate!(options,
+        order: :chronological,
+        first_parent: false,
+        since: nil,
+        until: nil
+      )
+
+    order =
+      case options[:order] do
+        :chronological -> []
+        :topological -> ["--topo-order"]
+        :date -> ["--date-order"]
+      end
+
+    arguments =
+      ["rev-list"] ++
+        order ++
+        optional_flag(options[:first_parent], "--first-parent") ++
+        optional_value(options[:since], "--since") ++
+        optional_value(options[:until], "--until") ++
+        [revision]
+
+    with {:ok, output} <- git(repository, arguments) do
+      {:ok, metadata_lines(output)}
+    end
+  end
+
   @spec rev_parse(Path.t(), binary()) :: result(binary())
   def rev_parse(repository, expression) do
     with {:ok, output} <- git(repository, ["rev-parse", "--verify", expression]) do
@@ -95,10 +125,24 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
-  @spec merge_base(Path.t(), binary(), binary()) :: result([binary()])
-  def merge_base(repository, left, right) do
-    with {:ok, output} <- git(repository, ["merge-base", "--all", left, right]) do
-      {:ok, metadata_lines(output)}
+  @spec merge_base(Path.t(), binary(), binary(), keyword()) :: result([binary()])
+  def merge_base(repository, left, right, options \\ []) do
+    options = Keyword.validate!(options, all: true)
+    arguments = ["merge-base"] ++ optional_flag(options[:all], "--all") ++ [left, right]
+
+    case git(repository, arguments) do
+      {:ok, output} -> {:ok, metadata_lines(output)}
+      {:error, %{status: 1, output: <<>>}} -> {:ok, []}
+      {:error, _error} = error -> error
+    end
+  end
+
+  @spec is_ancestor(Path.t(), binary(), binary()) :: result(boolean())
+  def is_ancestor(repository, ancestor, descendant) do
+    case git(repository, ["merge-base", "--is-ancestor", ancestor, descendant]) do
+      {:ok, _output} -> {:ok, true}
+      {:error, %{status: 1}} -> {:ok, false}
+      {:error, _error} = error -> error
     end
   end
 
@@ -249,6 +293,9 @@ defmodule Gitility.Differential.Oracle do
 
   defp optional_flag(true, flag), do: [flag]
   defp optional_flag(false, _flag), do: []
+
+  defp optional_value(nil, _flag), do: []
+  defp optional_value(value, flag), do: ["#{flag}=#{value}"]
 
   defp path_arguments(nil), do: []
   defp path_arguments(path) when is_binary(path), do: ["--", path]

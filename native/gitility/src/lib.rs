@@ -8,17 +8,18 @@
 
 use gitility_core::runtime::thread_budget;
 use gitility_core::{
-    list_tree as core_list_tree, peel as core_peel, read_file as core_read_file, Budget,
+    is_ancestor as core_is_ancestor, list_tree as core_list_tree, log as core_log,
+    merge_base as core_merge_base, peel as core_peel, read_file as core_read_file, Budget,
     BudgetLimits, BusyReason, ByteRange as CoreByteRange, CacheOptions, CacheStats,
     CallbackRangeTransport, Error, ErrorCode, FileKind, FileOptions, HashKind, HydrationStats,
     Job as CoreJob, JobObserver, JobOutput, JobSpec, JobState, LayeredOdb, LocalOdb,
-    LocalOdbOptions, ObjectDb, ObjectHeader, ObjectKind, ObjectReadResult, Oid, PackDescriptor,
-    PackFetchOdb, PackFetchOptions, PackManifest, PeelTarget, PendingTable, ProviderCacheOptions,
-    ProviderKind, ProviderOdb, ProviderOptions, ProviderPayload, ProviderReplyValue,
-    ProviderRequest, ProviderTransport, QueryStats, RangePayload, RangePendingTable, RangeRequest,
-    RangeRequestKind, RangeRequestSender, ReadManyBudget, Runtime as CoreRuntime, RuntimeConfig,
-    Snapshot, StaticOdb, SubmitError, TreeItemKind, TreeOptions, TypeFilter,
-    PROVIDER_HEADER_SIZE_CEILING,
+    LocalOdbOptions, LogIdentity, LogOptions, LogOrder, ObjectDb, ObjectHeader, ObjectKind,
+    ObjectReadResult, Oid, PackDescriptor, PackFetchOdb, PackFetchOptions, PackManifest,
+    PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions,
+    ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport, QueryStats,
+    RangePayload, RangePendingTable, RangeRequest, RangeRequestKind, RangeRequestSender,
+    ReadManyBudget, Runtime as CoreRuntime, RuntimeConfig, Snapshot, StaticOdb, SubmitError,
+    TreeItemKind, TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
 };
 use rustler::{
     types::{map::MapIterator, tuple::get_tuple},
@@ -456,7 +457,7 @@ impl JobObserver for NifJobObserver {
 
 #[derive(Clone, Copy)]
 enum JobResultKind {
-    Tree { stopped_by_max_results: bool },
+    Page { stopped_by_max_results: bool },
     Other,
 }
 
@@ -644,12 +645,23 @@ struct ReadFileOptions {
 }
 
 #[derive(NifMap)]
-struct ErrorMap {
+struct LogOptionsMap<'a> {
+    order: Atom,
+    first_parent: bool,
+    since: Option<i64>,
+    until: Option<i64>,
+    limit: u64,
+    cursor: Option<Binary<'a>>,
+}
+
+#[derive(NifMap)]
+struct ErrorMap<'a> {
     code: Atom,
     message: String,
     retryable: bool,
     limit: Option<String>,
     layer: Option<u64>,
+    oid: Option<Binary<'a>>,
 }
 
 #[derive(NifMap)]
@@ -689,6 +701,29 @@ struct TreeEntryMap<'a> {
     kind: Atom,
     mode: u32,
     size: Option<u64>,
+}
+
+#[derive(NifMap)]
+struct IdentityMap<'a> {
+    name: Binary<'a>,
+    email: Binary<'a>,
+    time: i64,
+    tz: Binary<'a>,
+    tz_offset_minutes: i32,
+}
+
+#[derive(NifMap)]
+struct CommitMap<'a> {
+    id: Binary<'a>,
+    parents: Vec<Binary<'a>>,
+    tree_id: Binary<'a>,
+    author: IdentityMap<'a>,
+    committer: IdentityMap<'a>,
+    subject: Binary<'a>,
+    message_raw: Binary<'a>,
+    message_truncated: bool,
+    signature_headers: Vec<Binary<'a>>,
+    encoding: Option<Binary<'a>>,
 }
 
 #[derive(NifMap)]
@@ -735,6 +770,14 @@ struct HydrationStatsMap {
 #[derive(NifMap)]
 struct TreePageMap<'a> {
     entries: Vec<TreeEntryMap<'a>>,
+    next_cursor: Option<Binary<'a>>,
+    truncated: bool,
+    stats: StatsMap,
+}
+
+#[derive(NifMap)]
+struct LogPageMap<'a> {
+    commits: Vec<CommitMap<'a>>,
     next_cursor: Option<Binary<'a>>,
     truncated: bool,
     stats: StatsMap,
@@ -1966,9 +2009,144 @@ fn job_submit_list_tree<'a>(
         detach,
         limits,
         budget_limits(limits),
-        JobResultKind::Tree {
+        JobResultKind::Page {
             stopped_by_max_results,
         },
+        task,
+    )
+}
+
+#[rustler::nif]
+#[allow(clippy::too_many_arguments)]
+fn job_submit_log<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    store: ResourceArc<StoreResource>,
+    raw_commit_oid: Binary<'a>,
+    raw_tree_oid: Binary<'a>,
+    opts: LogOptionsMap<'a>,
+    limits: LimitsMap,
+    detach: bool,
+) -> NifResult<Term<'a>> {
+    let commit_oid = match oid_for_store(&store, raw_commit_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let tree_oid = match oid_for_store(&store, raw_tree_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let order = match parse_log_order(opts.order) {
+        Ok(order) => order,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let stopped_by_max_results = limits.max_results < opts.limit;
+    let effective_limit = opts.limit.min(limits.max_results);
+    let limit = match usize::try_from(effective_limit) {
+        Ok(limit) => limit,
+        Err(_) => {
+            let error = Error::new(
+                ErrorCode::InvalidArgument,
+                "commit log page limit is too large",
+            );
+            return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+        }
+    };
+    let options = LogOptions {
+        order,
+        first_parent: opts.first_parent,
+        since: opts.since,
+        until: opts.until,
+        limit,
+        cursor: opts.cursor.map(|cursor| cursor.as_slice().to_vec()),
+    };
+    let task_store = store.clone();
+    let task = Box::new(move |budget: &Budget| {
+        core_log(
+            task_store.0.as_dyn(),
+            &Snapshot {
+                commit_oid,
+                tree_oid,
+            },
+            &options,
+            budget,
+        )
+        .map(JobOutput::Log)
+    });
+    submit_job(
+        env,
+        runtime,
+        detach,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Page {
+            stopped_by_max_results,
+        },
+        task,
+    )
+}
+
+#[rustler::nif]
+fn job_submit_merge_base<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    store: ResourceArc<StoreResource>,
+    raw_left: Binary<'a>,
+    raw_right: Binary<'a>,
+    limits: LimitsMap,
+) -> NifResult<Term<'a>> {
+    let left = match oid_for_store(&store, raw_left.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let right = match oid_for_store(&store, raw_right.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let task_store = store.clone();
+    let task = Box::new(move |budget: &Budget| {
+        core_merge_base(task_store.0.as_dyn(), left, right, budget).map(JobOutput::Oids)
+    });
+    submit_job(
+        env,
+        runtime,
+        false,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Other,
+        task,
+    )
+}
+
+#[rustler::nif]
+fn job_submit_is_ancestor<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    store: ResourceArc<StoreResource>,
+    raw_ancestor: Binary<'a>,
+    raw_descendant: Binary<'a>,
+    limits: LimitsMap,
+) -> NifResult<Term<'a>> {
+    let ancestor = match oid_for_store(&store, raw_ancestor.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let descendant = match oid_for_store(&store, raw_descendant.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let task_store = store.clone();
+    let task = Box::new(move |budget: &Budget| {
+        core_is_ancestor(task_store.0.as_dyn(), ancestor, descendant, budget)
+            .map(JobOutput::Boolean)
+    });
+    submit_job(
+        env,
+        runtime,
+        false,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Other,
         task,
     )
 }
@@ -2171,16 +2349,57 @@ fn encode_job_output<'a>(
                 })
                 .collect();
             let stopped_by = match result_kind {
-                JobResultKind::Tree {
+                JobResultKind::Page {
                     stopped_by_max_results: true,
                 } => atoms::max_results(),
-                JobResultKind::Tree {
+                JobResultKind::Page {
                     stopped_by_max_results: false,
                 }
                 | JobResultKind::Other => atoms::limit(),
             };
             TreePageMap {
                 entries,
+                next_cursor: page.next_cursor.map(|cursor| binary(env, &cursor)),
+                truncated: page.truncated,
+                stats: stats_map(page.stats, elapsed_ms, stopped_by, provider_spend),
+            }
+            .encode(env)
+        }
+        JobOutput::Log(page) => {
+            let stopped_by = match result_kind {
+                JobResultKind::Page {
+                    stopped_by_max_results: true,
+                } => atoms::max_results(),
+                JobResultKind::Page {
+                    stopped_by_max_results: false,
+                }
+                | JobResultKind::Other => atoms::limit(),
+            };
+            LogPageMap {
+                commits: page
+                    .commits
+                    .into_iter()
+                    .map(|commit| CommitMap {
+                        id: binary(env, commit.id.as_bytes()),
+                        parents: commit
+                            .parents
+                            .iter()
+                            .map(|parent| binary(env, parent.as_bytes()))
+                            .collect(),
+                        tree_id: binary(env, commit.tree_id.as_bytes()),
+                        author: identity_map(env, commit.author),
+                        committer: identity_map(env, commit.committer),
+                        subject: binary(env, &commit.subject),
+                        message_raw: binary(env, &commit.message_raw),
+                        message_truncated: commit.message_truncated,
+                        signature_headers: commit
+                            .signature_headers
+                            .iter()
+                            .map(|name| binary(env, name))
+                            .collect(),
+                        encoding: commit.encoding.map(|encoding| binary(env, &encoding)),
+                    })
+                    .collect(),
                 next_cursor: page.next_cursor.map(|cursor| binary(env, &cursor)),
                 truncated: page.truncated,
                 stats: stats_map(page.stats, elapsed_ms, stopped_by, provider_spend),
@@ -2225,6 +2444,12 @@ fn encode_job_output<'a>(
             .collect::<Vec<_>>()
             .encode(env),
         JobOutput::Oid(oid) => binary(env, oid.as_bytes()).encode(env),
+        JobOutput::Oids(oids) => oids
+            .iter()
+            .map(|oid| binary(env, oid.as_bytes()))
+            .collect::<Vec<_>>()
+            .encode(env),
+        JobOutput::Boolean(value) => value.encode(env),
         JobOutput::Snapshot(snapshot) => SnapshotMap {
             commit_oid: binary(env, snapshot.commit_oid.as_bytes()),
             tree_oid: binary(env, snapshot.tree_oid.as_bytes()),
@@ -2250,6 +2475,32 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
                     .saturating_add(length(entry.oid.as_bytes()))
             },
         ),
+        JobOutput::Log(page) => page.commits.iter().fold(
+            page.next_cursor.as_deref().map(length).unwrap_or(0),
+            |total, commit| {
+                let parents = commit.parents.iter().fold(0u64, |total, parent| {
+                    total.saturating_add(length(parent.as_bytes()))
+                });
+                let signatures = commit
+                    .signature_headers
+                    .iter()
+                    .fold(0u64, |total, name| total.saturating_add(length(name)));
+                total
+                    .saturating_add(length(commit.id.as_bytes()))
+                    .saturating_add(length(commit.tree_id.as_bytes()))
+                    .saturating_add(parents)
+                    .saturating_add(length(&commit.author.name))
+                    .saturating_add(length(&commit.author.email))
+                    .saturating_add(length(&commit.author.tz))
+                    .saturating_add(length(&commit.committer.name))
+                    .saturating_add(length(&commit.committer.email))
+                    .saturating_add(length(&commit.committer.tz))
+                    .saturating_add(length(&commit.subject))
+                    .saturating_add(length(&commit.message_raw))
+                    .saturating_add(signatures)
+                    .saturating_add(commit.encoding.as_deref().map(length).unwrap_or_default())
+            },
+        ),
         JobOutput::File(file) => length(&file.path)
             .saturating_add(length(file.blob_oid.as_bytes()))
             .saturating_add(length(&file.data))
@@ -2267,6 +2518,10 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
                 .saturating_add(object.as_ref().map(|(_, data)| length(data)).unwrap_or(0))
         }),
         JobOutput::Oid(oid) => length(oid.as_bytes()),
+        JobOutput::Oids(oids) => oids
+            .iter()
+            .fold(0, |total, oid| total.saturating_add(length(oid.as_bytes()))),
+        JobOutput::Boolean(_) => 1,
         JobOutput::Snapshot(snapshot) => length(snapshot.commit_oid.as_bytes())
             .saturating_add(length(snapshot.tree_oid.as_bytes())),
         JobOutput::Hydration(stats) => length(stats.generation.as_bytes()).saturating_add(96),
@@ -2337,6 +2592,16 @@ fn object_map<'a>(env: Env<'a>, kind: ObjectKind, data: &[u8]) -> ObjectMap<'a> 
         kind: object_kind_atom(kind),
         size: data.len() as u64,
         data: binary(env, data),
+    }
+}
+
+fn identity_map<'a>(env: Env<'a>, identity: LogIdentity) -> IdentityMap<'a> {
+    IdentityMap {
+        name: binary(env, &identity.name),
+        email: binary(env, &identity.email),
+        time: identity.time,
+        tz: binary(env, &identity.tz),
+        tz_offset_minutes: identity.tz_offset_minutes,
     }
 }
 
@@ -2436,6 +2701,21 @@ fn parse_peel_target(target: Atom) -> Result<PeelTarget, Error> {
     }
 }
 
+fn parse_log_order(order: Atom) -> Result<LogOrder, Error> {
+    if order == atoms::chronological() {
+        Ok(LogOrder::Chronological)
+    } else if order == atoms::topological() {
+        Ok(LogOrder::Topological)
+    } else if order == atoms::date() {
+        Ok(LogOrder::DateOrder)
+    } else {
+        Err(Error::new(
+            ErrorCode::InvalidArgument,
+            "commit log order must be chronological, topological, or date",
+        ))
+    }
+}
+
 fn type_filter(types: &[Atom]) -> Result<TypeFilter, Error> {
     let mut filter = TypeFilter::NONE;
     for kind in types {
@@ -2512,13 +2792,14 @@ fn missing_object(oid: Oid) -> Error {
     )
 }
 
-fn error_map(env: Env<'_>, error: Error) -> NifResult<ErrorMap> {
+fn error_map<'a>(env: Env<'a>, error: Error) -> NifResult<ErrorMap<'a>> {
     Ok(ErrorMap {
         code: Atom::from_str(env, error.code.as_str())?,
         message: error.message,
         retryable: error.retryable,
         limit: error.limit.map(str::to_owned),
         layer: error.layer,
+        oid: error.object_oid.map(|oid| binary(env, oid.as_bytes())),
     })
 }
 
@@ -2574,6 +2855,9 @@ mod atoms {
         tag,
         symlink,
         gitlink,
+        chronological,
+        topological,
+        date,
         text,
         binary,
         header,

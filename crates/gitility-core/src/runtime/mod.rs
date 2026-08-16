@@ -23,6 +23,7 @@ pub mod thread_budget;
 use crate::budget::{Budget, BudgetLimits};
 use crate::error::{Error, ErrorCode};
 use crate::file::FileRead;
+use crate::log::LogPage;
 use crate::object::{ObjectHeader, ObjectKind, Oid};
 use crate::packfetch::HydrationStats;
 use crate::snapshot::Snapshot;
@@ -68,11 +69,14 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutput {
     Tree(TreePage),
+    Log(LogPage),
     File(FileRead),
     Header(Option<ObjectHeader>),
     Object { kind: ObjectKind, data: Vec<u8> },
     ReadMany(ReadManyOutput),
     Oid(Oid),
+    Oids(Vec<Oid>),
+    Boolean(bool),
     Snapshot(Snapshot),
     Hydration(HydrationStats),
 }

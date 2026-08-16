@@ -16,6 +16,11 @@ The corpus contains:
 - `sha1-history.git`: a criss-cross merge, exact and similarity renames,
   blame/follow history, delete/re-add history, an exact copy, and a
   four-candidate rename input. Stable `fixture/*` tags name useful queries.
+- `sha1-graph.git`: three branches joined by a four-parent octopus merge, an
+  annotated tag on that merge, a criss-cross with exactly two merge bases, a
+  disjoint root, a child whose committer time predates its parent, and a
+  deterministic 220-commit linear tail. Stable `fixture/*` tags name every
+  graph edge used by log, merge-base, ancestry, cursor, and cancellation tests.
 - `sha1-nested.git`: a three-plus-level tree with sibling directories and
   mixed `.ex`, `.md`, and `.txt` files at the root and multiple depths. It is
   the pathspec fixture for slash-crossing `**` and scope-relative partitions.

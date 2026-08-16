@@ -6,7 +6,7 @@ use std::fmt;
 /// A Git object hash algorithm. Everything that *represents* an ID
 /// supports both; query *execution* refuses SHA-256 cleanly until the
 /// engine supports it (design R1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HashKind {
     Sha1,
     Sha256,
@@ -26,7 +26,7 @@ const MAX_DIGEST_LEN: usize = 32;
 
 /// A typed object ID: algorithm plus digest bytes, stored inline
 /// (no allocation — OIDs are copied pervasively).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Oid {
     kind: HashKind,
     bytes: [u8; MAX_DIGEST_LEN],

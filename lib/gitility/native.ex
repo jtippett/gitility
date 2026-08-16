@@ -55,6 +55,23 @@ defmodule Gitility.Native do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  def job_submit_log(
+        _runtime,
+        _resource,
+        _commit_oid,
+        _tree_oid,
+        _opts,
+        _limits,
+        _detach
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  def job_submit_merge_base(_runtime, _resource, _left, _right, _limits),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def job_submit_is_ancestor(_runtime, _resource, _ancestor, _descendant, _limits),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def job_submit_read_file(
         _runtime,
         _resource,

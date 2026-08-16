@@ -5,19 +5,21 @@ defmodule Gitility.Identity do
   `name` and `email` are raw bytes — Git makes no encoding promise, and
   Gitility makes none either. `time` is Unix seconds; `tz` is the raw
   timezone field exactly as encoded (e.g. `"+1000"`, including the `-0000`
-  that some tools emit and that an integer offset cannot represent).
+  that some tools emit). Log results additionally populate
+  `tz_offset_minutes` with the parsed numeric offset.
 
   `display_name/1` and `to_datetime/1` are the lossy conveniences.
   """
 
   @enforce_keys [:name, :email, :time, :tz]
-  defstruct [:name, :email, :time, :tz]
+  defstruct [:name, :email, :time, :tz, :tz_offset_minutes]
 
   @type t :: %__MODULE__{
           name: binary(),
           email: binary(),
           time: integer(),
-          tz: binary()
+          tz: binary(),
+          tz_offset_minutes: integer() | nil
         }
 
   @doc "The name as a printable string (lossy — see `Gitility.Path.display/1`)."

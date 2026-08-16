@@ -12,13 +12,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ancestry;
 pub mod budget;
+mod commit_graph;
 pub mod cursor;
 pub mod decode;
 pub mod error;
 pub mod file;
 pub mod layered_odb;
 pub mod local_odb;
+pub mod log;
 pub mod lru;
 pub mod object;
 pub mod odb;
@@ -35,6 +38,7 @@ pub mod verify;
 #[cfg(test)]
 mod test_support;
 
+pub use ancestry::{is_ancestor, merge_base};
 pub use budget::{Budget, BudgetLimits};
 pub use cursor::{decode as decode_cursor, encode as encode_cursor, Cursor, CursorExpected};
 pub use decode::{
@@ -44,6 +48,7 @@ pub use error::{Error, ErrorCode};
 pub use file::{read_file, FileKind, FileOptions, FileRead, LfsPointer};
 pub use layered_odb::{CacheLayer, CacheOptions, LayeredOdb};
 pub use local_odb::{LocalOdb, LocalOdbOptions, RepositoryLayout};
+pub use log::{log, LogCommit, LogIdentity, LogOptions, LogOrder, LogPage};
 pub use object::{HashKind, ObjectHeader, ObjectKind, Oid};
 pub use odb::{
     CacheStats, HeaderProvenance, HeaderRead, ObjectDb, ObjectReadResult, ReadManyBudget,

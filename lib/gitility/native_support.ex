@@ -1,7 +1,21 @@
 defmodule Gitility.NativeSupport do
   @moduledoc false
 
-  alias Gitility.{Error, File, Job, Limits, ODB, OID, Page, Repository, Runtime, Stats, TreeEntry}
+  alias Gitility.{
+    Commit,
+    Error,
+    File,
+    Identity,
+    Job,
+    Limits,
+    ODB,
+    OID,
+    Page,
+    Repository,
+    Runtime,
+    Stats,
+    TreeEntry
+  }
 
   @known_limit_names %{
     "timeout_ms" => :timeout_ms,
@@ -86,6 +100,7 @@ defmodule Gitility.NativeSupport do
       %{}
       |> maybe_put(:limit, normalize_limit(Map.get(error, :limit)))
       |> maybe_put(:layer, Map.get(error, :layer))
+      |> maybe_put(:oid, normalize_error_oid(Map.get(error, :oid)))
       |> maybe_put(:retry_after_ms, Map.get(error, :retry_after_ms))
       |> maybe_put(:reason, Map.get(error, :reason))
 
@@ -179,6 +194,32 @@ defmodule Gitility.NativeSupport do
     }
   end
 
+  def job_payload(%{commits: commits, next_cursor: cursor, stats: stats} = page) do
+    items =
+      Enum.map(commits, fn commit ->
+        %Commit{
+          id: job_oid(commit.id),
+          parents: Enum.map(commit.parents, &job_oid/1),
+          tree_id: job_oid(commit.tree_id),
+          author: identity_payload(commit.author),
+          committer: identity_payload(commit.committer),
+          subject: commit.subject,
+          message_raw: commit.message_raw,
+          message_truncated: commit.message_truncated,
+          signature_headers: commit.signature_headers,
+          encoding: commit.encoding
+        }
+      end)
+
+    %Page{
+      items: items,
+      next_cursor: if(cursor, do: Base.url_encode64(cursor, padding: false)),
+      truncated: page.truncated,
+      stats: struct!(Stats, Map.to_list(stats)),
+      warnings: page_warnings(page.truncated, stats.stopped_by)
+    }
+  end
+
   def job_payload(%{blob_oid: blob_oid, path: path, data: data} = file)
       when is_binary(blob_oid) and is_binary(path) and is_binary(data) do
     %File{
@@ -211,6 +252,16 @@ defmodule Gitility.NativeSupport do
   defp job_oid(bytes) when byte_size(bytes) == 20, do: oid_from_bytes(:sha1, bytes)
   defp job_oid(bytes) when byte_size(bytes) == 32, do: oid_from_bytes(:sha256, bytes)
 
+  defp identity_payload(identity) do
+    %Identity{
+      name: identity.name,
+      email: identity.email,
+      time: identity.time,
+      tz: identity.tz,
+      tz_offset_minutes: identity.tz_offset_minutes
+    }
+  end
+
   defp page_warnings(false, _stopped_by), do: []
 
   defp page_warnings(true, stopped_by) do
@@ -219,6 +270,10 @@ defmodule Gitility.NativeSupport do
 
   defp normalize_limit(nil), do: nil
   defp normalize_limit(limit), do: Map.get(@known_limit_names, limit, limit)
+
+  defp normalize_error_oid(nil), do: nil
+  defp normalize_error_oid(bytes) when byte_size(bytes) in [20, 32], do: job_oid(bytes)
+  defp normalize_error_oid(bytes), do: bytes
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

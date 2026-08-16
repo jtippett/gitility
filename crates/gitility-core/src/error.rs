@@ -5,6 +5,7 @@
 //! sanitized here — no backend configuration, credentials, or remote URLs
 //! ever enter an `Error`.
 
+use crate::object::Oid;
 use std::fmt;
 
 /// The stable error codes. Keep in exact sync with `Gitility.Error.codes/0`.
@@ -134,6 +135,8 @@ pub struct Error {
     pub limit: Option<&'static str>,
     /// The zero-based layer whose operation failed, when composed.
     pub layer: Option<u64>,
+    /// The object that caused an object-specific failure, when applicable.
+    pub object_oid: Option<Oid>,
 }
 
 impl Error {
@@ -144,6 +147,7 @@ impl Error {
             retryable: false,
             limit: None,
             layer: None,
+            object_oid: None,
         }
     }
 
@@ -154,6 +158,7 @@ impl Error {
             retryable: true,
             limit: None,
             layer: None,
+            object_oid: None,
         }
     }
 
@@ -167,6 +172,12 @@ impl Error {
     /// position so callers can distinguish which authoritative layer failed.
     pub fn with_layer(mut self, layer: usize) -> Self {
         self.layer = Some(layer as u64);
+        self
+    }
+
+    /// Associates an object-specific failure with its exact object ID.
+    pub fn with_oid(mut self, oid: Oid) -> Self {
+        self.object_oid = Some(oid);
         self
     }
 }

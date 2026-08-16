@@ -66,6 +66,9 @@ defmodule Gitility do
   @typedoc "Any handle that can answer plumbing queries: a repository or ODB."
   @type store :: Repository.t() | ODB.t()
 
+  @typedoc "A commit-graph source: an ODB or a snapshot using its ODB."
+  @type graph_store :: ODB.t() | Snapshot.t()
+
   ## ————————————————————————————————————————————————————————————————
   ## Trees and files
   ## ————————————————————————————————————————————————————————————————
@@ -169,7 +172,7 @@ defmodule Gitility do
 
   ## Options
 
-    * `:order` — `:topological` (default) or `:time`.
+    * `:order` — `:chronological` (default), `:topological`, or `:date`.
     * `:first_parent` — follow only first parents (default `false`).
     * `:since` / `:until` — commit-time bounds (Unix seconds or `DateTime`).
     * `:limit`, `:cursor` — pagination.
@@ -177,9 +180,14 @@ defmodule Gitility do
   """
   @spec log(Snapshot.t(), keyword()) ::
           {:ok, Page.t(Gitility.Commit.t())} | {:error, Error.t()}
-  def log(snapshot, opts \\ []) do
-    _ = {snapshot, opts}
-    NotImplementedError.stub!(:"log/2", "Milestone 3")
+  def log(%Snapshot{} = snapshot, opts \\ []) do
+    {opts, limits} = log_options!(opts)
+
+    NativeSupport.await_sync(
+      fn -> submit_log(snapshot, opts, limits, false) end,
+      limits.timeout_ms,
+      :log
+    )
   end
 
   @doc """
@@ -263,14 +271,41 @@ defmodule Gitility do
   ## ————————————————————————————————————————————————————————————————
 
   @doc """
-  The best common ancestor of two commits, or `:none` when the histories
-  are unrelated.
+  The best common ancestor of two commits, or `nil` when the histories are
+  unrelated. Pass `all: true` to return every best common ancestor.
   """
-  @spec merge_base(store(), OID.t(), OID.t()) ::
-          {:ok, OID.t() | :none} | {:error, Error.t()}
-  def merge_base(store, left_oid, right_oid) do
-    _ = {store, left_oid, right_oid}
-    NotImplementedError.stub!(:"merge_base/3", "Milestone 3")
+  @spec merge_base(graph_store(), OID.t() | binary(), OID.t() | binary(), keyword()) ::
+          {:ok, OID.t() | nil | [OID.t()]} | {:error, Error.t()}
+  def merge_base(store, left_oid, right_oid, opts \\ []) do
+    opts = Keyword.validate!(opts, all: false, limits: nil)
+    all = NativeSupport.boolean_option!(opts, :all)
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+
+    with {:ok, resource, hash, runtime} <- graph_store_runtime(store),
+         {:ok, left_oid} <- NativeSupport.parse_oid(left_oid),
+         {:ok, right_oid} <- NativeSupport.parse_oid(right_oid),
+         {:ok, bases} <-
+           NativeSupport.await_sync(
+             fn ->
+               NativeSupport.submit_job(runtime, :merge_base, fn runtime_resource ->
+                 Native.job_submit_merge_base(
+                   runtime_resource,
+                   resource,
+                   left_oid.bytes,
+                   right_oid.bytes,
+                   limits_map
+                 )
+               end)
+             end,
+             limits.timeout_ms,
+             :merge_base
+           ) do
+      bases = Enum.map(bases, &NativeSupport.oid_from_bytes(hash, &1))
+      {:ok, if(all, do: bases, else: List.first(bases))}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+    end
   end
 
   @doc """
@@ -279,10 +314,36 @@ defmodule Gitility do
   Wrapped in an ok-tuple like everything else — ancestry can fail on
   missing objects, and the error model does not raise for repository data.
   """
-  @spec ancestor?(store(), OID.t(), OID.t()) :: {:ok, boolean()} | {:error, Error.t()}
-  def ancestor?(store, ancestor_oid, descendant_oid) do
-    _ = {store, ancestor_oid, descendant_oid}
-    NotImplementedError.stub!(:"ancestor?/3", "Milestone 3")
+  @spec ancestor?(graph_store(), OID.t() | binary(), OID.t() | binary(), keyword()) ::
+          {:ok, boolean()} | {:error, Error.t()}
+  def ancestor?(store, ancestor_oid, descendant_oid, opts \\ []) do
+    opts = Keyword.validate!(opts, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+
+    with {:ok, resource, _hash, runtime} <- graph_store_runtime(store),
+         {:ok, ancestor_oid} <- NativeSupport.parse_oid(ancestor_oid),
+         {:ok, descendant_oid} <- NativeSupport.parse_oid(descendant_oid),
+         {:ok, result} <-
+           NativeSupport.await_sync(
+             fn ->
+               NativeSupport.submit_job(runtime, :ancestor, fn runtime_resource ->
+                 Native.job_submit_is_ancestor(
+                   runtime_resource,
+                   resource,
+                   ancestor_oid.bytes,
+                   descendant_oid.bytes,
+                   limits_map
+                 )
+               end)
+             end,
+             limits.timeout_ms,
+             :ancestor
+           ) do
+      {:ok, result}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+    end
   end
 
   @doc """
@@ -434,6 +495,28 @@ defmodule Gitility do
   defp validate_peel_target(_target),
     do: NativeSupport.invalid_argument(":to must be :commit, :tree, or :blob")
 
+  defp validate_log_order(order) when order in [:chronological, :topological, :date],
+    do: {:ok, order}
+
+  defp validate_log_order(order) when is_atom(order),
+    do: NativeSupport.invalid_argument(":order must be :chronological, :topological, or :date")
+
+  defp validate_log_order(_order), do: raise(ArgumentError, ":order must be an atom")
+
+  defp validate_log_time(nil, _key), do: {:ok, nil}
+  defp validate_log_time(%DateTime{} = value, _key), do: {:ok, DateTime.to_unix(value)}
+  defp validate_log_time(value, _key) when is_integer(value), do: {:ok, value}
+
+  defp validate_log_time(_value, key),
+    do: raise(ArgumentError, ":#{key} must be a DateTime, Unix integer seconds, or nil")
+
+  defp graph_store_runtime(%Snapshot{odb: odb}), do: NativeSupport.store_runtime(odb)
+  defp graph_store_runtime(%ODB{} = odb), do: NativeSupport.store_runtime(odb)
+
+  defp graph_store_runtime(_value) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Snapshot or Gitility.ODB")}
+  end
+
   ## ————————————————————————————————————————————————————————————————
   ## Async variants
   ## ————————————————————————————————————————————————————————————————
@@ -493,6 +576,23 @@ defmodule Gitility do
     {opts, limits}
   end
 
+  defp log_options!(opts) do
+    opts =
+      Keyword.validate!(opts,
+        order: :chronological,
+        first_parent: false,
+        since: nil,
+        until: nil,
+        limit: 1_000,
+        cursor: nil,
+        limits: nil
+      )
+
+    limits = opts[:limits] || Limits.new()
+    _limits_map = NativeSupport.limits_map!(limits)
+    {opts, limits}
+  end
+
   defp read_file_options!(opts) do
     opts = Keyword.validate!(opts, lines: nil, max_bytes: 256_000, limits: nil)
     limits = opts[:limits] || Limits.new()
@@ -540,6 +640,41 @@ defmodule Gitility do
     end
   end
 
+  defp submit_log(
+         %Snapshot{odb: %ODB{ref: resource, runtime: runtime}} = snapshot,
+         opts,
+         limits,
+         detach
+       ) do
+    limits_map = NativeSupport.limits_map!(limits)
+    first_parent = NativeSupport.boolean_option!(opts, :first_parent)
+
+    with {:ok, order} <- validate_log_order(opts[:order]),
+         {:ok, since} <- validate_log_time(opts[:since], :since),
+         {:ok, until} <- validate_log_time(opts[:until], :until),
+         {:ok, limit} <- effective_page_limit(opts[:limit], limits.max_results),
+         {:ok, cursor} <- decode_cursor(opts[:cursor]) do
+      NativeSupport.submit_job(runtime, :log, fn runtime_resource ->
+        Native.job_submit_log(
+          runtime_resource,
+          resource,
+          snapshot.commit_oid.bytes,
+          snapshot.tree_oid.bytes,
+          %{
+            order: order,
+            first_parent: first_parent,
+            since: since,
+            until: until,
+            limit: limit,
+            cursor: cursor
+          },
+          limits_map,
+          detach
+        )
+      end)
+    end
+  end
+
   defp submit_read_file(
          %Snapshot{odb: %ODB{ref: resource, runtime: runtime}} = snapshot,
          path,
@@ -577,9 +712,22 @@ defmodule Gitility do
 
   @doc "Asynchronous `log/2`; returns the `Gitility.Job`."
   @spec async_log(Snapshot.t(), keyword()) :: {:ok, Job.t()} | {:error, Error.t()}
-  def async_log(snapshot, opts \\ []) do
-    _ = {snapshot, opts}
-    NotImplementedError.stub!(:"async_log/2", "Milestone 3")
+  def async_log(%Snapshot{} = snapshot, opts \\ []) do
+    opts =
+      Keyword.validate!(opts,
+        order: :chronological,
+        first_parent: false,
+        since: nil,
+        until: nil,
+        limit: 1_000,
+        cursor: nil,
+        limits: nil,
+        detach: false
+      )
+
+    detach = NativeSupport.boolean_option!(opts, :detach)
+    {opts, limits} = opts |> Keyword.delete(:detach) |> log_options!()
+    submit_log(snapshot, opts, limits, detach)
   end
 
   @doc "Asynchronous `history/3`; returns the `Gitility.Job`."

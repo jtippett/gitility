@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sprites": {
+      "type": "http",
+      "url": "https://sprites.dev/mcp"
+    }
+  }
+}

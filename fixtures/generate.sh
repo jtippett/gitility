@@ -307,6 +307,132 @@ make_history() {
   export_bare "$work_repository" "$bare_repository" sha1
 }
 
+make_graph() {
+  local work_repository=$1
+  local bare_repository=$2
+  local root_commit
+  local branch_a
+  local branch_b
+  local branch_c
+  local octopus
+  local left_side
+  local right_side
+  local criss_left
+  local criss_right
+  local resolved
+  local skew_child
+  local disjoint
+  local tail_tree
+  local tail_parent
+  local tail_start
+  local tail_middle
+  local tail_index
+  local tail_epoch
+
+  init_work_repo "$work_repository" sha1
+  printf 'commit graph fixture\n' >"$work_repository/graph.txt"
+  commit_all_at "$work_repository" '2001-05-01T00:00:00+0000' 'Graph root'
+  root_commit="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/graph-root "$root_commit"
+
+  git -C "$work_repository" switch --quiet -c graph-a "$root_commit"
+  printf 'branch a\n' >"$work_repository/branch-a.txt"
+  commit_all_at "$work_repository" '2001-05-01T00:01:00+0000' 'Graph branch A'
+  branch_a="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/branch-a "$branch_a"
+
+  git -C "$work_repository" switch --quiet -c graph-b "$root_commit"
+  printf 'branch b\n' >"$work_repository/branch-b.txt"
+  commit_all_at "$work_repository" '2001-05-01T00:02:00+0000' 'Graph branch B'
+  branch_b="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/branch-b "$branch_b"
+
+  git -C "$work_repository" switch --quiet -c graph-c "$root_commit"
+  printf 'branch c\n' >"$work_repository/branch-c.txt"
+  commit_all_at "$work_repository" '2001-05-01T00:03:00+0000' 'Graph branch C'
+  branch_c="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/branch-c "$branch_c"
+
+  git -C "$work_repository" switch --quiet main
+  env GIT_AUTHOR_DATE='2001-05-01T00:04:00+0000' \
+    GIT_COMMITTER_DATE='2001-05-01T00:04:00+0000' GIT_MERGE_AUTOEDIT=no \
+    git -C "$work_repository" merge --quiet --no-ff --no-edit \
+    -m 'Octopus merge of three branches' graph-a graph-b graph-c
+  octopus="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/octopus "$octopus"
+  tag_at "$work_repository" '2001-05-01T00:05:00+0000' graph-octopus "$octopus"
+
+  git -C "$work_repository" switch --quiet -c criss-left-side "$octopus"
+  printf 'criss left\n' >"$work_repository/criss-left.txt"
+  commit_all_at "$work_repository" '2001-05-01T00:06:00+0000' 'Criss-cross left side'
+  left_side="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/criss-base-left "$left_side"
+
+  git -C "$work_repository" switch --quiet -c criss-right-side "$octopus"
+  printf 'criss right\n' >"$work_repository/criss-right.txt"
+  commit_all_at "$work_repository" '2001-05-01T00:07:00+0000' 'Criss-cross right side'
+  right_side="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/criss-base-right "$right_side"
+
+  git -C "$work_repository" switch --quiet -c criss-left "$left_side"
+  merge_at "$work_repository" '2001-05-01T00:08:00+0000' criss-right-side \
+    'Criss-cross merge from the left'
+  criss_left="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/criss-left "$criss_left"
+
+  git -C "$work_repository" switch --quiet -c criss-right "$right_side"
+  merge_at "$work_repository" '2001-05-01T00:09:00+0000' criss-left-side \
+    'Criss-cross merge from the right'
+  criss_right="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/criss-right "$criss_right"
+
+  git -C "$work_repository" switch --quiet main
+  git -C "$work_repository" merge --quiet --ff-only criss-left
+  merge_at "$work_repository" '2001-05-01T00:10:00+0000' criss-right \
+    'Resolve the criss-cross graph'
+  resolved="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/criss-resolved "$resolved"
+
+  printf 'clock skew child\n' >"$work_repository/skew.txt"
+  commit_all_at "$work_repository" '2001-04-30T23:00:00+0000' \
+    'Clock-skew child earlier than its parent'
+  skew_child="$(git -C "$work_repository" rev-parse HEAD)"
+  git -C "$work_repository" tag fixture/skew-child "$skew_child"
+
+  tail_tree="$(git -C "$work_repository" rev-parse HEAD^{tree})"
+  disjoint="$(
+    env GIT_AUTHOR_DATE='2001-05-01T00:11:00+0000' \
+      GIT_COMMITTER_DATE='2001-05-01T00:11:00+0000' \
+      git -C "$work_repository" commit-tree "$tail_tree" -m 'Disjoint graph root'
+  )"
+  git -C "$work_repository" tag fixture/disjoint "$disjoint"
+
+  tail_parent="$skew_child"
+  tail_start=''
+  tail_middle=''
+  tail_epoch=988761600
+  for tail_index in $(seq 1 220); do
+    tail_parent="$(
+      env GIT_AUTHOR_DATE="@$((tail_epoch + tail_index)) +0000" \
+        GIT_COMMITTER_DATE="@$((tail_epoch + tail_index)) +0000" \
+        git -C "$work_repository" commit-tree "$tail_tree" -p "$tail_parent" \
+        -m "Linear tail $tail_index"
+    )"
+    if ((tail_index == 1)); then
+      tail_start="$tail_parent"
+    fi
+    if ((tail_index == 110)); then
+      tail_middle="$tail_parent"
+    fi
+  done
+  git -C "$work_repository" update-ref refs/heads/main "$tail_parent" "$skew_child"
+  git -C "$work_repository" tag fixture/tail-start "$tail_start"
+  git -C "$work_repository" tag fixture/tail-middle "$tail_middle"
+  git -C "$work_repository" tag fixture/tail-tip "$tail_parent"
+
+  export_bare "$work_repository" "$bare_repository" sha1
+}
+
 make_lfs_pointer() {
   local work_repository=$1
   local bare_repository=$2
@@ -347,12 +473,14 @@ make_nested() {
 sha1_work="$scratch_dir/sha1-basic-work"
 sha256_work="$scratch_dir/sha256-basic-work"
 history_work="$scratch_dir/sha1-history-work"
+graph_work="$scratch_dir/sha1-graph-work"
 lfs_work="$scratch_dir/lfs-pointer-work"
 nested_work="$scratch_dir/sha1-nested-work"
 
 make_basic sha1 "$sha1_work" "$output_dir/sha1-basic.git"
 make_basic sha256 "$sha256_work" "$output_dir/sha256-basic.git"
 make_history "$history_work" "$output_dir/sha1-history.git"
+make_graph "$graph_work" "$output_dir/sha1-graph.git"
 make_lfs_pointer "$lfs_work" "$output_dir/lfs-pointer.git"
 make_nested "$nested_work" "$output_dir/sha1-nested.git"
 
@@ -526,6 +654,7 @@ PY
 sha1_head="$(git -C "$output_dir/sha1-basic.git" rev-parse HEAD)"
 sha256_head="$(git -C "$output_dir/sha256-basic.git" rev-parse HEAD)"
 history_head="$(git -C "$output_dir/sha1-history.git" rev-parse HEAD)"
+graph_head="$(git -C "$output_dir/sha1-graph.git" rev-parse HEAD)"
 lfs_head="$(git -C "$output_dir/lfs-pointer.git" rev-parse HEAD)"
 nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
 
@@ -539,6 +668,21 @@ nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
     "$(git -C "$output_dir/sha1-history.git" rev-parse fixture/criss-left)"
   printf 'sha1_history_criss_right=%s\n' \
     "$(git -C "$output_dir/sha1-history.git" rev-parse fixture/criss-right)"
+  printf 'sha1_graph_head=%s\n' "$graph_head"
+  printf 'sha1_graph_octopus=%s\n' \
+    "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/octopus)"
+  printf 'sha1_graph_criss_left=%s\n' \
+    "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/criss-left)"
+  printf 'sha1_graph_criss_right=%s\n' \
+    "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/criss-right)"
+  printf 'sha1_graph_criss_base_left=%s\n' \
+    "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/criss-base-left)"
+  printf 'sha1_graph_criss_base_right=%s\n' \
+    "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/criss-base-right)"
+  printf 'sha1_graph_disjoint=%s\n' \
+    "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/disjoint)"
+  printf 'sha1_graph_skew_child=%s\n' \
+    "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/skew-child)"
   printf 'lfs_pointer_head=%s\n' "$lfs_head"
   printf 'sha1_nested_head=%s\n' "$nested_head"
   printf 'sha1_nested_root_txt=%s\n' \

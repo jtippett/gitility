@@ -17,3 +17,9 @@ the `:gitility_engine` tag so developers can select that gate explicitly (for
 example, `mix test --only gitility_engine`). Unknown mismatches fail; only
 cases whose id, operation, fixture repository, and query all exactly match a
 record in `allowlist.exs` pass with a visible allowlist record.
+
+Content-search parity uses `git grep -F` for literal byte patterns, `-i` only
+for the certified ASCII folding cases, `-I` for the default binary policy, and
+`-a` for `binary: :text`. Regex search is intentionally Rust-unit-tested rather
+than compared here because Git and `regex::bytes` accept different pattern
+classes.

@@ -13,6 +13,7 @@ defmodule Gitility.NativeSupport do
     Page,
     Repository,
     Runtime,
+    SearchMatch,
     Stats,
     TreeEntry
   }
@@ -228,6 +229,32 @@ defmodule Gitility.NativeSupport do
     }
   end
 
+  def job_payload(%{matches: matches, next_cursor: cursor, stats: stats} = page) do
+    items =
+      Enum.map(matches, fn item ->
+        %SearchMatch{
+          commit_oid: job_oid(item.commit_oid),
+          blob_oid: job_oid(item.blob_oid),
+          path: item.path,
+          line: item.line,
+          column: item.column,
+          preview: item.preview,
+          preview_truncated: item.preview_truncated,
+          submatches: Enum.map(item.submatches, &{&1.start, &1.length}),
+          context_before: item.context_before,
+          context_after: item.context_after
+        }
+      end)
+
+    %Page{
+      items: items,
+      next_cursor: if(cursor, do: Base.url_encode64(cursor, padding: false)),
+      truncated: page.truncated,
+      stats: struct!(Stats, Map.to_list(stats)),
+      warnings: search_page_warnings(page.truncated, stats)
+    }
+  end
+
   def job_payload(%{blob_oid: blob_oid, path: path, data: data} = file)
       when is_binary(blob_oid) and is_binary(path) and is_binary(data) do
     %File{
@@ -275,6 +302,25 @@ defmodule Gitility.NativeSupport do
   defp page_warnings(true, stopped_by) do
     [%{code: :truncated, message: "page truncated by #{stopped_by || "an unknown limit"}"}]
   end
+
+  defp search_page_warnings(truncated, stats) do
+    page_warnings(truncated, stats.stopped_by)
+    |> maybe_add_warning(
+      stats.binary_skipped > 0,
+      :binary_skipped,
+      "binary blobs skipped by :binary policy (NUL in first 8000 bytes)"
+    )
+    |> maybe_add_warning(
+      stats.oversize_skipped > 0,
+      :oversize_skipped,
+      "oversize blobs skipped by max_object_bytes"
+    )
+  end
+
+  defp maybe_add_warning(warnings, true, code, message),
+    do: warnings ++ [%{code: code, message: message}]
+
+  defp maybe_add_warning(warnings, false, _code, _message), do: warnings
 
   defp normalize_limit(nil), do: nil
   defp normalize_limit(limit), do: Map.get(@known_limit_names, limit, limit)

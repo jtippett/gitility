@@ -106,6 +106,46 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
+  @doc """
+  Runs the pinned `git grep` literal oracle and returns byte-preserving rows.
+
+  Columns are normalized from Git's 1-based display to Gitility's 0-based
+  byte-column contract. Regex mode deliberately has no oracle adapter because
+  Git and Rust's `regex` crate accept different pattern classes.
+  """
+  @spec grep(Path.t(), binary(), binary(), keyword()) :: result([map()])
+  def grep(repository, revision, pattern, options \\ []) do
+    options =
+      Keyword.validate!(options,
+        ignore_case: false,
+        binary: :skip,
+        pathspecs: []
+      )
+
+    binary_flag =
+      case options[:binary] do
+        :skip -> "-I"
+        :text -> "-a"
+      end
+
+    arguments =
+      ["grep", "-F"] ++
+        optional_flag(options[:ignore_case], "-i") ++
+        [
+          binary_flag,
+          "--line-number",
+          "--column",
+          "--full-name",
+          "-e",
+          pattern,
+          revision
+        ] ++ pathspec_arguments(options[:pathspecs])
+
+    with {:ok, output} <- git(repository, arguments) do
+      parse_raw_line_records(output, &parse_grep_record/1)
+    end
+  end
+
   @spec rev_parse(Path.t(), binary()) :: result(binary())
   def rev_parse(repository, expression) do
     with {:ok, output} <- git(repository, ["rev-parse", "--verify", expression]) do
@@ -276,9 +316,66 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
+  defp parse_grep_record(record) do
+    with {:ok, revision_or_path, rest} <- take_field(record, ?:),
+         {:ok, path, rest} <- grep_path_and_rest(revision_or_path, rest),
+         {:ok, line_field, rest} <- take_field(rest, ?:),
+         {:ok, column_field, line_bytes} <- take_field(rest, ?:),
+         {line, ""} when line > 0 <- Integer.parse(line_field),
+         {column, ""} when column > 0 <- Integer.parse(column_field) do
+      {:ok, %{path: path, line: line, column: column - 1, line_bytes: line_bytes}}
+    else
+      _ -> {:error, "malformed git grep record: #{inspect(record)}"}
+    end
+  end
+
+  defp grep_path_and_rest(revision, rest) when byte_size(revision) in [40, 64] do
+    if ascii_hex?(revision) do
+      take_field(rest, ?:)
+    else
+      {:ok, revision, rest}
+    end
+  end
+
+  defp grep_path_and_rest(path, rest), do: {:ok, path, rest}
+
+  defp ascii_hex?(binary) do
+    Enum.all?(:binary.bin_to_list(binary), fn byte ->
+      byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F
+    end)
+  end
+
+  defp take_field(binary, separator) do
+    case :binary.match(binary, <<separator>>) do
+      {offset, 1} ->
+        value = binary_part(binary, 0, offset)
+        rest = binary_part(binary, offset + 1, byte_size(binary) - offset - 1)
+        {:ok, value, rest}
+
+      :nomatch ->
+        {:error, :missing_separator}
+    end
+  end
+
   defp parse_records_by_line(output, parser) do
     output
     |> metadata_lines()
+    |> Enum.reduce_while({:ok, []}, fn record, {:ok, parsed} ->
+      case parser.(record) do
+        {:ok, value} -> {:cont, {:ok, [value | parsed]}}
+        {:error, reason} -> {:halt, {:error, %{status: 1, output: reason}}}
+      end
+    end)
+    |> case do
+      {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
+      error -> error
+    end
+  end
+
+  defp parse_raw_line_records(output, parser) do
+    output
+    |> :binary.split(<<"\n">>, [:global])
+    |> drop_trailing_empty_fields()
     |> Enum.reduce_while({:ok, []}, fn record, {:ok, parsed} ->
       case parser.(record) do
         {:ok, value} -> {:cont, {:ok, [value | parsed]}}
@@ -299,6 +396,9 @@ defmodule Gitility.Differential.Oracle do
 
   defp path_arguments(nil), do: []
   defp path_arguments(path) when is_binary(path), do: ["--", path]
+
+  defp pathspec_arguments([]), do: []
+  defp pathspec_arguments(pathspecs), do: ["--" | pathspecs]
 
   defp parse_raw_changes([], changes), do: {:ok, Enum.reverse(changes)}
 

@@ -15,6 +15,11 @@ defmodule Gitility.Stats do
   by this job only. `cache_bytes` and `cache_entries` snapshot current
   residency when the result is built; `cache_evictions` is cumulative for the
   cache handle, so it remains observable after the job that caused eviction.
+
+  Search additionally reports unique `files_scanned`, duplicate-path
+  `blobs_deduped`, and explicit `binary_skipped` / `oversize_skipped` counts.
+  `scanned_blobs` is retained as the generic/native compatibility counter and
+  equals `files_scanned` for search pages.
   """
 
   defstruct objects_requested: 0,
@@ -29,6 +34,10 @@ defmodule Gitility.Stats do
             provider_bytes: 0,
             decompressed_bytes: 0,
             scanned_blobs: 0,
+            files_scanned: 0,
+            blobs_deduped: 0,
+            binary_skipped: 0,
+            oversize_skipped: 0,
             elapsed_ms: 0,
             stopped_by: nil
 
@@ -45,6 +54,10 @@ defmodule Gitility.Stats do
           provider_bytes: non_neg_integer(),
           decompressed_bytes: non_neg_integer(),
           scanned_blobs: non_neg_integer(),
+          files_scanned: non_neg_integer(),
+          blobs_deduped: non_neg_integer(),
+          binary_skipped: non_neg_integer(),
+          oversize_skipped: non_neg_integer(),
           elapsed_ms: non_neg_integer(),
           stopped_by: atom() | nil
         }

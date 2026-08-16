@@ -26,6 +26,7 @@ use crate::file::FileRead;
 use crate::log::LogPage;
 use crate::object::{ObjectHeader, ObjectKind, Oid};
 use crate::packfetch::HydrationStats;
+use crate::search::SearchPage;
 use crate::snapshot::Snapshot;
 use crate::tree::TreePage;
 pub use observer::TestObserver;
@@ -69,6 +70,7 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutput {
     Tree(TreePage),
+    Search(SearchPage),
     Log(LogPage),
     File(FileRead),
     Header(Option<ObjectHeader>),

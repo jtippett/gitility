@@ -9,17 +9,18 @@
 use gitility_core::runtime::thread_budget;
 use gitility_core::{
     is_ancestor as core_is_ancestor, list_tree as core_list_tree, log as core_log,
-    merge_base as core_merge_base, peel as core_peel, read_file as core_read_file, Budget,
-    BudgetLimits, BusyReason, ByteRange as CoreByteRange, CacheOptions, CacheStats,
-    CallbackRangeTransport, Error, ErrorCode, FileKind, FileOptions, HashKind, HydrationStats,
-    Job as CoreJob, JobObserver, JobOutput, JobSpec, JobState, LayeredOdb, LocalOdb,
-    LocalOdbOptions, LogIdentity, LogOptions, LogOrder, ObjectDb, ObjectHeader, ObjectKind,
-    ObjectReadResult, Oid, PackDescriptor, PackFetchOdb, PackFetchOptions, PackManifest,
-    PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions,
-    ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport, QueryStats,
-    RangePayload, RangePendingTable, RangeRequest, RangeRequestKind, RangeRequestSender,
-    ReadManyBudget, Runtime as CoreRuntime, RuntimeConfig, Snapshot, StaticOdb, SubmitError,
-    TreeItemKind, TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
+    merge_base as core_merge_base, peel as core_peel, read_file as core_read_file,
+    search as core_search, Budget, BudgetLimits, BusyReason, ByteRange as CoreByteRange,
+    CacheOptions, CacheStats, CallbackRangeTransport, Error, ErrorCode, FileKind, FileOptions,
+    HashKind, HydrationStats, Job as CoreJob, JobObserver, JobOutput, JobSpec, JobState,
+    LayeredOdb, LocalOdb, LocalOdbOptions, LogIdentity, LogOptions, LogOrder, ObjectDb,
+    ObjectHeader, ObjectKind, ObjectReadResult, Oid, PackDescriptor, PackFetchOdb,
+    PackFetchOptions, PackManifest, PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind,
+    ProviderOdb, ProviderOptions, ProviderPayload, ProviderReplyValue, ProviderRequest,
+    ProviderTransport, QueryStats, RangePayload, RangePendingTable, RangeRequest, RangeRequestKind,
+    RangeRequestSender, ReadManyBudget, Runtime as CoreRuntime, RuntimeConfig, SearchBinaryMode,
+    SearchMode, SearchOptions, Snapshot, StaticOdb, SubmitError, TreeItemKind, TreeOptions,
+    TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
 };
 use rustler::{
     types::{map::MapIterator, tuple::get_tuple},
@@ -659,6 +660,18 @@ struct LogOptionsMap<'a> {
 }
 
 #[derive(NifMap)]
+struct SearchOptionsMap<'a> {
+    mode: Atom,
+    case_sensitive: bool,
+    path: Binary<'a>,
+    pathspecs: Vec<Binary<'a>>,
+    binary: Atom,
+    context_lines: u32,
+    limit: u64,
+    cursor: Option<Binary<'a>>,
+}
+
+#[derive(NifMap)]
 struct ErrorMap<'a> {
     code: Atom,
     message: String,
@@ -668,6 +681,7 @@ struct ErrorMap<'a> {
     oid: Option<Binary<'a>>,
     order: Option<String>,
     file: Option<String>,
+    reason: Option<String>,
 }
 
 #[derive(NifMap)]
@@ -734,6 +748,26 @@ struct CommitMap<'a> {
 }
 
 #[derive(NifMap)]
+struct SearchSubmatchMap {
+    start: u32,
+    length: u32,
+}
+
+#[derive(NifMap)]
+struct SearchMatchMap<'a> {
+    commit_oid: Binary<'a>,
+    blob_oid: Binary<'a>,
+    path: Binary<'a>,
+    line: u32,
+    column: u32,
+    preview: Binary<'a>,
+    preview_truncated: bool,
+    submatches: Vec<SearchSubmatchMap>,
+    context_before: Vec<Binary<'a>>,
+    context_after: Vec<Binary<'a>>,
+}
+
+#[derive(NifMap)]
 struct StatsMap {
     objects_requested: u64,
     objects_read: u64,
@@ -747,6 +781,10 @@ struct StatsMap {
     provider_bytes: u64,
     decompressed_bytes: u64,
     scanned_blobs: u64,
+    files_scanned: u64,
+    blobs_deduped: u64,
+    binary_skipped: u64,
+    oversize_skipped: u64,
     elapsed_ms: u64,
     stopped_by: Option<Atom>,
 }
@@ -785,6 +823,14 @@ struct TreePageMap<'a> {
 #[derive(NifMap)]
 struct LogPageMap<'a> {
     commits: Vec<CommitMap<'a>>,
+    next_cursor: Option<Binary<'a>>,
+    truncated: bool,
+    stats: StatsMap,
+}
+
+#[derive(NifMap)]
+struct SearchPageMap<'a> {
+    matches: Vec<SearchMatchMap<'a>>,
     next_cursor: Option<Binary<'a>>,
     truncated: bool,
     stats: StatsMap,
@@ -2025,6 +2071,87 @@ fn job_submit_list_tree<'a>(
 
 #[rustler::nif]
 #[allow(clippy::too_many_arguments)]
+fn job_submit_search<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    store: ResourceArc<StoreResource>,
+    raw_commit_oid: Binary<'a>,
+    raw_tree_oid: Binary<'a>,
+    query: Binary<'a>,
+    opts: SearchOptionsMap<'a>,
+    limits: LimitsMap,
+    detach: bool,
+) -> NifResult<Term<'a>> {
+    let commit_oid = match oid_for_store(&store, raw_commit_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let tree_oid = match oid_for_store(&store, raw_tree_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let mode = match parse_search_mode(opts.mode) {
+        Ok(mode) => mode,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let binary_mode = match parse_search_binary_mode(opts.binary) {
+        Ok(mode) => mode,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let stopped_by_max_results = limits.max_results < opts.limit;
+    let effective_limit = opts.limit.min(limits.max_results);
+    let limit = match usize::try_from(effective_limit) {
+        Ok(limit) => limit,
+        Err(_) => {
+            let error = Error::new(ErrorCode::InvalidArgument, "search page limit is too large");
+            return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+        }
+    };
+    let query = query.as_slice().to_vec();
+    let options = SearchOptions {
+        mode,
+        case_sensitive: opts.case_sensitive,
+        path: opts.path.as_slice().to_vec(),
+        pathspecs: opts
+            .pathspecs
+            .iter()
+            .map(|pathspec| pathspec.as_slice().to_vec())
+            .collect(),
+        binary: binary_mode,
+        context_lines: opts.context_lines,
+        limit,
+        max_result_bytes: limits.max_result_bytes,
+        cursor: opts.cursor.map(|cursor| cursor.as_slice().to_vec()),
+    };
+    let task_store = store.clone();
+    let task = Box::new(move |budget: &Budget| {
+        core_search(
+            task_store.0.as_dyn(),
+            &Snapshot {
+                commit_oid,
+                tree_oid,
+            },
+            &query,
+            &options,
+            budget,
+        )
+        .map(JobOutput::Search)
+    });
+    submit_job(
+        env,
+        runtime,
+        detach,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Page {
+            stopped_by_max_results,
+        },
+        task,
+    )
+}
+
+#[rustler::nif]
+#[allow(clippy::too_many_arguments)]
 fn job_submit_log<'a>(
     env: Env<'a>,
     runtime: ResourceArc<RuntimeResource>,
@@ -2372,6 +2499,54 @@ fn encode_job_output<'a>(
             }
             .encode(env)
         }
+        JobOutput::Search(page) => {
+            let stopped_by = match result_kind {
+                JobResultKind::Page {
+                    stopped_by_max_results: true,
+                } => atoms::max_results(),
+                JobResultKind::Page {
+                    stopped_by_max_results: false,
+                }
+                | JobResultKind::Other => atoms::limit(),
+            };
+            SearchPageMap {
+                matches: page
+                    .matches
+                    .into_iter()
+                    .map(|item| SearchMatchMap {
+                        commit_oid: binary(env, item.commit_oid.as_bytes()),
+                        blob_oid: binary(env, item.blob_oid.as_bytes()),
+                        path: binary(env, &item.path),
+                        line: item.line,
+                        column: item.column,
+                        preview: binary(env, &item.preview),
+                        preview_truncated: item.preview_truncated,
+                        submatches: item
+                            .submatches
+                            .into_iter()
+                            .map(|range| SearchSubmatchMap {
+                                start: range.start,
+                                length: range.length,
+                            })
+                            .collect(),
+                        context_before: item
+                            .context_before
+                            .iter()
+                            .map(|line| binary(env, line))
+                            .collect(),
+                        context_after: item
+                            .context_after
+                            .iter()
+                            .map(|line| binary(env, line))
+                            .collect(),
+                    })
+                    .collect(),
+                next_cursor: page.next_cursor.map(|cursor| binary(env, &cursor)),
+                truncated: page.truncated,
+                stats: stats_map(page.stats, elapsed_ms, stopped_by, provider_spend),
+            }
+            .encode(env)
+        }
         JobOutput::Log(page) => {
             let stopped_by = match result_kind {
                 JobResultKind::Page {
@@ -2481,6 +2656,24 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
                     .saturating_add(length(&entry.path))
                     .saturating_add(length(&entry.name))
                     .saturating_add(length(entry.oid.as_bytes()))
+            },
+        ),
+        JobOutput::Search(page) => page.matches.iter().fold(
+            page.next_cursor.as_deref().map(length).unwrap_or(0),
+            |total, item| {
+                let context = item
+                    .context_before
+                    .iter()
+                    .chain(&item.context_after)
+                    .fold(0u64, |total, line| total.saturating_add(length(line)));
+                total
+                    .saturating_add(length(item.commit_oid.as_bytes()))
+                    .saturating_add(length(item.blob_oid.as_bytes()))
+                    .saturating_add(length(&item.path))
+                    .saturating_add(length(&item.preview))
+                    .saturating_add(context)
+                    .saturating_add((item.submatches.len() as u64).saturating_mul(8))
+                    .saturating_add(16)
             },
         ),
         JobOutput::Log(page) => page.commits.iter().fold(
@@ -2631,7 +2824,11 @@ fn stats_map(
         provider_requests: provider_spend.2,
         provider_bytes: provider_spend.3,
         decompressed_bytes: stats.bytes_read,
-        scanned_blobs: 0,
+        scanned_blobs: stats.files_scanned,
+        files_scanned: stats.files_scanned,
+        blobs_deduped: stats.blobs_deduped,
+        binary_skipped: stats.binary_skipped,
+        oversize_skipped: stats.oversize_skipped,
         elapsed_ms,
         stopped_by: stats.stopped_by.and_then(|limit| {
             if limit == "limit" {
@@ -2724,6 +2921,32 @@ fn parse_log_order(order: Atom) -> Result<LogOrder, Error> {
     }
 }
 
+fn parse_search_mode(mode: Atom) -> Result<SearchMode, Error> {
+    if mode == atoms::literal() {
+        Ok(SearchMode::Literal)
+    } else if mode == atoms::regex() {
+        Ok(SearchMode::Regex)
+    } else {
+        Err(Error::new(
+            ErrorCode::InvalidArgument,
+            "search mode must be literal or regex",
+        ))
+    }
+}
+
+fn parse_search_binary_mode(mode: Atom) -> Result<SearchBinaryMode, Error> {
+    if mode == atoms::skip() {
+        Ok(SearchBinaryMode::Skip)
+    } else if mode == atoms::text() {
+        Ok(SearchBinaryMode::Text)
+    } else {
+        Err(Error::new(
+            ErrorCode::InvalidArgument,
+            "search binary mode must be skip or text",
+        ))
+    }
+}
+
 fn type_filter(types: &[Atom]) -> Result<TypeFilter, Error> {
     let mut filter = TypeFilter::NONE;
     for kind in types {
@@ -2810,6 +3033,7 @@ fn error_map<'a>(env: Env<'a>, error: Error) -> NifResult<ErrorMap<'a>> {
         oid: error.object_oid.map(|oid| binary(env, oid.as_bytes())),
         order: error.order.map(|order| order.as_str().to_owned()),
         file: error.file.map(|file| file.as_str().to_owned()),
+        reason: error.reason,
     })
 }
 
@@ -2868,6 +3092,9 @@ mod atoms {
         chronological,
         topological,
         date,
+        literal,
+        regex,
+        skip,
         text,
         binary,
         header,

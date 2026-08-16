@@ -55,6 +55,18 @@ defmodule Gitility.Native do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  def job_submit_search(
+        _runtime,
+        _resource,
+        _commit_oid,
+        _tree_oid,
+        _query,
+        _opts,
+        _limits,
+        _detach
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def job_submit_log(
         _runtime,
         _resource,

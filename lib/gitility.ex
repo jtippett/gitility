@@ -142,6 +142,10 @@ defmodule Gitility do
   implement this same API later — results are keyed by blob ID to make
   that a drop-in.)
 
+  Cursor resume replays the deterministic tree prefix and re-scans the cursor
+  path, costing O(prefix paths + one blob re-scan); replayed prefix paths do
+  not consume `limits.max_objects` again.
+
   ## Options
 
     * `:mode` — `:literal` (default) or `:regex`. Regex uses a linear-time
@@ -151,16 +155,27 @@ defmodule Gitility do
     * `:case_sensitive` — default `true`.
     * `:path` — restrict to a subtree (raw bytes).
     * `:pathspecs` — glob patterns filtering candidate files.
-    * `:binary` — `:skip` (default) or `:match` binary blobs.
+    * `:binary` — `:skip` (default) or `:text` to scan binary blobs as bytes.
     * `:context_lines` — context lines around each match (default `0`).
     * `:limit`, `:cursor` — pagination.
     * `:limits` — a `Gitility.Limits` override.
   """
   @spec search(Snapshot.t(), binary(), keyword()) ::
           {:ok, Page.t(Gitility.SearchMatch.t())} | {:error, Error.t()}
-  def search(snapshot, query, opts \\ []) do
-    _ = {snapshot, query, opts}
-    NotImplementedError.stub!(:"search/3", "Milestone 3")
+  def search(snapshot, query, opts \\ [])
+
+  def search(%Snapshot{} = snapshot, query, opts) do
+    {opts, limits} = search_options!(opts)
+
+    NativeSupport.await_sync(
+      fn -> submit_search(snapshot, query, opts, limits, false) end,
+      limits.timeout_ms,
+      :search
+    )
+  end
+
+  def search(_snapshot, _query, _opts) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Snapshot", operation: :search)}
   end
 
   ## ————————————————————————————————————————————————————————————————
@@ -532,6 +547,31 @@ defmodule Gitility do
 
   defp validate_log_order(_order), do: raise(ArgumentError, ":order must be an atom")
 
+  defp validate_search_mode(mode) when mode in [:literal, :regex], do: {:ok, mode}
+
+  defp validate_search_mode(mode) when is_atom(mode),
+    do: NativeSupport.invalid_argument(":mode must be :literal or :regex")
+
+  defp validate_search_mode(_mode), do: raise(ArgumentError, ":mode must be an atom")
+
+  defp validate_search_binary_mode(mode) when mode in [:skip, :text], do: {:ok, mode}
+
+  defp validate_search_binary_mode(mode) when is_atom(mode),
+    do: NativeSupport.invalid_argument(":binary must be :skip or :text")
+
+  defp validate_search_binary_mode(_mode),
+    do: raise(ArgumentError, ":binary must be an atom")
+
+  defp validate_search_context_lines(lines)
+       when is_integer(lines) and lines >= 0 and lines <= 32,
+       do: {:ok, lines}
+
+  defp validate_search_context_lines(lines) when is_integer(lines),
+    do: NativeSupport.invalid_argument(":context_lines must be between 0 and 32")
+
+  defp validate_search_context_lines(_lines),
+    do: raise(ArgumentError, ":context_lines must be an integer")
+
   defp validate_log_time(nil, _key), do: {:ok, nil}
   defp validate_log_time(%DateTime{} = value, _key), do: {:ok, DateTime.to_unix(value)}
   defp validate_log_time(value, _key) when is_integer(value), do: {:ok, value}
@@ -612,6 +652,25 @@ defmodule Gitility do
         first_parent: false,
         since: nil,
         until: nil,
+        limit: 1_000,
+        cursor: nil,
+        limits: nil
+      )
+
+    limits = opts[:limits] || Limits.new()
+    _limits_map = NativeSupport.limits_map!(limits)
+    {opts, limits}
+  end
+
+  defp search_options!(opts) do
+    opts =
+      Keyword.validate!(opts,
+        mode: :literal,
+        case_sensitive: true,
+        path: "",
+        pathspecs: [],
+        binary: :skip,
+        context_lines: 0,
         limit: 1_000,
         cursor: nil,
         limits: nil
@@ -704,6 +763,48 @@ defmodule Gitility do
     end
   end
 
+  defp submit_search(
+         %Snapshot{odb: %ODB{ref: resource, runtime: runtime}} = snapshot,
+         query,
+         opts,
+         limits,
+         detach
+       ) do
+    limits_map = NativeSupport.limits_map!(limits)
+    case_sensitive = NativeSupport.boolean_option!(opts, :case_sensitive)
+
+    with :ok <- validate_binary(query, "search query"),
+         {:ok, mode} <- validate_search_mode(opts[:mode]),
+         :ok <- validate_binary(opts[:path], ":path"),
+         {:ok, pathspecs} <- validate_pathspecs(opts[:pathspecs]),
+         {:ok, binary_mode} <- validate_search_binary_mode(opts[:binary]),
+         {:ok, context_lines} <- validate_search_context_lines(opts[:context_lines]),
+         {:ok, limit} <- effective_page_limit(opts[:limit], limits.max_results),
+         {:ok, cursor} <- decode_cursor(opts[:cursor]) do
+      NativeSupport.submit_job(runtime, :search, fn runtime_resource ->
+        Native.job_submit_search(
+          runtime_resource,
+          resource,
+          snapshot.commit_oid.bytes,
+          snapshot.tree_oid.bytes,
+          query,
+          %{
+            mode: mode,
+            case_sensitive: case_sensitive,
+            path: opts[:path],
+            pathspecs: pathspecs,
+            binary: binary_mode,
+            context_lines: context_lines,
+            limit: limit,
+            cursor: cursor
+          },
+          limits_map,
+          detach
+        )
+      end)
+    end
+  end
+
   defp submit_read_file(
          %Snapshot{odb: %ODB{ref: resource, runtime: runtime}} = snapshot,
          path,
@@ -734,9 +835,30 @@ defmodule Gitility do
   @doc "Asynchronous `search/3`; returns the `Gitility.Job`."
   @spec async_search(Snapshot.t(), binary(), keyword()) ::
           {:ok, Job.t()} | {:error, Error.t()}
-  def async_search(snapshot, query, opts \\ []) do
-    _ = {snapshot, query, opts}
-    NotImplementedError.stub!(:"async_search/3", "Milestone 3")
+  def async_search(snapshot, query, opts \\ [])
+
+  def async_search(%Snapshot{} = snapshot, query, opts) do
+    opts =
+      Keyword.validate!(opts,
+        mode: :literal,
+        case_sensitive: true,
+        path: "",
+        pathspecs: [],
+        binary: :skip,
+        context_lines: 0,
+        limit: 1_000,
+        cursor: nil,
+        limits: nil,
+        detach: false
+      )
+
+    detach = NativeSupport.boolean_option!(opts, :detach)
+    {opts, limits} = opts |> Keyword.delete(:detach) |> search_options!()
+    submit_search(snapshot, query, opts, limits, detach)
+  end
+
+  def async_search(_snapshot, _query, _opts) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Snapshot", operation: :search)}
   end
 
   @doc "Asynchronous `log/2`; returns the `Gitility.Job`."

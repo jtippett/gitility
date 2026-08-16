@@ -11,7 +11,7 @@ corrupt_helper="$script_dir/corrupt.py"
 checksum_helper="$script_dir/checksums.py"
 generator_hash="$(git hash-object "$script_dir/generate.sh")"
 
-for command in awk cat chmod cmp cp dd env find git ln mkdir mktemp mv python3 rm seq; do
+for command in awk cat chmod cmp cp dd env find git grep ln mkdir mktemp mv python3 rm seq; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'error: fixture generation requires %s\n' "$command" >&2
     exit 1
@@ -503,12 +503,46 @@ make_nested() {
   export_bare "$work_repository" "$bare_repository" sha1
 }
 
+make_search() {
+  local work_repository=$1
+  local bare_repository=$2
+  local page_line
+
+  init_work_repo "$work_repository" sha1
+  mkdir -p "$work_repository/deep/level/three" \
+    "$work_repository/dedup/a" "$work_repository/dedup/b" \
+    "$work_repository/dedup/c" "$work_repository/pages"
+
+  printf 'shared needle payload\nsecond line\n' >"$work_repository/dedup/a/shared.txt"
+  cp "$work_repository/dedup/a/shared.txt" "$work_repository/dedup/b/shared.txt"
+  cp "$work_repository/dedup/a/shared.txt" "$work_repository/dedup/c/shared.txt"
+  printf 'deep Needle and needle\n' >"$work_repository/deep/level/three/hit.txt"
+  printf '\000binary payload containing needle\n' >"$work_repository/binary-with-needle.dat"
+  awk 'BEGIN { for (i = 0; i < 8100; i++) printf "x"; printf "\nneedle after byte 8000\n" }' \
+    >"$work_repository/after-8000.txt"
+  printf 'caf\351 needle latin-1\n' >"$work_repository/latin1.txt"
+  printf 'first\r\nneedle on crlf\r\nlast\r\n' >"$work_repository/crlf.txt"
+  printf 'needle needle needle needle needle\n' >"$work_repository/many-on-one-line.txt"
+  : >"$work_repository/empty.txt"
+  printf 'last line only needle' >"$work_repository/final-no-newline.txt"
+  : >"$work_repository/pages/many-lines.txt"
+  for page_line in $(seq 1 40); do
+    printf 'page %02d needle\n' "$page_line" >>"$work_repository/pages/many-lines.txt"
+  done
+
+  commit_all_at "$work_repository" '2001-06-01T00:00:00+0000' \
+    'Add deterministic content-search corpus'
+  export_bare "$work_repository" "$bare_repository" sha1
+  git -C "$bare_repository" fsck --full --strict --no-dangling >/dev/null
+}
+
 sha1_work="$scratch_dir/sha1-basic-work"
 sha256_work="$scratch_dir/sha256-basic-work"
 history_work="$scratch_dir/sha1-history-work"
 graph_work="$scratch_dir/sha1-graph-work"
 lfs_work="$scratch_dir/lfs-pointer-work"
 nested_work="$scratch_dir/sha1-nested-work"
+search_work="$scratch_dir/sha1-search-work"
 
 make_basic sha1 "$sha1_work" "$output_dir/sha1-basic.git"
 make_basic sha256 "$sha256_work" "$output_dir/sha256-basic.git"
@@ -516,6 +550,7 @@ make_history "$history_work" "$output_dir/sha1-history.git"
 make_graph "$graph_work" "$output_dir/sha1-graph.git"
 make_lfs_pointer "$lfs_work" "$output_dir/lfs-pointer.git"
 make_nested "$nested_work" "$output_dir/sha1-nested.git"
+make_search "$search_work" "$output_dir/sha1-search.git"
 
 # Fully packed and deliberately mixed object layouts.
 cp -R "$output_dir/sha1-basic.git" "$output_dir/sha1-basic-packed.git"
@@ -690,6 +725,7 @@ history_head="$(git -C "$output_dir/sha1-history.git" rev-parse HEAD)"
 graph_head="$(git -C "$output_dir/sha1-graph.git" rev-parse HEAD)"
 lfs_head="$(git -C "$output_dir/lfs-pointer.git" rev-parse HEAD)"
 nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
+search_head="$(git -C "$output_dir/sha1-search.git" rev-parse HEAD)"
 
 {
   printf 'git_version=%s\n' "$git_version"
@@ -722,6 +758,7 @@ nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
     "$(git -C "$output_dir/sha1-graph.git" rev-parse fixture/equal-merge)"
   printf 'lfs_pointer_head=%s\n' "$lfs_head"
   printf 'sha1_nested_head=%s\n' "$nested_head"
+  printf 'sha1_search_head=%s\n' "$search_head"
   printf 'sha1_nested_root_txt=%s\n' \
     "$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD:root.txt)"
   printf 'sha1_nested_deep_txt=%s\n' \
@@ -737,12 +774,32 @@ printf '%s\n' "$generator_hash" >"$output_dir/GENERATOR_HASH"
 python3 "$checksum_helper" "$output_dir" >"$output_dir/CHECKSUMS"
 
 if [[ -s "$previous_oids" ]]; then
-  cmp "$previous_oids" "$output_dir/OIDS"
-  printf 'Verified stable object IDs against the previous generation.\n'
+  while IFS= read -r previous_oid; do
+    if [[ "$previous_oid" == sha1_search_head=* ]]; then
+      continue
+    fi
+    if ! grep -Fqx -- "$previous_oid" "$output_dir/OIDS"; then
+      printf 'error: generated object ID changed or disappeared: %s\n' "$previous_oid" >&2
+      exit 1
+    fi
+  done <"$previous_oids"
+  printf 'Verified stable pre-existing object IDs against the previous generation.\n'
 fi
 if [[ -s "$previous_checksums" ]]; then
-  cmp "$previous_checksums" "$output_dir/CHECKSUMS"
-  printf 'Verified byte-identical repository contents against the previous generation.\n'
+  # Extending the generated corpus legitimately adds inventory records and
+  # changes the OIDS/generator markers. Every other pre-existing path must
+  # remain byte-identical.
+  while IFS= read -r previous_checksum; do
+    case "$previous_checksum" in
+      *' R0VORVJBVE9SX0hBU0g=' | *' T0lEUw==') continue ;;
+    esac
+    if ! grep -Fqx -- "$previous_checksum" "$output_dir/CHECKSUMS"; then
+      printf 'error: generated fixture changed or disappeared: %s\n' \
+        "$previous_checksum" >&2
+      exit 1
+    fi
+  done <"$previous_checksums"
+  printf 'Verified byte-identical pre-existing repository contents.\n'
 fi
 
 printf 'Generated fixtures with git %s:\n' "$git_version"

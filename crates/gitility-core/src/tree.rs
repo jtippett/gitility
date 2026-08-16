@@ -129,6 +129,10 @@ pub struct QueryStats {
     pub cache_bytes: u64,
     pub cache_entries: u64,
     pub cache_evictions: u64,
+    pub files_scanned: u64,
+    pub blobs_deduped: u64,
+    pub binary_skipped: u64,
+    pub oversize_skipped: u64,
     pub stopped_by: Option<&'static str>,
 }
 
@@ -284,6 +288,10 @@ pub fn list_tree(
             cache_bytes: cache_stats.bytes,
             cache_entries: cache_stats.entries,
             cache_evictions: cache_stats.evictions,
+            files_scanned: 0,
+            blobs_deduped: 0,
+            binary_skipped: 0,
+            oversize_skipped: 0,
             stopped_by,
         },
     })
@@ -442,11 +450,11 @@ pub(crate) fn resolve_path(
 }
 
 #[derive(Debug)]
-struct OwnedTreeEntry {
-    mode: u32,
-    name: Vec<u8>,
-    oid: Oid,
-    kind: TreeItemKind,
+pub(crate) struct OwnedTreeEntry {
+    pub(crate) mode: u32,
+    pub(crate) name: Vec<u8>,
+    pub(crate) oid: Oid,
+    pub(crate) kind: TreeItemKind,
 }
 
 fn read_tree_entries(
@@ -478,6 +486,76 @@ fn read_tree_entries(
         .collect()
 }
 
+pub(crate) fn resolve_path_for_graph_walk(
+    store: &dyn ObjectDb,
+    snapshot: &Snapshot,
+    path: &[u8],
+    budget: &Budget,
+) -> Result<ResolvedPath, Error> {
+    validate_path(path)?;
+    if path.is_empty() {
+        return Ok(ResolvedPath::RootTree(snapshot.tree_oid));
+    }
+
+    let mut tree_oid = snapshot.tree_oid;
+    let mut segments = path.split(|byte| *byte == b'/').peekable();
+    while let Some(segment) = segments.next() {
+        let entries = read_tree_entries_graph(store, tree_oid, budget)?;
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.name == segment)
+            .ok_or_else(path_not_found)?;
+        if segments.peek().is_none() {
+            return Ok(ResolvedPath::Entry(ResolvedEntry {
+                oid: entry.oid,
+                mode: entry.mode,
+                kind: entry.kind,
+            }));
+        }
+        if entry.kind != TreeItemKind::Tree {
+            return Err(path_not_found());
+        }
+        tree_oid = entry.oid;
+    }
+    Err(path_not_found())
+}
+
+fn read_tree_entries_graph(
+    store: &dyn ObjectDb,
+    oid: Oid,
+    budget: &Budget,
+) -> Result<Vec<OwnedTreeEntry>, Error> {
+    let mut payload = Vec::new();
+    let kind = store
+        .try_find_graph(&oid, &mut payload, budget)?
+        .ok_or_else(|| missing_object(oid, "tree"))?;
+    if kind != ObjectKind::Tree {
+        return Err(Error::new(
+            ErrorCode::NotATree,
+            format!("tree object {oid} is not a tree"),
+        ));
+    }
+    decode_owned_tree_entries(&payload, store.hash_kind())
+}
+
+fn decode_owned_tree_entries(
+    payload: &[u8],
+    hash_kind: HashKind,
+) -> Result<Vec<OwnedTreeEntry>, Error> {
+    decode_tree(payload, hash_kind)
+        .map(|entry| {
+            let entry = entry?;
+            validate_tree_name(entry.name)?;
+            Ok(OwnedTreeEntry {
+                mode: entry.mode,
+                name: entry.name.to_vec(),
+                oid: entry.oid,
+                kind: kind_from_mode(entry.mode)?,
+            })
+        })
+        .collect()
+}
+
 fn read_tree_entries_for_walk(
     store: &dyn ObjectDb,
     oid: Oid,
@@ -486,6 +564,25 @@ fn read_tree_entries_for_walk(
 ) -> Result<Vec<OwnedTreeEntry>, Error> {
     let entries = read_tree_entries(store, oid, budget)?;
     if prefetch_children && store.supports_prefetch() {
+        let child_trees = entries
+            .iter()
+            .filter(|entry| entry.kind == TreeItemKind::Tree)
+            .map(|entry| entry.oid)
+            .collect::<Vec<_>>();
+        if !child_trees.is_empty() {
+            store.prefetch(&child_trees, budget)?;
+        }
+    }
+    Ok(entries)
+}
+
+pub(crate) fn read_tree_entries_for_graph_walk(
+    store: &dyn ObjectDb,
+    oid: Oid,
+    budget: &Budget,
+) -> Result<Vec<OwnedTreeEntry>, Error> {
+    let entries = read_tree_entries_graph(store, oid, budget)?;
+    if store.supports_prefetch() {
         let child_trees = entries
             .iter()
             .filter(|entry| entry.kind == TreeItemKind::Tree)
@@ -584,7 +681,7 @@ fn validate_cursor_position(position: &[u8], base: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn join_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
+pub(crate) fn join_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
     if prefix.is_empty() {
         return name.to_vec();
     }
@@ -595,7 +692,7 @@ fn join_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
     path
 }
 
-fn relative_to_scope<'a>(path: &'a [u8], scope: &[u8]) -> &'a [u8] {
+pub(crate) fn relative_to_scope<'a>(path: &'a [u8], scope: &[u8]) -> &'a [u8] {
     if scope.is_empty() {
         path
     } else {

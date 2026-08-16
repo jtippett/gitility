@@ -171,6 +171,9 @@ pub struct Error {
     pub order: Option<ErrorOrder>,
     /// Stable repository metadata filename associated with a parse failure.
     pub file: Option<ErrorFile>,
+    /// A sanitized machine-readable reason for failures whose underlying
+    /// engine provides useful diagnostics (currently safe-regex compilation).
+    pub reason: Option<String>,
 }
 
 impl Error {
@@ -184,6 +187,7 @@ impl Error {
             object_oid: None,
             order: None,
             file: None,
+            reason: None,
         }
     }
 
@@ -197,6 +201,7 @@ impl Error {
             object_oid: None,
             order: None,
             file: None,
+            reason: None,
         }
     }
 
@@ -235,6 +240,12 @@ impl Error {
     /// Names stable repository metadata involved in a parse failure.
     pub fn with_file(mut self, file: ErrorFile) -> Self {
         self.file = Some(file);
+        self
+    }
+
+    /// Attaches a sanitized engine reason to this failure.
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
         self
     }
 }

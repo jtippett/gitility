@@ -239,6 +239,10 @@ pub fn log(
             cache_bytes: cache_stats.bytes,
             cache_entries: cache_stats.entries,
             cache_evictions: cache_stats.evictions,
+            files_scanned: 0,
+            blobs_deduped: 0,
+            binary_skipped: 0,
+            oversize_skipped: 0,
             stopped_by,
         },
     })

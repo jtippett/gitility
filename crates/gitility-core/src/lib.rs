@@ -30,6 +30,7 @@ pub mod pathspec;
 pub mod provider_odb;
 pub mod refs;
 pub mod runtime;
+pub mod search;
 pub mod snapshot;
 pub mod static_odb;
 pub mod tree;
@@ -67,6 +68,10 @@ pub use refs::{RefDb, RefPage, RefQuery, RefTarget};
 pub use runtime::{
     BusyReason, Job, JobObserver, JobOutput, JobSpec, JobState, JobTask, OwnerKey, ReadManyOutput,
     Runtime, RuntimeConfig, RuntimeCounters, SubmitError, TestObserver,
+};
+pub use search::{
+    search, SearchBinaryMode, SearchMatch, SearchMode, SearchOptions, SearchPage, SearchSubmatch,
+    MAX_CONTEXT_LINES,
 };
 pub use snapshot::{open as open_snapshot, peel, PeelTarget, Snapshot};
 pub use static_odb::StaticOdb;

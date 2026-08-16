@@ -172,7 +172,8 @@ pub struct Error {
     /// Stable repository metadata filename associated with a parse failure.
     pub file: Option<ErrorFile>,
     /// A sanitized machine-readable reason for failures whose underlying
-    /// engine provides useful diagnostics (currently safe-regex compilation).
+    /// engine provides useful diagnostics (for example safe-regex compilation
+    /// or an upstream defect class behind an unsupported operation).
     pub reason: Option<String>,
 }
 

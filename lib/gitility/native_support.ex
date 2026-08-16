@@ -338,7 +338,8 @@ defmodule Gitility.NativeSupport do
             origin: line.origin,
             content: line.content,
             old_line: line.old_line,
-            new_line: line.new_line
+            new_line: line.new_line,
+            no_newline: line.no_newline
           }
         end)
     }

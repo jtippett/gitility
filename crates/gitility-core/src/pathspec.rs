@@ -25,6 +25,44 @@ impl PathspecMatcher {
     pub(crate) fn matches(&self, path: &[u8]) -> bool {
         self.patterns.is_empty() || self.patterns.iter().any(|pattern| matches(pattern, path))
     }
+
+    /// Returns true if `prefix` itself or anything below it can match.
+    ///
+    /// Literal pathspecs admit exact pruning. Glob pathspecs use the complete
+    /// directory portion before their first metacharacter as a conservative
+    /// fast path; patterns without such a directory prefix keep the walk
+    /// open. This never rejects a subtree that the matcher could select.
+    pub(crate) fn may_match_descendant(&self, prefix: &[u8]) -> bool {
+        self.patterns.is_empty()
+            || self
+                .patterns
+                .iter()
+                .any(|pattern| pattern_may_match_descendant(pattern, prefix))
+    }
+}
+
+fn pattern_may_match_descendant(pattern: &[u8], prefix: &[u8]) -> bool {
+    let (pattern, force_glob) = pattern
+        .strip_prefix(b":(glob)")
+        .map_or((pattern, false), |pattern| (pattern, true));
+    let first_meta = pattern
+        .iter()
+        .position(|byte| matches!(byte, b'*' | b'?' | b'['));
+    if !force_glob && first_meta.is_none() {
+        return path_prefixes_overlap(pattern, prefix);
+    }
+
+    let fixed = &pattern[..first_meta.unwrap_or(pattern.len())];
+    let Some(last_slash) = fixed.iter().rposition(|byte| *byte == b'/') else {
+        return true;
+    };
+    path_prefixes_overlap(&fixed[..last_slash], prefix)
+}
+
+fn path_prefixes_overlap(left: &[u8], right: &[u8]) -> bool {
+    left == right
+        || (left.starts_with(right) && left.get(right.len()) == Some(&b'/'))
+        || (right.starts_with(left) && right.get(left.len()) == Some(&b'/'))
 }
 
 /// Matches one raw-byte path with Git's path-aware wildmatch rules.
@@ -88,5 +126,21 @@ mod tests {
         assert!(matcher.matches(b"sub/file"));
         assert!(matcher.matches(b"sub/deep/file"));
         assert!(!matcher.matches(b"outside/file"));
+    }
+
+    #[test]
+    fn descendant_check_prunes_literal_and_fixed_glob_prefixes_conservatively() {
+        let literal = PathspecMatcher::new(&[b"dir/sub/file.txt".to_vec()]);
+        assert!(literal.may_match_descendant(b"dir"));
+        assert!(literal.may_match_descendant(b"dir/sub"));
+        assert!(!literal.may_match_descendant(b"other"));
+
+        let glob = PathspecMatcher::new(&[b":(glob)dir/sub/**".to_vec()]);
+        assert!(glob.may_match_descendant(b"dir"));
+        assert!(glob.may_match_descendant(b"dir/sub"));
+        assert!(!glob.may_match_descendant(b"other"));
+
+        let root_glob = PathspecMatcher::new(&[b"*.txt".to_vec()]);
+        assert!(root_glob.may_match_descendant(b"anywhere"));
     }
 }

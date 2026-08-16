@@ -50,7 +50,7 @@ defmodule Gitility.MixProject do
         "Changelog" => "#{@source_url}/blob/master/CHANGELOG.md"
       },
       files: ~w(lib Cargo.toml Cargo.lock native/gitility/Cargo.toml native/gitility/src
-           crates/gitility-core/Cargo.toml crates/gitility-core/src
+           crates/gitility-core/Cargo.toml crates/gitility-core/src crates/gitility-core/vendor
            checksum-Elixir.Gitility.Native.exs .formatter.exs mix.exs
            README.md CHANGELOG.md LICENSE)
     ]

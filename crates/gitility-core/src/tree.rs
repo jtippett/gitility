@@ -340,9 +340,11 @@ impl Walker<'_> {
                 stack.pop();
                 continue;
             };
-            let should_descend =
-                entry.kind == TreeItemKind::Tree && self.opts.recursive && depth < max_depth;
             let relative_path = relative_to_scope(&path, &self.opts.path);
+            let should_descend = entry.kind == TreeItemKind::Tree
+                && self.opts.recursive
+                && depth < max_depth
+                && self.matcher.may_match_descendant(relative_path);
             let should_emit = self.opts.types.contains(entry.kind)
                 && self.matcher.matches(relative_path)
                 && (self.resume.is_empty() || path.as_slice() > self.resume);

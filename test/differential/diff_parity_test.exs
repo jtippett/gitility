@@ -37,6 +37,12 @@ defmodule Gitility.Differential.DiffParityTest do
 
     assert {:ok, actual} = Gitility.diff(context.base, context.head, format: :summary)
 
+    assert %{status: "M", path: "symlink-stable"} =
+             Enum.find(expected, &(&1.path == "symlink-stable"))
+
+    assert %{status: :modified, old_mode: 0o120000, new_mode: 0o120000} =
+             Enum.find(actual.files, &(&1.new_path == "symlink-stable"))
+
     compare(
       :diff_summary_no_renames,
       %{format: :summary, renames: false},
@@ -45,35 +51,31 @@ defmodule Gitility.Differential.DiffParityTest do
     )
   end
 
-  test "rename and changed-source copy pairs match diff-tree", context do
-    for {case_id, git_options, gitility_options} <- [
-          {:renames, ["-M"], [renames: :similarity]},
-          {:copies, ["-M", "-C"], [renames: :similarity, copies: true]}
-        ] do
-      assert {:ok, expected} =
-               Oracle.diff_tree_raw(
-                 context.repository_path,
-                 context.base_oid,
-                 context.head_oid,
-                 git_options
-               )
+  test "rename pairs and every integer similarity score match diff-tree", context do
+    assert {:ok, expected} =
+             Oracle.diff_tree_raw(
+               context.repository_path,
+               context.base_oid,
+               context.head_oid,
+               ["-M"]
+             )
 
-      assert {:ok, actual} =
-               Gitility.diff(
-                 context.base,
-                 context.head,
-                 Keyword.put(gitility_options, :format, :summary)
-               )
+    assert {:ok, actual} =
+             Gitility.diff(context.base, context.head,
+               format: :summary,
+               renames: :similarity
+             )
 
-      compare(
-        {:diff_rewrites, case_id},
-        %{format: :summary, git_options: git_options},
-        rewrite_pairs(expected),
-        engine_rewrite_pairs(actual.files)
-      )
+    compare(
+      {:diff_rewrites, :renames},
+      %{format: :summary, git_options: ["-M"]},
+      rewrite_pairs(expected),
+      engine_rewrite_pairs(actual.files)
+    )
 
-      compare_similarity_buckets(case_id, expected, actual.files)
-    end
+    # This pins truncation parity for every detected pair, including the
+    # borderline R050 and fractional R086 shapes.
+    assert similarity_scores(expected) == engine_similarity_scores(actual.files)
   end
 
   test "stats match NUL-safe numstat including binary markers", context do
@@ -115,17 +117,28 @@ defmodule Gitility.Differential.DiffParityTest do
                    context_lines
                  )
 
+        actual_hunks =
+          if file.status == :type_changed do
+            # Git emits two file sections for T. The oracle flattens those two
+            # sections onto Gitility's one record in delete-then-add order.
+            assert length(expected_hunks) == 2
+            assert length(file.hunks) == 2
+            engine_hunks(file.hunks)
+          else
+            engine_hunks(file.hunks)
+          end
+
         compare(
           {:diff_patch, context_lines, path},
           %{format: :patch, context_lines: context_lines, path: path},
           expected_hunks,
-          engine_hunks(file.hunks)
+          actual_hunks
         )
       end
     end
   end
 
-  test "explicit glob-magic pathspec scopes both walkers to dir/sub", context do
+  test "pathspec scopes the walk before rename detection", context do
     pathspecs = [":(glob)dir/sub/**"]
 
     assert {:ok, expected} =
@@ -133,22 +146,53 @@ defmodule Gitility.Differential.DiffParityTest do
                context.repository_path,
                context.base_oid,
                context.head_oid,
-               ["--no-renames"],
+               ["-M"],
                pathspecs
              )
 
     assert {:ok, actual} =
              Gitility.diff(context.base, context.head,
                format: :summary,
-               pathspecs: pathspecs
+               pathspecs: pathspecs,
+               renames: :similarity
              )
+
+    assert %{status: "A", path: "dir/sub/rename-inside-new.txt"} =
+             Enum.find(expected, &(&1.path == "dir/sub/rename-inside-new.txt"))
+
+    assert %{status: :added, new_path: "dir/sub/rename-inside-new.txt"} =
+             Enum.find(actual.files, &(&1.new_path == "dir/sub/rename-inside-new.txt"))
 
     compare(
       :diff_pathspec_glob,
-      %{format: :summary, pathspecs: pathspecs},
+      %{format: :summary, pathspecs: pathspecs, renames: :similarity},
       raw_file_records(expected),
       engine_file_records(actual.files)
     )
+  end
+
+  test "trailing-newline-only patch carries Git's marker on the prior line", context do
+    path = "trailing-newline.txt"
+
+    assert {:ok, expected} =
+             Oracle.diff_hunks(
+               context.repository_path,
+               context.base_oid,
+               context.head_oid,
+               path,
+               0
+             )
+
+    assert {:ok, actual} =
+             Gitility.diff(context.base, context.head,
+               pathspecs: [path],
+               context_lines: 0
+             )
+
+    assert [%{lines: [%{origin: :deletion, no_newline: true}, %{origin: :addition}]}] =
+             expected
+
+    assert expected == engine_hunks(hd(actual.files).hunks)
   end
 
   test "two real parent-child graph pairs match file-record parity" do
@@ -220,30 +264,16 @@ defmodule Gitility.Differential.DiffParityTest do
     |> Enum.map(&{&1.status, &1.old_path, &1.new_path})
   end
 
-  defp compare_similarity_buckets(case_id, expected, actual) do
-    git_scores =
-      expected
-      |> Enum.filter(&(&1.status in ["R", "C"]))
-      |> Map.new(&{{&1.path, &1.destination}, &1.similarity})
+  defp similarity_scores(changes) do
+    changes
+    |> Enum.filter(&(&1.status == "R"))
+    |> Map.new(&{{&1.path, &1.destination}, &1.similarity})
+  end
 
-    engine_scores =
-      actual
-      |> Enum.filter(&(&1.status in [:renamed, :copied]))
-      |> Map.new(&{{&1.old_path, &1.new_path}, &1.similarity})
-
-    for pair <- Map.keys(git_scores) |> Enum.sort() do
-      score_case =
-        if pair == {"rename-clean-old.txt", "rename-clean-new.txt"},
-          do: :clean,
-          else: {:candidate, pair}
-
-      compare(
-        {:diff_similarity, case_id, score_case},
-        %{renames: :similarity, git_options: case_id, pair: pair},
-        Map.fetch!(git_scores, pair),
-        Map.get(engine_scores, pair)
-      )
-    end
+  defp engine_similarity_scores(files) do
+    files
+    |> Enum.filter(&(&1.status == :renamed))
+    |> Map.new(&{{&1.old_path, &1.new_path}, &1.similarity})
   end
 
   defp engine_hunks(hunks) do
@@ -259,14 +289,17 @@ defmodule Gitility.Differential.DiffParityTest do
               origin: line.origin,
               content: line.content,
               old_line: line.old_line,
-              new_line: line.new_line
+              new_line: line.new_line,
+              no_newline: line.no_newline
             }
           end)
       }
     end)
   end
 
-  defp gitlink?(file), do: mode_type(file.old_mode) == 0o160000 or mode_type(file.new_mode) == 0o160000
+  defp gitlink?(file),
+    do: mode_type(file.old_mode) == 0o160000 or mode_type(file.new_mode) == 0o160000
+
   defp mode_type(nil), do: nil
   defp mode_type(mode), do: Bitwise.band(mode, 0o170000)
 
@@ -282,10 +315,8 @@ defmodule Gitility.Differential.DiffParityTest do
 
   defp git_oid("0000000000000000000000000000000000000000"), do: nil
 
-  defp git_oid(
-         "0000000000000000000000000000000000000000000000000000000000000000"
-       ),
-       do: nil
+  defp git_oid("0000000000000000000000000000000000000000000000000000000000000000"),
+    do: nil
 
   defp git_oid(oid), do: oid
 

@@ -108,7 +108,24 @@ stage_sync() {
   # Reviewers/probes drop test/_scratch_*.exs files; a stale one on the remote
   # (deleted locally after the last sync) silently joins the next full run.
   rexec "cd $REMOTE_DIR && find test -name '_scratch_*' -delete 2>/dev/null; git init -q 2>/dev/null; true"
-  echo "==> sync: done"
+  # A sync that lands on a doomed instance (sprite mid-restore) can report
+  # success while the persistent tree stays stale (observed 2026-08-17:
+  # every stage then ran against the previous milestone's code). Verify
+  # CONTENT, not exit codes: git-hash every shipped file on both sides and
+  # compare the combined digest before any stage is allowed to run.
+  local shipped expect actual
+  shipped="$(printf '%s\n' "$manifest" \
+    | grep -v -E '^(sources/|fixtures/generated/|_build/|deps/|target/|priv/native/|doc/)' \
+    | sort)"
+  expect="$(printf '%s\n' "$shipped" | tr '\n' '\0' \
+    | xargs -0 git hash-object -- | git hash-object --stdin)"
+  actual="$(printf '%s\n' "$shipped" \
+    | sprite exec -s "$SPRITE_NAME" -- bash -lc "cd $REMOTE_DIR && tr '\n' '\0' | xargs -0 git hash-object -- 2>/dev/null | git hash-object --stdin" | tail -1)"
+  if [ "$expect" != "$actual" ]; then
+    echo "==> sync: VERIFY FAILED (local $expect != remote $actual) — remote tree is stale or incomplete, aborting" >&2
+    exit 1
+  fi
+  echo "==> sync: done (content-verified $expect)"
 }
 
 stage_postgres() {

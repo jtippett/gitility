@@ -25,6 +25,11 @@ The corpus contains:
 - `sha1-nested.git`: a three-plus-level tree with sibling directories and
   mixed `.ex`, `.md`, and `.txt` files at the root and multiple depths. It is
   the pathspec fixture for slash-crossing `**` and scope-relative partitions.
+- `sha1-search.git`: deterministic text, binary-window, encoding, symlink,
+  long-line, repeated-blob, pagination, and pathspec shapes for content search.
+- `sha1-diff.git`: adds, deletes, modifications, modes, type changes,
+  symlinks, gitlinks, binary transitions, newline edges, pathspec scoping, and
+  exact, edited, borderline, and copy-shaped rewrite candidates.
 - `sha1-basic-packed.git`, `sha1-basic-mixed.git`, and
   `sha1-history-midx.git`: fully packed, mixed loose/packed, and two-pack
   multi-pack-index layouts.

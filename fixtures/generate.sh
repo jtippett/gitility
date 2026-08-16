@@ -564,9 +564,10 @@ make_diff() {
   local base_commit
   local head_commit
   local line_number
+  local borderline_score
 
   init_work_repo "$work_repository" sha1
-  mkdir -p "$work_repository/dir/sub"
+  mkdir -p "$work_repository/dir/sub" "$work_repository/outside/deep"
 
   printf 'deleted in head\n' >"$work_repository/delete.txt"
   : >"$work_repository/modify.txt"
@@ -593,8 +594,14 @@ make_diff() {
   printf 'text before transition\n' >"$work_repository/text-to-binary.dat"
   printf 'first\r\nsecond\r\nthird\r\n' >"$work_repository/crlf.txt"
   printf 'first line\nold eof' >"$work_repository/eof-no-newline.txt"
+  printf 'trailing newline toggle' >"$work_repository/trailing-newline.txt"
+  printf 'insertion line 1\ninsertion line 2\ninsertion line 3\n' \
+    >"$work_repository/mid-insertion.txt"
+  ln -s 'old-stable-target' "$work_repository/symlink-stable"
+  printf 'pathspec rename payload\n' >"$work_repository/rename-outside-old.txt"
   printf 'scoped old\n' >"$work_repository/dir/sub/modified.txt"
   printf 'scoped delete\n' >"$work_repository/dir/sub/deleted.txt"
+  printf 'unscoped tree old\n' >"$work_repository/outside/deep/modified.txt"
   commit_all_at "$work_repository" '2001-07-01T00:00:00+0000' \
     'Structured diff base'
   base_normal="$(git -C "$work_repository" rev-parse HEAD)"
@@ -606,13 +613,15 @@ make_diff() {
   mv "$scratch_dir/diff-modify.txt" "$work_repository/modify.txt"
   git -C "$work_repository" mv rename-clean-old.txt rename-clean-new.txt
   git -C "$work_repository" mv rename-edit-old.txt rename-edit-new.txt
-  awk '{ if (NR == 10 || NR == 20) printf "rename EDIT line %02d\\n", NR; else print }' \
+  awk '{ if (NR == 5 || NR == 10 || NR == 15 || NR == 20) printf "rename EDIT line %02d\n", NR; else print }' \
     "$work_repository/rename-edit-new.txt" >"$scratch_dir/diff-rename-edit.txt"
   mv "$scratch_dir/diff-rename-edit.txt" "$work_repository/rename-edit-new.txt"
   git -C "$work_repository" mv rename-borderline-old.txt rename-borderline-new.txt
-  awk '{ if (NR <= 10) print; else printf "borderline replacement %02d\\n", NR }' \
+  awk '{ if (NR <= 10) print; else printf "borderline replaced %02d\n", NR }' \
     "$work_repository/rename-borderline-new.txt" >"$scratch_dir/diff-borderline.txt"
   mv "$scratch_dir/diff-borderline.txt" "$work_repository/rename-borderline-new.txt"
+  # Deliberately retain this changed-source copy shape even though copies:true
+  # is unsupported in 0.x; it is the regression corpus for a post-1.0 tracker.
   cp "$work_repository/copy-source.txt" "$work_repository/copy-near.txt"
   printf 'copy source changed in place\n' >>"$work_repository/copy-source.txt"
   chmod 755 "$work_repository/mode-only.sh"
@@ -622,10 +631,19 @@ make_diff() {
   printf 'now binary\000transition\n' >"$work_repository/text-to-binary.dat"
   printf 'first\r\nSECOND\r\nthird\r\n' >"$work_repository/crlf.txt"
   printf 'first line\nnew eof' >"$work_repository/eof-no-newline.txt"
+  printf 'trailing newline toggle\n' >"$work_repository/trailing-newline.txt"
+  awk '{ print; if (NR == 2) print "inserted between 2 and 3" }' \
+    "$work_repository/mid-insertion.txt" >"$scratch_dir/diff-mid-insertion.txt"
+  mv "$scratch_dir/diff-mid-insertion.txt" "$work_repository/mid-insertion.txt"
+  rm "$work_repository/symlink-stable"
+  ln -s 'new-stable-target' "$work_repository/symlink-stable"
+  # The source intentionally lies outside the scoped destination pathspec.
+  git -C "$work_repository" mv rename-outside-old.txt dir/sub/rename-inside-new.txt
   : >"$work_repository/empty-added.txt"
   printf 'scoped new\n' >"$work_repository/dir/sub/modified.txt"
   rm "$work_repository/dir/sub/deleted.txt"
   printf 'scoped add\n' >"$work_repository/dir/sub/added.txt"
+  printf 'unscoped tree new\n' >"$work_repository/outside/deep/modified.txt"
   commit_all_at "$work_repository" '2001-07-01T00:01:00+0000' \
     'Structured diff head'
   head_normal="$(git -C "$work_repository" rev-parse HEAD)"
@@ -665,7 +683,18 @@ make_diff() {
   git -C "$bare_repository" fsck --full --strict --no-dangling >/dev/null
   test "$(git -C "$bare_repository" rev-parse fixture/diff-base)" = "$base_commit"
   test "$(git -C "$bare_repository" rev-parse fixture/diff-head)" = "$head_commit"
-  test "$(git -C "$bare_repository" diff-tree -r --no-commit-id --name-only "$base_commit" "$head_commit" -- dir/sub | wc -l | awk '{ print $1 }')" = 3
+  test "$(git -C "$bare_repository" diff-tree -r --no-commit-id --name-only "$base_commit" "$head_commit" -- dir/sub | wc -l | awk '{ print $1 }')" = 4
+  borderline_score="$(
+    git -C "$bare_repository" diff-tree -r --no-commit-id --name-status -M \
+      "$base_commit" "$head_commit" |
+      awk '$2 == "rename-borderline-old.txt" && $3 == "rename-borderline-new.txt" { print substr($1, 2) + 0 }'
+  )"
+  test "$borderline_score" = 50
+  test "$(
+    git -C "$bare_repository" diff-tree -r --no-commit-id --name-status \
+      "$base_commit" "$head_commit" -- symlink-stable |
+      awk 'NR == 1 { print $1 }'
+  )" = M
 }
 
 sha1_work="$scratch_dir/sha1-basic-work"

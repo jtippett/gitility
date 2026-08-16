@@ -488,8 +488,16 @@ defmodule Gitility.Differential.Oracle do
   defp parse_patch_line(<<"@@ ", _rest::binary>> = line, {hunks, current}) do
     hunks = maybe_finish_hunk(hunks, current)
 
+    # Regex.run omits unmatched TRAILING groups, so git's short-form
+    # headers ("@@ -1 +1 @@", count omitted when 1) return fewer captures;
+    # pad before destructuring.
     case Regex.run(~r/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/, line) do
-      [_, old_start, old_lines, new_start, new_lines] ->
+      [_ | captures] when length(captures) in 3..4 ->
+        [old_start, old_lines, new_start, new_lines] =
+          case captures ++ ["", "", "", ""] do
+            [a, b, c, d | _] -> [a, b, c, d]
+          end
+
         old_lines = if old_lines == "", do: "1", else: old_lines
         new_lines = if new_lines == "", do: "1", else: new_lines
         {hunks, new_patch_hunk(old_start, old_lines, new_start, new_lines)}
@@ -497,6 +505,13 @@ defmodule Gitility.Differential.Oracle do
       _ ->
         raise "malformed git patch hunk header: #{inspect(line)}"
     end
+  end
+
+  defp parse_patch_line(
+         <<"\\ No newline at end of file">>,
+         {hunks, %{lines: [line | rest]} = current}
+       ) do
+    {hunks, %{current | lines: [%{line | no_newline: true} | rest]}}
   end
 
   defp parse_patch_line(<<"\\ No newline at end of file">>, state), do: state
@@ -510,7 +525,13 @@ defmodule Gitility.Differential.Oracle do
         ?- -> {:deletion, current.old_line, nil, 1, 0}
       end
 
-    line = %{origin: line_origin, content: content, old_line: old_line, new_line: new_line}
+    line = %{
+      origin: line_origin,
+      content: content,
+      old_line: old_line,
+      new_line: new_line,
+      no_newline: false
+    }
 
     current = %{
       current

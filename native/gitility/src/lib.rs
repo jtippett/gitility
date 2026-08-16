@@ -784,6 +784,7 @@ struct DiffLineMap<'a> {
     content: Binary<'a>,
     old_line: Option<u32>,
     new_line: Option<u32>,
+    no_newline: bool,
 }
 
 #[derive(NifMap)]
@@ -2682,6 +2683,7 @@ fn encode_job_output<'a>(
                                     content: binary(env, &line.content),
                                     old_line: line.old_line,
                                     new_line: line.new_line,
+                                    no_newline: line.no_newline,
                                 })
                                 .collect(),
                         })

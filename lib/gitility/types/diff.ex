@@ -27,7 +27,9 @@ defmodule Gitility.Diff do
     `status` follows Git's classification. For renames and copies,
     `old_path`/`new_path` differ and `similarity` is the match score in
     basis points of 100 (`90` = 90% similar). Binary files carry
-    `binary: true` and no hunks.
+    `binary: true` and no hunks. At patch detail, a `:type_changed` record
+    has exactly two hunks: a pure deletion of the old content followed by a
+    pure insertion of the new content.
     """
 
     @enforce_keys [:status]
@@ -65,17 +67,23 @@ defmodule Gitility.Diff do
   end
 
   defmodule Hunk do
-    @moduledoc "One hunk of a patch-format diff."
+    @moduledoc """
+    One hunk of a patch-format diff.
+
+    `header` is reserved for future function/context-heading support and is
+    always `nil` in 0.x.
+    """
 
     @enforce_keys [:old_start, :old_lines, :new_start, :new_lines]
     defstruct [:old_start, :old_lines, :new_start, :new_lines, :header, lines: []]
 
+    @typedoc "A patch hunk; `header` is reserved and always `nil` in 0.x."
     @type t :: %__MODULE__{
             old_start: non_neg_integer(),
             old_lines: non_neg_integer(),
             new_start: non_neg_integer(),
             new_lines: non_neg_integer(),
-            header: binary() | nil,
+            header: nil,
             lines: [Gitility.Diff.Line.t()]
           }
   end
@@ -84,19 +92,23 @@ defmodule Gitility.Diff do
     @moduledoc """
     One line of a hunk. `content` is raw bytes without the leading
     origin marker; `old_line`/`new_line` are 1-based, `nil` on the side
-    where the line does not exist.
+    where the line does not exist. `no_newline` is true when this is the
+    final line on its side and that side has no trailing newline, equivalent
+    to Git's `\\ No newline at end of file` marker.
     """
 
     @enforce_keys [:origin, :content]
-    defstruct [:origin, :content, :old_line, :new_line]
+    defstruct [:origin, :content, :old_line, :new_line, no_newline: false]
 
     @type origin :: :context | :addition | :deletion
 
+    @typedoc "A raw patch line with explicit line numbers and trailing-newline state."
     @type t :: %__MODULE__{
             origin: origin(),
             content: binary(),
             old_line: pos_integer() | nil,
-            new_line: pos_integer() | nil
+            new_line: pos_integer() | nil,
+            no_newline: boolean()
           }
   end
 end

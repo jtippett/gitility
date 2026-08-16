@@ -4,14 +4,21 @@ version = "0.66.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-# Verbatim copy of upstream gix-diff 0.66.0 (licenses alongside). Two
-# divergences from crates.io: (1) tree/function.rs's #[cfg(test)] module
-# is removed (it needs the gix-testtools dev-dependency; we never build
-# vendor tests); (2) this manifest: the
-# blob feature's gix-tempfile edge sets default-features = false, because
-# tempfile's defaults pull DashMap (hp-hashmap) and signal handlers —
-# both forbidden inside a NIF by the thread policy. Upgrade procedure:
-# re-copy src/ from the new upstream tag and re-apply that one edge.
+# Vendored from upstream gix-diff 0.66.0 (licenses alongside). Every local
+# divergence is listed here. Manifest divergences: dependency versions are
+# exact `=` pins; crates.io's normalized removal of path dependencies is kept;
+# the gix-tempfile edge sets default-features = false so DashMap (hp-hashmap)
+# and signal-handler threads cannot enter the NIF; `[lints.clippy]` allows the
+# upstream lint surface; and `[lib] test = false` avoids compiling vendor tests.
+# Source divergence: tree/function.rs's `#[cfg(test)]` module is removed because
+# it requires the omitted gix-testtools dev-dependency. Upgrade by preserving
+# the OLD vendor manifest, re-copying `src/` from the new upstream tag, then
+# re-applying manifest policy by diffing that old manifest against upstream's
+# new manifest and accounting for every delta here. Re-run the complete Rust,
+# loom, lint, formatting, spawn-guard, fixture, and differential gate.
+#
+# Post-1.0 only: the unreachable blob-pipeline surface may be trimmed then;
+# keeping it verbatim today minimizes re-vendor drift.
 description = "Vendored gitoxide diff (upstream source, thread-free gix-tempfile edge)"
 
 [lib]

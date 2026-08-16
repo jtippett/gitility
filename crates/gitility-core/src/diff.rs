@@ -7,20 +7,22 @@
 //! borrows the two snapshot stores instead of constructing a persistent layer.
 
 use crate::budget::Budget;
+use crate::decode::decode_tree;
 use crate::error::{Error, ErrorCode};
 use crate::object::{HashKind, ObjectHeader, ObjectKind, Oid};
 use crate::odb::{CacheStats, HeaderProvenance, HeaderRead, ObjectDb};
 use crate::pathspec::PathspecMatcher;
 use crate::search::{is_binary_payload, MAX_CONTEXT_LINES};
 use crate::snapshot::Snapshot;
-use crate::tree::{ensure_query_compatible, QueryStats};
+use crate::tree::{ensure_query_compatible, join_path, QueryStats};
+use crate::verify::object_id;
 use gix_diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
 use gix_diff::blob::{Algorithm, InternedInput, UnifiedDiff};
-use gix_diff::rewrites::{Copies, CopySource};
 use gix_diff::tree::recorder::Location;
 use gix_diff::tree_with_rewrites::{Action, ChangeRef};
 use gix_object::TreeRefIter;
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
@@ -130,6 +132,7 @@ pub struct DiffLine {
     pub content: Vec<u8>,
     pub old_line: Option<u32>,
     pub new_line: Option<u32>,
+    pub no_newline: bool,
 }
 
 /// A successful-result warning.
@@ -217,20 +220,24 @@ pub fn diff(
         ));
     }
 
-    let adapter = GixObjectStore::new(&union, budget, opts.max_object_bytes);
-    let base_tree = read_required_tree(&union, base.tree_oid, budget)?;
-    let head_tree = read_required_tree(&union, head.tree_oid, budget)?;
     let matcher = PathspecMatcher::new(&opts.pathspecs);
+    let prepared = if opts.pathspecs.is_empty() {
+        PreparedTrees {
+            base: read_required_tree(&union, base.tree_oid, budget)?,
+            head: read_required_tree(&union, head.tree_oid, budget)?,
+            projected: HashMap::new(),
+        }
+    } else {
+        project_diff_trees(&union, base.tree_oid, head.tree_oid, &matcher, budget)?
+    };
+    let adapter = GixObjectStore::new(&union, budget, opts.max_object_bytes, prepared.projected);
     let mut changes = Vec::with_capacity(opts.max_diff_files.min(1_024));
-    let mut stopped_by = None;
+    let mut walk_stopped_by = None;
     let mut platform = rewrite_platform(opts.max_object_bytes);
     let rewrite_options = match opts.renames {
         RenameTracking::Disabled => None,
         RenameTracking::Similarity => Some(gix_diff::Rewrites {
-            copies: opts.copies.then_some(Copies {
-                source: CopySource::FromSetOfModifiedFiles,
-                percentage: Some(0.5),
-            }),
+            copies: None,
             percentage: Some(0.5),
             // Tracker compares `sources * destinations` with this field. The
             // square keeps all candidates admitted by max_diff_files while
@@ -241,8 +248,8 @@ pub fn diff(
     };
 
     let result = gix_diff::tree_with_rewrites(
-        TreeRefIter::from_bytes(&base_tree, gix_hash_kind(base.tree_oid.kind())),
-        TreeRefIter::from_bytes(&head_tree, gix_hash_kind(head.tree_oid.kind())),
+        TreeRefIter::from_bytes(&prepared.base, gix_hash_kind(base.tree_oid.kind())),
+        TreeRefIter::from_bytes(&prepared.head, gix_hash_kind(head.tree_oid.kind())),
         &mut platform,
         &mut Default::default(),
         &adapter,
@@ -251,11 +258,8 @@ pub fn diff(
             let Some(change) = normalize_change(change)? else {
                 return Ok(std::ops::ControlFlow::Continue(()));
             };
-            if !matcher.matches(change.sort_path()) {
-                return Ok(std::ops::ControlFlow::Continue(()));
-            }
             if changes.len() == opts.max_diff_files {
-                stopped_by = Some("max_diff_files");
+                walk_stopped_by = Some("max_diff_files");
                 return Ok(std::ops::ControlFlow::Break(()));
             }
             changes.push(change);
@@ -273,7 +277,7 @@ pub fn diff(
         // Breaking the callback is how the tree walker is stopped at the
         // file ceiling. gitoxide reports that control-flow break as
         // `Cancelled`; it is a successful, explicitly truncated diff here.
-        if stopped_by.is_none() {
+        if walk_stopped_by.is_none() {
             return Err(map_tree_diff_error(error));
         }
     }
@@ -286,11 +290,8 @@ pub fn diff(
             .then_with(|| left.old_path.cmp(&right.old_path))
     });
 
-    let rewrite_oversize = if opts.format == DiffFormat::Summary {
-        adapter.oversize_count() as u64
-    } else {
-        0
-    };
+    let rewrite_oversize_oids = adapter.oversize_oids();
+    let rewrite_oversize = rewrite_oversize_oids.len() as u64;
     let mut files = Vec::with_capacity(changes.len());
     let mut warnings = if rewrite_oversize == 0 {
         Vec::new()
@@ -303,6 +304,7 @@ pub fn diff(
     let mut hunks_used = 0usize;
     let mut lines_used = 0usize;
     let mut oversize_skipped = rewrite_oversize;
+    let mut populate_stopped_by = None;
 
     for change in changes {
         budget.check()?;
@@ -319,7 +321,9 @@ pub fn diff(
                 )? {
                     PopulateOutcome::Complete => {}
                     PopulateOutcome::Oversize => {
-                        oversize_skipped = oversize_skipped.saturating_add(1);
+                        if !file_oids_overlap(&file, &rewrite_oversize_oids) {
+                            oversize_skipped = oversize_skipped.saturating_add(1);
+                        }
                         if !warnings.iter().any(|warning: &DiffWarning| {
                             warning.code == DiffWarningCode::OversizeSkipped
                         }) {
@@ -330,7 +334,7 @@ pub fn diff(
                         }
                     }
                     PopulateOutcome::Stopped(limit) => {
-                        stopped_by = Some(limit);
+                        populate_stopped_by = Some(limit);
                     }
                 }
             } else {
@@ -338,11 +342,12 @@ pub fn diff(
             }
         }
         files.push(file);
-        if stopped_by.is_some() {
+        if populate_stopped_by.is_some() {
             break;
         }
     }
 
+    let stopped_by = populate_stopped_by.or(walk_stopped_by);
     let truncated = stopped_by.is_some();
     if let Some(limit) = stopped_by {
         warnings.insert(
@@ -391,11 +396,12 @@ fn validate(
             "diff context_lines must be between 0 and 32",
         ));
     }
-    if opts.copies && opts.renames == RenameTracking::Disabled {
+    if opts.copies {
         return Err(Error::new(
-            ErrorCode::InvalidArgument,
-            "copy detection requires rename detection",
-        ));
+            ErrorCode::UnsupportedOperation,
+            "copy detection is disabled in 0.x because upstream copy tracking can score the post-image blob and suppress the modified source record",
+        )
+        .with_reason("upstream_post_image_copy_tracking_source_suppression"));
     }
     if opts.max_diff_files == 0 || opts.max_diff_hunks == 0 || opts.max_diff_lines == 0 {
         return Err(Error::new(
@@ -491,7 +497,7 @@ fn normalize_change(change: ChangeRef<'_>) -> Result<Option<RawChange>, Error> {
                 return Ok(None);
             }
             let similarity = diff
-                .map(|stats| (stats.similarity * 100.0).round().clamp(0.0, 100.0) as u8)
+                .map(|stats| (stats.similarity * 100.0).floor().clamp(0.0, 100.0) as u8)
                 .unwrap_or(100);
             RawChange {
                 status: if copy {
@@ -556,7 +562,15 @@ fn populate_content(
     }
 
     check_comparison_cadence(&old, &new, budget)?;
-    let input = InternedInput::new(LinesWithoutLf::new(&old), LinesWithoutLf::new(&new));
+    let old_line_count = line_count(&old);
+    let new_line_count = line_count(&new);
+    if file.status == DiffStatus::TypeChanged && opts.format == DiffFormat::Patch {
+        file.additions = Some(new_line_count);
+        file.deletions = Some(old_line_count);
+        return populate_type_change_hunks(file, &old, &new, opts, budget, hunks_used, lines_used);
+    }
+
+    let input = InternedInput::new(LinesWithLf::new(&old), LinesWithLf::new(&new));
     let computed = gix_diff::blob::diff_with_slider_heuristics(Algorithm::Histogram, &input);
     file.additions = Some(computed.count_additions());
     file.deletions = Some(computed.count_removals());
@@ -572,6 +586,10 @@ fn populate_content(
         lines_used,
         max_hunks: opts.max_diff_hunks,
         max_lines: opts.max_diff_lines,
+        old_final_line: old_line_count,
+        new_final_line: new_line_count,
+        old_lacks_newline: lacks_trailing_newline(&old),
+        new_lacks_newline: lacks_trailing_newline(&new),
     };
     let consumed = UnifiedDiff::new(
         &computed,
@@ -597,6 +615,86 @@ fn populate_content(
     Ok(PopulateOutcome::Complete)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn populate_type_change_hunks(
+    file: &mut DiffFile,
+    old: &[u8],
+    new: &[u8],
+    opts: &DiffOptions,
+    budget: &Budget,
+    hunks_used: &mut usize,
+    lines_used: &mut usize,
+) -> Result<PopulateOutcome, Error> {
+    for (origin, data) in [
+        (DiffLineOrigin::Deletion, old),
+        (DiffLineOrigin::Addition, new),
+    ] {
+        budget.check()?;
+        let count = line_count(data);
+        let count_usize = usize::try_from(count).unwrap_or(usize::MAX);
+        if *hunks_used == opts.max_diff_hunks {
+            return Ok(PopulateOutcome::Stopped("max_diff_hunks"));
+        }
+        if lines_used.saturating_add(count_usize) > opts.max_diff_lines {
+            return Ok(PopulateOutcome::Stopped("max_diff_lines"));
+        }
+
+        let lacks_newline = lacks_trailing_newline(data);
+        let lines = LinesWithLf::new(data)
+            .enumerate()
+            .map(|(index, content)| {
+                budget.check()?;
+                let number = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
+                Ok(DiffLine {
+                    origin,
+                    content: content.strip_suffix(b"\n").unwrap_or(content).to_vec(),
+                    old_line: (origin == DiffLineOrigin::Deletion).then_some(number),
+                    new_line: (origin == DiffLineOrigin::Addition).then_some(number),
+                    no_newline: lacks_newline && number == count,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        file.hunks.push(match origin {
+            DiffLineOrigin::Deletion => DiffHunk {
+                old_start: zero_side_start(1, count),
+                old_lines: count,
+                new_start: 0,
+                new_lines: 0,
+                header: None,
+                lines,
+            },
+            DiffLineOrigin::Addition => DiffHunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: zero_side_start(1, count),
+                new_lines: count,
+                header: None,
+                lines,
+            },
+            DiffLineOrigin::Context => unreachable!("type changes use pure-side hunks"),
+        });
+        *hunks_used = hunks_used.saturating_add(1);
+        *lines_used = lines_used.saturating_add(count_usize);
+    }
+    Ok(PopulateOutcome::Complete)
+}
+
+fn line_count(data: &[u8]) -> u32 {
+    u32::try_from(LinesWithLf::new(data).count()).unwrap_or(u32::MAX)
+}
+
+fn lacks_trailing_newline(data: &[u8]) -> bool {
+    !data.is_empty() && !data.ends_with(b"\n")
+}
+
+fn zero_side_start(start: u32, lines: u32) -> u32 {
+    if lines == 0 {
+        start.saturating_sub(1)
+    } else {
+        start
+    }
+}
+
 #[derive(Default)]
 struct HunkCollectorState {
     hunks: Vec<DiffHunk>,
@@ -611,6 +709,10 @@ struct HunkCollector<'a> {
     lines_used: &'a mut usize,
     max_hunks: usize,
     max_lines: usize,
+    old_final_line: u32,
+    new_final_line: u32,
+    old_lacks_newline: bool,
+    new_lacks_newline: bool,
 }
 
 impl ConsumeHunk for HunkCollector<'_> {
@@ -650,6 +752,8 @@ impl ConsumeHunk for HunkCollector<'_> {
                         content,
                         old_line: Some(old_line),
                         new_line: Some(new_line),
+                        no_newline: (self.old_lacks_newline && old_line == self.old_final_line)
+                            || (self.new_lacks_newline && new_line == self.new_final_line),
                     };
                     old_line = old_line.saturating_add(1);
                     new_line = new_line.saturating_add(1);
@@ -661,6 +765,7 @@ impl ConsumeHunk for HunkCollector<'_> {
                         content,
                         old_line: None,
                         new_line: Some(new_line),
+                        no_newline: self.new_lacks_newline && new_line == self.new_final_line,
                     };
                     new_line = new_line.saturating_add(1);
                     line
@@ -671,6 +776,7 @@ impl ConsumeHunk for HunkCollector<'_> {
                         content,
                         old_line: Some(old_line),
                         new_line: None,
+                        no_newline: self.old_lacks_newline && old_line == self.old_final_line,
                     };
                     old_line = old_line.saturating_add(1);
                     line
@@ -679,9 +785,9 @@ impl ConsumeHunk for HunkCollector<'_> {
             output.push(line);
         }
         self.state.borrow_mut().hunks.push(DiffHunk {
-            old_start: header.before_hunk_start,
+            old_start: zero_side_start(header.before_hunk_start, header.before_hunk_len),
             old_lines: header.before_hunk_len,
-            new_start: header.after_hunk_start,
+            new_start: zero_side_start(header.after_hunk_start, header.after_hunk_len),
             new_lines: header.after_hunk_len,
             header: None,
             lines: output,
@@ -695,15 +801,15 @@ impl ConsumeHunk for HunkCollector<'_> {
 }
 
 #[derive(Clone, Copy)]
-struct LinesWithoutLf<'a>(&'a [u8]);
+struct LinesWithLf<'a>(&'a [u8]);
 
-impl<'a> LinesWithoutLf<'a> {
+impl<'a> LinesWithLf<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self(data)
     }
 }
 
-impl<'a> Iterator for LinesWithoutLf<'a> {
+impl<'a> Iterator for LinesWithLf<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -717,11 +823,11 @@ impl<'a> Iterator for LinesWithoutLf<'a> {
             .map_or(self.0.len(), |position| position.saturating_add(1));
         let (line, rest) = self.0.split_at(split);
         self.0 = rest;
-        Some(line.strip_suffix(b"\n").unwrap_or(line))
+        Some(line)
     }
 }
 
-impl<'a> gix_diff::blob::TokenSource for LinesWithoutLf<'a> {
+impl<'a> gix_diff::blob::TokenSource for LinesWithLf<'a> {
     type Token = &'a [u8];
     type Tokenizer = Self;
 
@@ -823,6 +929,101 @@ fn read_required_tree(
         ));
     }
     Ok(payload)
+}
+
+struct PreparedTrees {
+    // Root bytes are handed directly to gitoxide and projected children are
+    // served from memory, so no tree payload is physically read a second time.
+    base: Vec<u8>,
+    head: Vec<u8>,
+    projected: HashMap<Oid, Vec<u8>>,
+}
+
+fn project_diff_trees(
+    store: &UnionObjectDb<'_>,
+    base_oid: Oid,
+    head_oid: Oid,
+    matcher: &PathspecMatcher,
+    budget: &Budget,
+) -> Result<PreparedTrees, Error> {
+    let mut cache = HashMap::new();
+    let mut projected = HashMap::new();
+    let base = project_tree(
+        store,
+        base_oid,
+        b"",
+        matcher,
+        budget,
+        &mut cache,
+        &mut projected,
+    )?;
+    let head = project_tree(
+        store,
+        head_oid,
+        b"",
+        matcher,
+        budget,
+        &mut cache,
+        &mut projected,
+    )?;
+    Ok(PreparedTrees {
+        base,
+        head,
+        projected,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_tree(
+    store: &UnionObjectDb<'_>,
+    oid: Oid,
+    prefix: &[u8],
+    matcher: &PathspecMatcher,
+    budget: &Budget,
+    cache: &mut HashMap<(Oid, Vec<u8>), Vec<u8>>,
+    projected: &mut HashMap<Oid, Vec<u8>>,
+) -> Result<Vec<u8>, Error> {
+    let cache_key = (oid, prefix.to_vec());
+    if let Some(payload) = cache.get(&cache_key) {
+        return Ok(payload.clone());
+    }
+
+    let payload = read_required_tree(store, oid, budget)?;
+    let mut output = Vec::new();
+    for entry in decode_tree(&payload, oid.kind()) {
+        budget.check()?;
+        let entry = entry?;
+        let path = join_path(prefix, entry.name);
+        let mode = entry.mode;
+        let entry_oid = if mode_type(mode) == 0o040000 {
+            if !matcher.may_match_descendant(&path) {
+                continue;
+            }
+            let child = project_tree(store, entry.oid, &path, matcher, budget, cache, projected)?;
+            if child.is_empty() {
+                continue;
+            }
+            let child_oid = object_id(oid.kind(), ObjectKind::Tree, &child)?;
+            projected.entry(child_oid).or_insert(child);
+            child_oid
+        } else {
+            if !matcher.matches(&path) {
+                continue;
+            }
+            entry.oid
+        };
+        output.extend_from_slice(format!("{mode:o} ").as_bytes());
+        output.extend_from_slice(entry.name);
+        output.push(0);
+        output.extend_from_slice(entry_oid.as_bytes());
+    }
+    cache.insert(cache_key, output.clone());
+    Ok(output)
+}
+
+fn file_oids_overlap(file: &DiffFile, oids: &HashSet<Oid>) -> bool {
+    file.old_oid.is_some_and(|oid| oids.contains(&oid))
+        || file.new_oid.is_some_and(|oid| oids.contains(&oid))
 }
 
 fn finish(
@@ -1013,16 +1214,23 @@ struct GixObjectStore<'a> {
     max_object_bytes: u64,
     last_error: RefCell<Option<Error>>,
     oversize: RefCell<Vec<Oid>>,
+    projected_trees: HashMap<Oid, Vec<u8>>,
 }
 
 impl<'a> GixObjectStore<'a> {
-    fn new(store: &'a UnionObjectDb<'a>, budget: &'a Budget, max_object_bytes: u64) -> Self {
+    fn new(
+        store: &'a UnionObjectDb<'a>,
+        budget: &'a Budget,
+        max_object_bytes: u64,
+        projected_trees: HashMap<Oid, Vec<u8>>,
+    ) -> Self {
         Self {
             store,
             budget,
             max_object_bytes,
             last_error: RefCell::new(None),
             oversize: RefCell::new(Vec::new()),
+            projected_trees,
         }
     }
 
@@ -1042,8 +1250,8 @@ impl<'a> GixObjectStore<'a> {
         }
     }
 
-    fn oversize_count(&self) -> usize {
-        self.oversize.borrow().len()
+    fn oversize_oids(&self) -> HashSet<Oid> {
+        self.oversize.borrow().iter().copied().collect()
     }
 }
 
@@ -1055,6 +1263,15 @@ impl gix_object::Find for GixObjectStore<'_> {
     ) -> Result<Option<gix_object::Data<'a>>, gix_object::find::Error> {
         let hash = core_hash_kind(id.kind()).map_err(|error| self.record(error))?;
         let oid = Oid::new(hash, id.as_bytes()).map_err(|error| self.record(error))?;
+        if let Some(tree) = self.projected_trees.get(&oid) {
+            buffer.clear();
+            buffer.extend_from_slice(tree);
+            return Ok(Some(gix_object::Data::new(
+                buffer,
+                gix_object::Kind::Tree,
+                gix_hash_kind(oid.kind()),
+            )));
+        }
         let kind = self
             .store
             .try_find(&oid, buffer, self.budget)
@@ -1075,6 +1292,12 @@ impl gix_object::FindHeader for GixObjectStore<'_> {
     ) -> Result<Option<gix_object::Header>, gix_object::find::Error> {
         let hash = core_hash_kind(id.kind()).map_err(|error| self.record(error))?;
         let oid = Oid::new(hash, id.as_bytes()).map_err(|error| self.record(error))?;
+        if let Some(tree) = self.projected_trees.get(&oid) {
+            return Ok(Some(gix_object::Header {
+                kind: gix_object::Kind::Tree,
+                size: tree.len() as u64,
+            }));
+        }
         self.store
             .try_header(&oid, self.budget)
             .map(|header| {
@@ -1230,6 +1453,183 @@ mod tests {
     }
 
     #[test]
+    fn file_ceiling_emits_exactly_three_records_before_walk_truncation() {
+        let mut objects = Vec::new();
+        let mut base_entries = Vec::new();
+        let mut head_entries = Vec::new();
+        for name in [b"a", b"b", b"c", b"d"] {
+            let old = [b"old ".as_slice(), name, b"\n"].concat();
+            let new = [b"new ".as_slice(), name, b"\n"].concat();
+            let old_oid = object_id(HashKind::Sha1, ObjectKind::Blob, &old).unwrap();
+            let new_oid = object_id(HashKind::Sha1, ObjectKind::Blob, &new).unwrap();
+            objects.push((ObjectKind::Blob, old));
+            objects.push((ObjectKind::Blob, new));
+            base_entries.push((0o100644, name.as_slice(), old_oid));
+            head_entries.push((0o100644, name.as_slice(), new_oid));
+        }
+        let base_tree = tree(&base_entries);
+        let head_tree = tree(&head_entries);
+        let base_tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, &base_tree).unwrap();
+        let head_tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, &head_tree).unwrap();
+        objects.push((ObjectKind::Tree, base_tree));
+        objects.push((ObjectKind::Tree, head_tree));
+        let all = store(objects);
+        let base = Snapshot {
+            commit_oid: Oid::new(HashKind::Sha1, &[1; 20]).unwrap(),
+            tree_oid: base_tree_oid,
+        };
+        let head = Snapshot {
+            commit_oid: Oid::new(HashKind::Sha1, &[2; 20]).unwrap(),
+            tree_oid: head_tree_oid,
+        };
+
+        let result = diff(
+            &all,
+            &base,
+            &all,
+            &head,
+            &DiffOptions {
+                format: DiffFormat::Summary,
+                max_diff_files: 3,
+                ..Default::default()
+            },
+            &Budget::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(result.files.len(), 3);
+        assert!(result.truncated);
+        assert_eq!(result.stats.stopped_by, Some("max_diff_files"));
+    }
+
+    #[test]
+    fn trailing_newline_only_changes_are_lossless() {
+        for (old, new, deletion_no_newline, addition_no_newline) in [
+            (b"same".as_slice(), b"same\n".as_slice(), true, false),
+            (b"same\n".as_slice(), b"same".as_slice(), false, true),
+        ] {
+            let old_oid = object_id(HashKind::Sha1, ObjectKind::Blob, old).unwrap();
+            let new_oid = object_id(HashKind::Sha1, ObjectKind::Blob, new).unwrap();
+            let base_tree = tree(&[(0o100644, b"toggle", old_oid)]);
+            let head_tree = tree(&[(0o100644, b"toggle", new_oid)]);
+            let base_tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, &base_tree).unwrap();
+            let head_tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, &head_tree).unwrap();
+            let all = store(vec![
+                (ObjectKind::Tree, base_tree),
+                (ObjectKind::Tree, head_tree),
+                (ObjectKind::Blob, old.to_vec()),
+                (ObjectKind::Blob, new.to_vec()),
+            ]);
+            let base = Snapshot {
+                commit_oid: Oid::new(HashKind::Sha1, &[1; 20]).unwrap(),
+                tree_oid: base_tree_oid,
+            };
+            let head = Snapshot {
+                commit_oid: Oid::new(HashKind::Sha1, &[2; 20]).unwrap(),
+                tree_oid: head_tree_oid,
+            };
+
+            let result = diff(
+                &all,
+                &base,
+                &all,
+                &head,
+                &DiffOptions {
+                    context_lines: 0,
+                    ..Default::default()
+                },
+                &Budget::unlimited(),
+            )
+            .unwrap();
+            let file = &result.files[0];
+            assert_eq!((file.additions, file.deletions), (Some(1), Some(1)));
+            assert_eq!(file.hunks.len(), 1);
+            assert_eq!(file.hunks[0].lines.len(), 2);
+            assert_eq!(file.hunks[0].lines[0].content, b"same");
+            assert_eq!(file.hunks[0].lines[0].no_newline, deletion_no_newline);
+            assert_eq!(file.hunks[0].lines[1].content, b"same");
+            assert_eq!(file.hunks[0].lines[1].no_newline, addition_no_newline);
+        }
+    }
+
+    #[test]
+    fn zero_sided_hunks_use_the_line_before_the_gap() {
+        let deleted = b"deleted\n".to_vec();
+        let added = b"added\n".to_vec();
+        let old_mid = b"one\ntwo\nthree\n".to_vec();
+        let new_mid = b"one\ntwo\ninserted\nthree\n".to_vec();
+        let deleted_oid = object_id(HashKind::Sha1, ObjectKind::Blob, &deleted).unwrap();
+        let added_oid = object_id(HashKind::Sha1, ObjectKind::Blob, &added).unwrap();
+        let old_mid_oid = object_id(HashKind::Sha1, ObjectKind::Blob, &old_mid).unwrap();
+        let new_mid_oid = object_id(HashKind::Sha1, ObjectKind::Blob, &new_mid).unwrap();
+        let base_tree = tree(&[
+            (0o100644, b"delete", deleted_oid),
+            (0o100644, b"mid", old_mid_oid),
+        ]);
+        let head_tree = tree(&[
+            (0o100644, b"add", added_oid),
+            (0o100644, b"mid", new_mid_oid),
+        ]);
+        let base_tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, &base_tree).unwrap();
+        let head_tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, &head_tree).unwrap();
+        let all = store(vec![
+            (ObjectKind::Tree, base_tree),
+            (ObjectKind::Tree, head_tree),
+            (ObjectKind::Blob, deleted),
+            (ObjectKind::Blob, added),
+            (ObjectKind::Blob, old_mid),
+            (ObjectKind::Blob, new_mid),
+        ]);
+        let base = Snapshot {
+            commit_oid: Oid::new(HashKind::Sha1, &[1; 20]).unwrap(),
+            tree_oid: base_tree_oid,
+        };
+        let head = Snapshot {
+            commit_oid: Oid::new(HashKind::Sha1, &[2; 20]).unwrap(),
+            tree_oid: head_tree_oid,
+        };
+        let result = diff(
+            &all,
+            &base,
+            &all,
+            &head,
+            &DiffOptions {
+                context_lines: 0,
+                ..Default::default()
+            },
+            &Budget::unlimited(),
+        )
+        .unwrap();
+        let hunk = |path: &[u8]| {
+            &result
+                .files
+                .iter()
+                .find(|file| file.new_path.as_deref().or(file.old_path.as_deref()) == Some(path))
+                .unwrap()
+                .hunks[0]
+        };
+        let add = hunk(b"add");
+        assert_eq!(
+            (add.old_start, add.old_lines, add.new_start, add.new_lines),
+            (0, 0, 1, 1)
+        );
+        let delete = hunk(b"delete");
+        assert_eq!(
+            (
+                delete.old_start,
+                delete.old_lines,
+                delete.new_start,
+                delete.new_lines
+            ),
+            (1, 1, 0, 0)
+        );
+        let mid = hunk(b"mid");
+        assert_eq!(
+            (mid.old_start, mid.old_lines, mid.new_start, mid.new_lines),
+            (2, 0, 3, 1)
+        );
+    }
+
+    #[test]
     fn clean_renames_and_gitlink_stats_have_public_shapes() {
         let payload = b"same\n".to_vec();
         let blob_oid = object_id(HashKind::Sha1, ObjectKind::Blob, &payload).unwrap();
@@ -1360,6 +1760,54 @@ mod tests {
     }
 
     #[test]
+    fn oversize_rename_candidates_are_counted_at_every_tier() {
+        let old = b"old candidate\n".to_vec();
+        let new = b"new candidate\n".to_vec();
+        let old_oid = object_id(HashKind::Sha1, ObjectKind::Blob, &old).unwrap();
+        let new_oid = object_id(HashKind::Sha1, ObjectKind::Blob, &new).unwrap();
+        let base_tree = tree(&[(0o100644, b"old", old_oid)]);
+        let head_tree = tree(&[(0o100644, b"new", new_oid)]);
+        let base_tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, &base_tree).unwrap();
+        let head_tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, &head_tree).unwrap();
+        let all = store(vec![
+            (ObjectKind::Tree, base_tree),
+            (ObjectKind::Tree, head_tree),
+            (ObjectKind::Blob, old),
+            (ObjectKind::Blob, new),
+        ]);
+        let base = Snapshot {
+            commit_oid: Oid::new(HashKind::Sha1, &[1; 20]).unwrap(),
+            tree_oid: base_tree_oid,
+        };
+        let head = Snapshot {
+            commit_oid: Oid::new(HashKind::Sha1, &[2; 20]).unwrap(),
+            tree_oid: head_tree_oid,
+        };
+
+        for format in [DiffFormat::Summary, DiffFormat::Stats, DiffFormat::Patch] {
+            let result = diff(
+                &all,
+                &base,
+                &all,
+                &head,
+                &DiffOptions {
+                    format,
+                    renames: RenameTracking::Similarity,
+                    max_object_bytes: 1,
+                    ..Default::default()
+                },
+                &Budget::unlimited(),
+            )
+            .unwrap();
+            assert_eq!(result.stats.oversize_skipped, 2, "{format:?}");
+            assert!(result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == DiffWarningCode::OversizeSkipped));
+        }
+    }
+
+    #[test]
     fn generated_diff_fixture_exercises_rewrite_candidates() {
         use crate::local_odb::LocalOdb;
         use crate::test_support::{fixture_oid, fixture_repo};
@@ -1378,7 +1826,6 @@ mod tests {
             &DiffOptions {
                 format: DiffFormat::Summary,
                 renames: RenameTracking::Similarity,
-                copies: true,
                 ..Default::default()
             },
             &Budget::unlimited(),
@@ -1387,7 +1834,7 @@ mod tests {
         let rewrites = result
             .files
             .iter()
-            .filter(|file| matches!(file.status, DiffStatus::Renamed | DiffStatus::Copied))
+            .filter(|file| file.status == DiffStatus::Renamed)
             .map(|file| {
                 (
                     file.status,
@@ -1404,16 +1851,162 @@ mod tests {
                 && record.3 == Some(100)
         }));
         assert!(rewrites.iter().any(|record| {
-            record.0 == DiffStatus::Copied
-                && record.1 == b"copy-source.txt"
-                && record.2 == b"copy-near.txt"
-                && record.3 == Some(93)
-        }));
-        assert!(rewrites.iter().any(|record| {
             record.0 == DiffStatus::Renamed
                 && record.1 == b"rename-edit-old.txt"
                 && record.2 == b"rename-edit-new.txt"
                 && record.3 == Some(86)
         }));
+        assert!(rewrites.iter().any(|record| {
+            record.0 == DiffStatus::Renamed
+                && record.1 == b"rename-borderline-old.txt"
+                && record.2 == b"rename-borderline-new.txt"
+                && record.3 == Some(50)
+        }));
+    }
+
+    #[test]
+    fn copies_are_rejected_with_the_upstream_defect_class() {
+        let empty_tree = Vec::new();
+        let tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, &empty_tree).unwrap();
+        let store = store(vec![(ObjectKind::Tree, empty_tree)]);
+        let snapshot = Snapshot {
+            commit_oid: Oid::new(HashKind::Sha1, &[1; 20]).unwrap(),
+            tree_oid,
+        };
+        let error = diff(
+            &store,
+            &snapshot,
+            &store,
+            &snapshot,
+            &DiffOptions {
+                renames: RenameTracking::Similarity,
+                copies: true,
+                ..Default::default()
+            },
+            &Budget::unlimited(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedOperation);
+        assert!(error.message.contains("post-image blob"));
+        assert!(error
+            .message
+            .contains("suppress the modified source record"));
+        assert_eq!(
+            error.reason.as_deref(),
+            Some("upstream_post_image_copy_tracking_source_suppression")
+        );
+    }
+
+    #[test]
+    fn type_change_patch_is_two_pure_hunks_and_symlink_change_stays_modified() {
+        use crate::local_odb::LocalOdb;
+        use crate::test_support::{fixture_oid, fixture_repo};
+
+        let (store, _) = LocalOdb::open(fixture_repo("sha1-diff.git"), Default::default())
+            .expect("diff fixture opens");
+        let base = Snapshot::open(&store, fixture_oid("sha1_diff_base"), &Budget::unlimited())
+            .expect("base snapshot opens");
+        let head = Snapshot::open(&store, fixture_oid("sha1_diff_head"), &Budget::unlimited())
+            .expect("head snapshot opens");
+        let result = diff(
+            &store,
+            &base,
+            &store,
+            &head,
+            &DiffOptions {
+                pathspecs: vec![b"type-change".to_vec(), b"symlink-stable".to_vec()],
+                context_lines: 0,
+                ..Default::default()
+            },
+            &Budget::unlimited(),
+        )
+        .unwrap();
+
+        let type_change = result
+            .files
+            .iter()
+            .find(|file| file.new_path.as_deref() == Some(b"type-change"))
+            .unwrap();
+        assert_eq!(type_change.status, DiffStatus::TypeChanged);
+        assert_eq!(type_change.hunks.len(), 2);
+        assert_eq!(
+            (
+                type_change.hunks[0].old_start,
+                type_change.hunks[0].old_lines,
+                type_change.hunks[0].new_start,
+                type_change.hunks[0].new_lines,
+            ),
+            (1, 1, 0, 0)
+        );
+        assert!(type_change.hunks[0]
+            .lines
+            .iter()
+            .all(|line| line.origin == DiffLineOrigin::Deletion));
+        assert_eq!(
+            (
+                type_change.hunks[1].old_start,
+                type_change.hunks[1].old_lines,
+                type_change.hunks[1].new_start,
+                type_change.hunks[1].new_lines,
+            ),
+            (0, 0, 1, 1)
+        );
+        assert!(type_change.hunks[1]
+            .lines
+            .iter()
+            .all(|line| line.origin == DiffLineOrigin::Addition));
+
+        let symlink = result
+            .files
+            .iter()
+            .find(|file| file.new_path.as_deref() == Some(b"symlink-stable"))
+            .unwrap();
+        assert_eq!(symlink.status, DiffStatus::Modified);
+        assert_eq!(symlink.old_mode, Some(0o120000));
+        assert_eq!(symlink.new_mode, Some(0o120000));
+    }
+
+    #[test]
+    fn pathspec_prunes_before_rename_tracking_and_reads_fewer_objects() {
+        use crate::local_odb::LocalOdb;
+        use crate::test_support::{fixture_oid, fixture_repo};
+
+        let run = |pathspecs: Vec<Vec<u8>>| {
+            let (store, _) = LocalOdb::open(fixture_repo("sha1-diff.git"), Default::default())
+                .expect("diff fixture opens");
+            let base = Snapshot::open(&store, fixture_oid("sha1_diff_base"), &Budget::unlimited())
+                .expect("base snapshot opens");
+            let head = Snapshot::open(&store, fixture_oid("sha1_diff_head"), &Budget::unlimited())
+                .expect("head snapshot opens");
+            diff(
+                &store,
+                &base,
+                &store,
+                &head,
+                &DiffOptions {
+                    format: DiffFormat::Summary,
+                    pathspecs,
+                    renames: RenameTracking::Similarity,
+                    ..Default::default()
+                },
+                &Budget::unlimited(),
+            )
+            .expect("fixture diff succeeds")
+        };
+
+        let unscoped = run(Vec::new());
+        let scoped = run(vec![b":(glob)dir/sub/**".to_vec()]);
+        let moved = scoped
+            .files
+            .iter()
+            .find(|file| file.new_path.as_deref() == Some(b"dir/sub/rename-inside-new.txt"))
+            .expect("scoped destination is present");
+        assert_eq!(moved.status, DiffStatus::Added);
+        assert!(
+            scoped.stats.objects_read < unscoped.stats.objects_read,
+            "scoped={} unscoped={}",
+            scoped.stats.objects_read,
+            unscoped.stats.objects_read
+        );
     }
 }

@@ -118,6 +118,7 @@ while IFS= read -r absolute_file; do
 done < <(
   find \
     "$workspace_root/crates/gitility-core/src" \
+    "$workspace_root/crates/gitility-core/vendor" \
     "$workspace_root/native/gitility/src" \
     -type f -name '*.rs' -print | sort
 )

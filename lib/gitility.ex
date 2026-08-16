@@ -276,7 +276,12 @@ defmodule Gitility do
   The snapshots may come from **different ODBs** — objects are
   content-addressed, so reads resolve through a union of the two stores
   (head's first). Both must share a hash algorithm (`:hash_mismatch`) and
-  a runtime (`:runtime_mismatch`).
+  a runtime (`:runtime_mismatch`). A miss in the head store falls through to
+  the base store; an object-read error in the head store is fail-fast and is
+  not retried against the base store.
+
+  At patch detail, a type change is represented by exactly two hunks: a pure
+  deletion of the old content followed by a pure insertion of the new content.
 
   ## Options
 
@@ -284,9 +289,14 @@ defmodule Gitility do
     * `:pathspecs` — glob patterns limiting the diff.
     * `:context_lines` — context per hunk (default `3`).
     * `:renames` — `false` (default) or `:similarity`. Rename detection is
-      opt-in because it reads candidate payloads.
-    * `:copies` — also detect copies from the changed-path candidate set
-      (default `false`); this does not perform `--find-copies-harder`.
+      opt-in because it reads candidate payloads. It buffers and scores
+      `O(changes)` candidates before the first record; diff ceilings bound
+      output, not this detection phase (timeouts and byte limits still apply).
+    * `:copies` — retained in the API surface, but only `false` is accepted in
+      0.x. `true` returns `:unsupported_operation` because the current upstream
+      tracker can score a post-image blob and suppress the modified source
+      record. It can return when upstream tracking is sound or the vendored
+      tracker is patched after 1.0.
     * `:limits` — a `Gitility.Limits` override.
   """
   @spec diff(Snapshot.t(), Snapshot.t(), keyword()) :: {:ok, Diff.t()} | {:error, Error.t()}
@@ -921,10 +931,14 @@ defmodule Gitility do
   end
 
   defp validate_diff_copies(false, _renames), do: :ok
-  defp validate_diff_copies(true, true), do: :ok
 
-  defp validate_diff_copies(true, false) do
-    NativeSupport.invalid_argument(":copies true requires :renames to be :similarity")
+  defp validate_diff_copies(true, _renames) do
+    {:error,
+     Error.new(
+       :unsupported_operation,
+       "copy detection is disabled in 0.x because upstream copy tracking can score the post-image blob and suppress the modified source record",
+       details: %{reason: "upstream_post_image_copy_tracking_source_suppression"}
+     )}
   end
 
   defp submit_read_file(

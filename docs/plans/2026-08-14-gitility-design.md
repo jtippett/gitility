@@ -602,6 +602,13 @@ content-addressed, so Gitility resolves reads through a union of the two stores
 (head's first, then base's). Both must share a hash algorithm
 (`:hash_mismatch` otherwise) and a runtime (`:runtime_mismatch`).
 
+Decision record (M3c review): copy detection remains in the option surface but
+`copies: true` returns `:unsupported_operation` throughout 0.x. The faithfully
+vendored gix-diff 0.66 tracker can score a copy against the post-image blob and
+suppress the modified source record, which is silent data loss. Copy detection
+returns only after upstream tracking is sound or a vendored fix is deliberately
+taken post-1.0. See `docs/plans/milestones/m3c-review-fixes.md` (M1).
+
 ### Blame
 
 ```elixir

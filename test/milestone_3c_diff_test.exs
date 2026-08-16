@@ -108,18 +108,31 @@ defmodule Gitility.Milestone3cDiffTest do
     assert {:error, %Error{code: :invalid_argument}} =
              Gitility.diff(context.base, context.head, context_lines: 33)
 
-    assert {:error, %Error{code: :invalid_argument}} =
+    assert {:error,
+            %Error{
+              code: :unsupported_operation,
+              message: message,
+              details: %{reason: "upstream_post_image_copy_tracking_source_suppression"}
+            }} =
              Gitility.diff(context.base, context.head, copies: true)
+
+    assert message =~ "post-image blob"
+    assert message =~ "suppress the modified source record"
+
+    assert {:error, %Error{code: :unsupported_operation}} =
+             Gitility.diff(context.base, context.head,
+               copies: true,
+               renames: :similarity
+             )
 
     assert {:error, %Error{code: :invalid_argument}} = Gitility.diff(%{}, context.head)
   end
 
-  test "rename, copy, type-change, mode-only, and gitlink records cross the API", context do
+  test "rename, type-change, mode-only, and gitlink records cross the API", context do
     assert {:ok, diff} =
              Gitility.diff(context.base, context.head,
                format: :summary,
-               renames: :similarity,
-               copies: true
+               renames: :similarity
              )
 
     assert %Diff.File{status: :renamed, similarity: 100} =
@@ -129,8 +142,6 @@ defmodule Gitility.Milestone3cDiffTest do
              find_new!(diff, "rename-edit-new.txt")
 
     assert similarity in 50..99
-
-    assert %Diff.File{status: :copied} = find_new!(diff, "copy-near.txt")
 
     assert %Diff.File{status: :type_changed, old_mode: 0o100644, new_mode: 0o120000} =
              find_new!(diff, "type-change")
@@ -199,8 +210,17 @@ defmodule Gitility.Milestone3cDiffTest do
   end
 
   test "each structured diff ceiling truncates work and names stopped_by", context do
+    assert {:ok, %Diff{truncated: true} = file_limited} =
+             Gitility.diff(context.base, context.head,
+               format: :summary,
+               limits: Limits.new(max_diff_files: 3)
+             )
+
+    assert length(file_limited.files) == 3
+    assert file_limited.stats.stopped_by == :max_diff_files
+    assert Enum.any?(file_limited.warnings, &(&1.code == :truncated))
+
     for {limit_name, limits} <- [
-          {:max_diff_files, Limits.new(max_diff_files: 1)},
           {:max_diff_hunks, Limits.new(max_diff_hunks: 1)},
           {:max_diff_lines, Limits.new(max_diff_lines: 1)}
         ] do
@@ -210,6 +230,36 @@ defmodule Gitility.Milestone3cDiffTest do
       assert diff.stats.stopped_by == limit_name
       assert Enum.any?(diff.warnings, &(&1.code == :truncated))
     end
+  end
+
+  test "newline-only and type-change patch records are lossless", context do
+    assert {:ok, newline} =
+             Gitility.diff(context.base, context.head,
+               pathspecs: ["trailing-newline.txt"],
+               context_lines: 0
+             )
+
+    assert [%Diff.File{additions: 1, deletions: 1, hunks: [hunk]}] = newline.files
+
+    assert [
+             %Diff.Line{origin: :deletion, no_newline: true},
+             %Diff.Line{origin: :addition, no_newline: false}
+           ] = hunk.lines
+
+    assert {:ok, type_change} =
+             Gitility.diff(context.base, context.head,
+               pathspecs: ["type-change"],
+               context_lines: 0
+             )
+
+    assert [%Diff.File{status: :type_changed, hunks: [deletion, insertion]}] =
+             type_change.files
+
+    assert {deletion.old_start, deletion.old_lines, deletion.new_start, deletion.new_lines} ==
+             {1, 1, 0, 0}
+
+    assert {insertion.old_start, insertion.old_lines, insertion.new_start, insertion.new_lines} ==
+             {0, 0, 1, 1}
   end
 
   test "different static ODBs form a head-first union and validate compatibility", context do

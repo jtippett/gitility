@@ -1616,6 +1616,32 @@ Either way the public API is unchanged — `PackRange` is one more ODB behind
 the same manifest and backend contracts. The checkpoint changes schedule
 risk, not architecture. Record the decision in this document.
 
+**C1 decision (2026-08-16): the lazy `PackRange` reader moves post-1.0.**
+Measured with `bench/c1_hydration.exs` on the Linux test box (8 vCPU),
+git/git as the workload (328.7 MB pack+idx — 3× the target unit), default
+`concurrency: 8` / 8 MiB chunks, `verify: :always`; target ≥ 33.3 MB/s
+(≤ 3 s per 100 MB):
+
+| case | time | rate |
+|---|---|---|
+| LocalDirectory → cold `{:dir, …}` | 3.6 s | 92 MB/s |
+| LocalDirectory → warm reused volume (same BEAM) | 1.8 s | 178 MB/s |
+| LocalDirectory → `into: :memory` (tmpfs) | 2.7 s | 120 MB/s |
+| Postgres → cold `{:dir, …}` | 4.2–9.6 s | 34–79 MB/s |
+
+Every case passed with `verify: :always` doing full pack+idx+pairing
+checksums in-line, and the hydrated store served a HEAD `Snapshot.open`.
+Postgres throughput varies with server cache state; its worst observed
+truly-cold run (34 MB/s) still met the target, and a `pool_size: 8` variant
+was *slower* (43 MB/s warm) than the single connection (79 MB/s warm), so
+the ceiling is chunk assembly, not connection serialization. Caveats, on
+the record: same-host backends (no real network hop — same-region S3 was
+not exercised, so its number is bandwidth-bound, typically ≥ 90 MB/s
+in-region), one repository shape, and no fleet-density economics. The
+decision reverses per the criterion above if Gentility's real corpus turns
+out multi-GB-sparse or per-node hydration proves wasteful at fleet density;
+until then 1.0's remote story is hydrate-then-query.
+
 ### Milestone 3 — semantic exploration
 
 1. Implement literal and safe-regex search.

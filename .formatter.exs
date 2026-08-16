@@ -3,6 +3,7 @@
   inputs: [
     "{mix,.formatter}.exs",
     "{config,lib,test}/**/*.{ex,exs}",
+    "bench/*.exs",
     "examples/*.exs",
     "scripts/*.exs"
   ]

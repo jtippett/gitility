@@ -763,6 +763,7 @@ struct SearchMatchMap<'a> {
     preview: Binary<'a>,
     preview_truncated: bool,
     submatches: Vec<SearchSubmatchMap>,
+    submatches_truncated: bool,
     context_before: Vec<Binary<'a>>,
     context_after: Vec<Binary<'a>>,
 }
@@ -785,6 +786,7 @@ struct StatsMap {
     blobs_deduped: u64,
     binary_skipped: u64,
     oversize_skipped: u64,
+    payload_rereads: u64,
     elapsed_ms: u64,
     stopped_by: Option<Atom>,
 }
@@ -2438,7 +2440,10 @@ fn job_take_result<'a>(env: Env<'a>, resource: ResourceArc<JobResource>) -> NifR
     };
     let provider_spend = resource.job.spent();
     match result {
-        Ok(output) if output_payload_bytes(&output) > resource.max_result_bytes => {
+        Ok(output)
+            if !allows_oversized_search_progress(&output)
+                && output_payload_bytes(&output) > resource.max_result_bytes =>
+        {
             let error = Error::new(
                 ErrorCode::ResultTooLarge,
                 "job result exceeds max_result_bytes and has been discarded",
@@ -2529,6 +2534,7 @@ fn encode_job_output<'a>(
                                 length: range.length,
                             })
                             .collect(),
+                        submatches_truncated: item.submatches_truncated,
                         context_before: item
                             .context_before
                             .iter()
@@ -2672,7 +2678,7 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
                     .saturating_add(length(&item.path))
                     .saturating_add(length(&item.preview))
                     .saturating_add(context)
-                    .saturating_add((item.submatches.len() as u64).saturating_mul(8))
+                    .saturating_add((item.submatches.len() as u64).saturating_mul(32))
                     .saturating_add(16)
             },
         ),
@@ -2727,6 +2733,16 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
             .saturating_add(length(snapshot.tree_oid.as_bytes())),
         JobOutput::Hydration(stats) => length(stats.generation.as_bytes()).saturating_add(96),
     }
+}
+
+fn allows_oversized_search_progress(output: &JobOutput) -> bool {
+    matches!(
+        output,
+        JobOutput::Search(page)
+            if page.truncated
+                && page.matches.len() == 1
+                && page.stats.stopped_by == Some("max_result_bytes")
+    )
 }
 
 fn submit_error_map(error: SubmitError) -> SubmitErrorMap {
@@ -2829,6 +2845,7 @@ fn stats_map(
         blobs_deduped: stats.blobs_deduped,
         binary_skipped: stats.binary_skipped,
         oversize_skipped: stats.oversize_skipped,
+        payload_rereads: stats.payload_rereads,
         elapsed_ms,
         stopped_by: stats.stopped_by.and_then(|limit| {
             if limit == "limit" {
@@ -3033,8 +3050,20 @@ fn error_map<'a>(env: Env<'a>, error: Error) -> NifResult<ErrorMap<'a>> {
         oid: error.object_oid.map(|oid| binary(env, oid.as_bytes())),
         order: error.order.map(|order| order.as_str().to_owned()),
         file: error.file.map(|file| file.as_str().to_owned()),
-        reason: error.reason,
+        reason: error.reason.map(|reason| truncate_utf8(reason, 1_024)),
     })
+}
+
+fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value.truncate(end);
+    value
 }
 
 fn limit_atom(limit: &str) -> Option<Atom> {
@@ -3056,6 +3085,21 @@ fn limit_atom(limit: &str) -> Option<Atom> {
         "max_bytes" => Some(atoms::max_bytes()),
         "max_total_bytes" => Some(atoms::max_total_bytes()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_utf8;
+
+    #[test]
+    fn nif_error_reasons_are_capped_at_one_kibibyte_on_utf8_boundaries() {
+        let ascii = truncate_utf8("x".repeat(2_000), 1_024);
+        assert_eq!(ascii.len(), 1_024);
+
+        let multibyte = truncate_utf8("é".repeat(1_000), 1_025);
+        assert!(multibyte.len() <= 1_024);
+        assert!(std::str::from_utf8(multibyte.as_bytes()).is_ok());
     }
 }
 

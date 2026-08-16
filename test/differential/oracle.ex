@@ -136,13 +136,16 @@ defmodule Gitility.Differential.Oracle do
           "--line-number",
           "--column",
           "--full-name",
+          "--null",
           "-e",
           pattern,
           revision
         ] ++ pathspec_arguments(options[:pathspecs])
 
-    with {:ok, output} <- git(repository, arguments) do
-      parse_raw_line_records(output, &parse_grep_record/1)
+    case git(repository, arguments) do
+      {:ok, output} -> parse_raw_line_records(output, &parse_grep_record(&1, revision))
+      {:error, %{status: 1, output: <<>>}} -> {:ok, []}
+      {:error, _error} = error -> error
     end
   end
 
@@ -316,11 +319,13 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
-  defp parse_grep_record(record) do
-    with {:ok, revision_or_path, rest} <- take_field(record, ?:),
-         {:ok, path, rest} <- grep_path_and_rest(revision_or_path, rest),
-         {:ok, line_field, rest} <- take_field(rest, ?:),
-         {:ok, column_field, line_bytes} <- take_field(rest, ?:),
+  defp parse_grep_record(record, revision) do
+    prefix = revision <> ":"
+
+    with {:ok, rest} <- strip_prefix(record, prefix),
+         {:ok, path, rest} <- take_field(rest, 0),
+         {:ok, line_field, rest} <- take_field(rest, 0),
+         {:ok, column_field, line_bytes} <- take_field(rest, 0),
          {line, ""} when line > 0 <- Integer.parse(line_field),
          {column, ""} when column > 0 <- Integer.parse(column_field) do
       {:ok, %{path: path, line: line, column: column - 1, line_bytes: line_bytes}}
@@ -329,21 +334,19 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
-  defp grep_path_and_rest(revision, rest) when byte_size(revision) in [40, 64] do
-    if ascii_hex?(revision) do
-      take_field(rest, ?:)
-    else
-      {:ok, revision, rest}
+  defp strip_prefix(binary, prefix) when byte_size(binary) >= byte_size(prefix) do
+    prefix_size = byte_size(prefix)
+
+    case binary do
+      <<candidate::binary-size(prefix_size), rest::binary>> when candidate == prefix ->
+        {:ok, rest}
+
+      _ ->
+        {:error, :prefix_mismatch}
     end
   end
 
-  defp grep_path_and_rest(path, rest), do: {:ok, path, rest}
-
-  defp ascii_hex?(binary) do
-    Enum.all?(:binary.bin_to_list(binary), fn byte ->
-      byte in ?0..?9 or byte in ?a..?f or byte in ?A..?F
-    end)
-  end
+  defp strip_prefix(_binary, _prefix), do: {:error, :prefix_mismatch}
 
   defp take_field(binary, separator) do
     case :binary.match(binary, <<separator>>) do
@@ -398,7 +401,9 @@ defmodule Gitility.Differential.Oracle do
   defp path_arguments(path) when is_binary(path), do: ["--", path]
 
   defp pathspec_arguments([]), do: []
-  defp pathspec_arguments(pathspecs), do: ["--" | pathspecs]
+  # Git's default wildmatch lets `*` cross `/`; Gitility deliberately uses
+  # glob magic, so an unprefixed `*.txt` would be a false-positive oracle.
+  defp pathspec_arguments(pathspecs), do: ["--" | Enum.map(pathspecs, &(":(glob)" <> &1))]
 
   defp parse_raw_changes([], changes), do: {:ok, Enum.reverse(changes)}
 

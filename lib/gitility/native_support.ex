@@ -241,6 +241,7 @@ defmodule Gitility.NativeSupport do
           preview: item.preview,
           preview_truncated: item.preview_truncated,
           submatches: Enum.map(item.submatches, &{&1.start, &1.length}),
+          submatches_truncated: item.submatches_truncated,
           context_before: item.context_before,
           context_after: item.context_after
         }

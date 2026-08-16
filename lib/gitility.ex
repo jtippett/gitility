@@ -137,19 +137,32 @@ defmodule Gitility do
   @doc """
   Searches blob contents across the snapshot.
 
-  The scan walks the tree, deduplicates blobs by object ID, and scans each
-  unique blob once, within strict budgets. (A persistent index may
-  implement this same API later — results are keyed by blob ID to make
-  that a drop-in.)
+  The scan walks the tree, deduplicates match spans by object ID, and scans
+  within strict budgets. Duplicate paths may physically re-read a payload to
+  materialize results without retaining blob-sized cache entries. (A
+  persistent index may implement this same API later — results are keyed by
+  blob ID to make that a drop-in.)
 
   Cursor resume replays the deterministic tree prefix and re-scans the cursor
   path, costing O(prefix paths + one blob re-scan); replayed prefix paths do
   not consume `limits.max_objects` again.
 
+  Search checks cancellation between 64 KiB literal-search windows. Regex
+  search checks each line and each yielded match; one matchless regex pass
+  over a line is the cancellation-granularity floor and is bounded by
+  `limits.max_object_bytes`.
+
+  Context belongs to each match independently, so adjacent matches may repeat
+  lines; unlike `git grep -C`, search does not merge context hunks. Options are
+  cursor-fingerprinted, but `Gitility.Limits` values are not. Changing a limit
+  such as `max_object_bytes` between pages can therefore change which later
+  blobs are scanned.
+
   ## Options
 
-    * `:mode` — `:literal` (default) or `:regex`. Regex uses a linear-time
-      engine over bytes; backreferences and lookaround return
+    * `:mode` — `:literal` (default) or `:regex`. Regex patterns must be UTF-8
+      and use a linear-time engine over bytes; arbitrary bytes can be matched
+      with `\\xNN` escapes. Backreferences and lookaround return
       `{:error, %Gitility.Error{code: :unsupported_regex}}` — there is no
       backtracking fallback.
     * `:case_sensitive` — default `true`.
@@ -562,6 +575,7 @@ defmodule Gitility do
   defp validate_search_binary_mode(_mode),
     do: raise(ArgumentError, ":binary must be an atom")
 
+  # Mirrors gitility_core::search::MAX_CONTEXT_LINES, the Rust source of truth.
   defp validate_search_context_lines(lines)
        when is_integer(lines) and lines >= 0 and lines <= 32,
        do: {:ok, lines}
@@ -677,7 +691,6 @@ defmodule Gitility do
       )
 
     limits = opts[:limits] || Limits.new()
-    _limits_map = NativeSupport.limits_map!(limits)
     {opts, limits}
   end
 

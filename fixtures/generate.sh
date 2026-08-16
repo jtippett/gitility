@@ -518,11 +518,23 @@ make_search() {
   cp "$work_repository/dedup/a/shared.txt" "$work_repository/dedup/c/shared.txt"
   printf 'deep Needle and needle\n' >"$work_repository/deep/level/three/hit.txt"
   printf '\000binary payload containing needle\n' >"$work_repository/binary-with-needle.dat"
+  {
+    awk 'BEGIN { for (i = 0; i < 7999; i++) printf "b" }'
+    printf '\000needle after binary boundary\n'
+  } >"$work_repository/nul-at-7999.dat"
+  {
+    awk 'BEGIN { for (i = 0; i < 8000; i++) printf "t" }'
+    printf '\000needle after text boundary\n'
+  } >"$work_repository/nul-at-8000.dat"
   awk 'BEGIN { for (i = 0; i < 8100; i++) printf "x"; printf "\nneedle after byte 8000\n" }' \
     >"$work_repository/after-8000.txt"
   printf 'caf\351 needle latin-1\n' >"$work_repository/latin1.txt"
   printf 'first\r\nneedle on crlf\r\nlast\r\n' >"$work_repository/crlf.txt"
   printf 'needle needle needle needle needle\n' >"$work_repository/many-on-one-line.txt"
+  printf 'root pages needle\n' >"$work_repository/pages.txt"
+  printf 'caf\303\251 needle utf-8\n' >"$work_repository/utf8-column.txt"
+  printf '\tneedle after tab\n' >"$work_repository/tab-column.txt"
+  ln -s 'needle-target.txt' "$work_repository/needle-link"
   : >"$work_repository/empty.txt"
   printf 'last line only needle' >"$work_repository/final-no-newline.txt"
   : >"$work_repository/pages/many-lines.txt"
@@ -774,16 +786,11 @@ printf '%s\n' "$generator_hash" >"$output_dir/GENERATOR_HASH"
 python3 "$checksum_helper" "$output_dir" >"$output_dir/CHECKSUMS"
 
 if [[ -s "$previous_oids" ]]; then
-  while IFS= read -r previous_oid; do
-    if [[ "$previous_oid" == sha1_search_head=* ]]; then
-      continue
-    fi
-    if ! grep -Fqx -- "$previous_oid" "$output_dir/OIDS"; then
-      printf 'error: generated object ID changed or disappeared: %s\n' "$previous_oid" >&2
-      exit 1
-    fi
-  done <"$previous_oids"
-  printf 'Verified stable pre-existing object IDs against the previous generation.\n'
+  if ! cmp -s "$previous_oids" "$output_dir/OIDS"; then
+    printf 'error: generated OIDS changed or were reordered\n' >&2
+    exit 1
+  fi
+  printf 'Verified byte-identical deterministic OIDS.\n'
 fi
 if [[ -s "$previous_checksums" ]]; then
   # Extending the generated corpus legitimately adds inventory records and

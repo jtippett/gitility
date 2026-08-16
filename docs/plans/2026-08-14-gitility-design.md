@@ -530,14 +530,20 @@ reversible JSON-safe representation.
 
 `mode: :regex` uses Rust's linear-time `regex` engine over bytes. Unsupported
 constructs such as backreferences and lookaround return `:unsupported_regex`;
-there is no fallback to a backtracking engine.
+there is no fallback to a backtracking engine. Patterns are UTF-8; `\\xNN`
+escapes match arbitrary bytes. A matchless pass over one line is the regex
+cancellation-granularity floor and remains bounded by `max_object_bytes`.
 
 Each `%Gitility.SearchMatch{}` includes raw path, blob ID, line, byte column,
-preview, submatches, and enough snapshot identity for a stable citation.
+preview, at most 256 preview-intersecting submatches, explicit preview/submatch
+truncation flags, and enough snapshot identity for a stable citation.
 
-The first implementation walks the tree, deduplicates blobs by object ID,
-prefetches object batches where the ODB supports it, and scans each unique
-blob once. A persistent index may implement the same API later.
+The first implementation walks the tree, caches bounded fixed-size match spans
+by blob ID, and prefetches object batches where the ODB supports it. Payloads
+can be physically re-read to materialize duplicate-path results without
+retaining blob bytes. Context is per match and may repeat adjacent lines;
+unlike `git grep -C`, search does not merge context hunks. A persistent index
+may implement the same API later.
 
 ### Commit graph and history
 
@@ -1193,6 +1199,11 @@ checksummed continuation state:
 Cursors are untrusted input. They are parsed with strict size limits and must
 match the operation, options, and snapshot. They contain no secrets and
 require no server-side session.
+
+Operation limits are not part of the option fingerprint. Changing a limit
+such as `max_object_bytes` between pages can change which later objects are
+available to scan, while changing a result-affecting option invalidates the
+cursor.
 
 **Cursor wire format v1** (frozen 2026-08-14; implemented in
 `gitility-core`'s cursor module, base64url-encoded without padding at the

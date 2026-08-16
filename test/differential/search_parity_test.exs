@@ -4,7 +4,7 @@ defmodule Gitility.Differential.SearchParityTest do
   # correctness, compile ceilings, and unsupported-construct coverage.
   use ExUnit.Case, async: true
 
-  alias Gitility.{OID, Repository}
+  alias Gitility.Repository
   alias Gitility.Differential.{Allowlist, Oracle}
 
   @moduletag :gitility_engine
@@ -25,7 +25,10 @@ defmodule Gitility.Differential.SearchParityTest do
     for {case_id, query, options} <- [
           {:sensitive, "needle", []},
           {:insensitive, "needle", [case_sensitive: false]},
-          {:pathspec, "needle", [pathspecs: ["deep/**", "dedup/**"]]}
+          {:pathspec, "needle", [pathspecs: ["deep/**", "dedup/**"]]},
+          # This differs under Git's default pathspec dialect because bare `*`
+          # crosses `/`; it passes only when the oracle emits `:(glob)` magic.
+          {:glob_star, "needle", [pathspecs: ["*.txt"]]}
         ] do
       oracle_options = [
         ignore_case: !Keyword.get(options, :case_sensitive, true),
@@ -73,14 +76,49 @@ defmodule Gitility.Differential.SearchParityTest do
       engine_positions(actual_binary.items)
     )
 
+    boundary_paths = ["nul-at-7999.dat", "nul-at-8000.dat"]
+
+    for binary <- [:skip, :text] do
+      assert {:ok, expected_boundary} =
+               Oracle.grep(context.repository_path, context.commit, "needle",
+                 binary: binary,
+                 pathspecs: boundary_paths
+               )
+
+      assert {:ok, actual_boundary} =
+               Gitility.search(context.snapshot, "needle",
+                 binary: binary,
+                 pathspecs: boundary_paths
+               )
+
+      compare(
+        "search/binary-window/#{binary}",
+        %{query: "needle", binary: binary, pathspecs: boundary_paths},
+        positions(expected_boundary),
+        engine_positions(actual_boundary.items)
+      )
+    end
+
     assert {:ok, expected_text} =
              Oracle.grep(context.repository_path, context.commit, "needle",
-               pathspecs: ["crlf.txt", "latin1.txt", "final-no-newline.txt"]
+               pathspecs: [
+                 "crlf.txt",
+                 "latin1.txt",
+                 "final-no-newline.txt",
+                 "utf8-column.txt",
+                 "tab-column.txt"
+               ]
              )
 
     assert {:ok, actual_text} =
              Gitility.search(context.snapshot, "needle",
-               pathspecs: ["crlf.txt", "latin1.txt", "final-no-newline.txt"]
+               pathspecs: [
+                 "crlf.txt",
+                 "latin1.txt",
+                 "final-no-newline.txt",
+                 "utf8-column.txt",
+                 "tab-column.txt"
+               ]
              )
 
     compare(
@@ -94,10 +132,14 @@ defmodule Gitility.Differential.SearchParityTest do
   test "cursor pages reconstruct the full stream at file and grouped-line boundaries", context do
     for {pathspecs, limit} <- [
           {["pages/**"], 7},
+          # Root-level glob scope crosses several files and also discriminates
+          # the `pages.txt`/`pages/` traversal-order prefix.
+          {["*.txt"], 2},
           {["dedup/**", "many-on-one-line.txt", "pages/**"], 4},
           {["many-on-one-line.txt", "pages/**"], 1}
         ] do
       opts = [pathspecs: pathspecs, limit: limit]
+
       assert {:ok, full} =
                Gitility.search(context.snapshot, "needle", pathspecs: pathspecs, limit: 1_000)
 

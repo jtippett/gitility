@@ -127,7 +127,10 @@ defmodule Gitility.Differential.CommitGraphParityTest do
 
       assert {:ok, expected_all} = Oracle.merge_base(repository_path, left_name, right_name)
       expected_all = Enum.sort(expected_all, :desc)
-      assert {:ok, actual_all} = Gitility.merge_base(repository.odb, left_hex, right_hex, all: true)
+
+      assert {:ok, actual_all} =
+               Gitility.merge_base(repository.odb, left_hex, right_hex, all: true)
+
       actual_all = Enum.map(actual_all, &OID.to_string/1)
 
       assert :ok =

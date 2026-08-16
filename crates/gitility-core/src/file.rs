@@ -132,6 +132,7 @@ pub fn read_file(
                 blobs_deduped: 0,
                 binary_skipped: 0,
                 oversize_skipped: 0,
+                payload_rereads: 0,
                 stopped_by: None,
             },
         });
@@ -188,6 +189,7 @@ pub fn read_file(
             blobs_deduped: 0,
             binary_skipped: 0,
             oversize_skipped: 0,
+            payload_rereads: 0,
             stopped_by: sliced.stopped_by,
         },
     })

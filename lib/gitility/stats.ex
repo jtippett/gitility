@@ -17,7 +17,8 @@ defmodule Gitility.Stats do
   cache handle, so it remains observable after the job that caused eviction.
 
   Search additionally reports unique `files_scanned`, duplicate-path
-  `blobs_deduped`, and explicit `binary_skipped` / `oversize_skipped` counts.
+  `blobs_deduped`, physical duplicate `payload_rereads`, and explicit
+  `binary_skipped` / `oversize_skipped` counts.
   `scanned_blobs` is retained as the generic/native compatibility counter and
   equals `files_scanned` for search pages.
   """
@@ -38,6 +39,7 @@ defmodule Gitility.Stats do
             blobs_deduped: 0,
             binary_skipped: 0,
             oversize_skipped: 0,
+            payload_rereads: 0,
             elapsed_ms: 0,
             stopped_by: nil
 
@@ -58,6 +60,7 @@ defmodule Gitility.Stats do
           blobs_deduped: non_neg_integer(),
           binary_skipped: non_neg_integer(),
           oversize_skipped: non_neg_integer(),
+          payload_rereads: non_neg_integer(),
           elapsed_ms: non_neg_integer(),
           stopped_by: atom() | nil
         }

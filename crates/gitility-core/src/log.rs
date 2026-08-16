@@ -243,6 +243,7 @@ pub fn log(
             blobs_deduped: 0,
             binary_skipped: 0,
             oversize_skipped: 0,
+            payload_rereads: 0,
             stopped_by,
         },
     })

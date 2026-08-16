@@ -53,17 +53,16 @@ byte pattern.
   resolution rules as list_tree — nonexistent scope → :invalid_path)
   and filtered by `pathspecs:` (pathspec.rs semantics, resolved relative
   to the scope, exactly as list_tree does).
-- Dedup: scan each unique blob OID ONCE per job even when it appears at
-  many paths; matches are still REPORTED per path in traversal order.
-  Cache scan results (the match positions, not the payload) keyed by
-  blob OID; bound the cache and record the bound's rationale. Bytes-read
-  accounting charges each unique blob once.
-- Prefetch: where the ODB exposes the existing child-prefetch seam
-  (provider stores), use it exactly as the tree walk already does — no
-  new mechanism.
-- Budget::check runs at least once per file scanned AND at least once
-  per 64 KiB of blob bytes scanned, so cancellation/deadline interrupts
-  mid-large-blob (M2 cooperative-deadline seam — no new mechanism).
+- Dedup: cache fixed-size matching-line spans by blob OID; matches are still
+  REPORTED per path in traversal order. The entry-count-bounded LRU never
+  retains payload/excerpt copies. Duplicate paths and evictions may physically
+  re-read and deterministically re-scan a blob, recorded as payload_rereads,
+  while logical bytes-read accounting charges each unique blob once.
+- Prefetch: where the ODB exposes the existing prefetch seam, batch pending
+  unique blob OIDs in windows of at most 64; scanning stays sequential.
+- Literal search checks between overlapped 64 KiB windows. Regex checks per
+  line and per yielded find; one matchless line pass is its cancellation floor,
+  bounded by max_object_bytes.
 - Limits: max_objects bounds blobs VISITED (scanned or cache-hit);
   max_results bounds emitted matches per page; max_result_bytes bounds
   the page's total payload; max_object_bytes bounds each blob —
@@ -71,7 +70,8 @@ byte pattern.
   counted (see R4 stats; never a silent drop, never an error).
   Exceeding a page ceiling mid-walk is a truncated successful page with
   a cursor, per the error model; zero-progress exhaustion is
-  :budget_exceeded, as in M1b.
+  :budget_exceeded, except that an unsplittable first valid match is emitted as
+  a one-item max_result_bytes-truncated page to guarantee stream progress.
 
 R3 [match semantics]. Options: mode: :literal (default) | :regex;
 case_sensitive: true (default).
@@ -92,8 +92,9 @@ case_sensitive: true (default).
   losslessly to the DTO).
 - Every match yields: path (raw bytes), blob OID, 1-based line, 0-based
   BYTE column, preview = the matched line's bytes capped at 1 KiB with
-  an explicit truncated flag, submatches = byte ranges of every match
-  occurrence within the (uncapped) line clamped to the emitted preview,
+  an explicit truncated flag, submatches = at most 256 byte ranges whose starts
+  fall within the emitted preview (crossing ranges are clamped; later ranges
+  are dropped), plus an explicit submatches_truncated flag,
   and context_before/context_after = up to context_lines: (0 default,
   cap 32 — above the cap is :invalid_argument) neighbouring lines, each
   capped at 1 KiB. Multiple matches on ONE line produce ONE
@@ -106,7 +107,7 @@ R4 [binary handling + skip accounting]. binary: :skip (default) | :text.
   from your knowledge of the pinned oracle behaviour) and not scanned.
 - :text — scan everything as bytes.
 Skips are never silent: page stats gain files_scanned, blobs_deduped,
-binary_skipped, oversize_skipped counts, and any page on whose walk a
+payload_rereads, binary_skipped, oversize_skipped counts, and any page on whose walk a
 skip occurred carries a warning naming the reason class and the limit
 (oversize names max_object_bytes). Follow the M1c warning idioms.
 
@@ -124,6 +125,9 @@ changing any of them with an old cursor → :invalid_cursor. Cursor-resume
 prefix traversal follows M3a's H6 rule: skipped-path visits are NOT
 recharged against max_objects (use the try_find_graph/without-charge
 seam); the position path's re-scan IS charged (it does real work).
+Limits values such as max_object_bytes are intentionally not cursor-
+fingerprinted, so changing limits between pages can change which later blobs
+are scanned; result-affecting search options remain fingerprinted.
 MAX_CURSOR_BYTES stays the single cursor.rs constant.
 
 R6 [NIF + Elixir API]. Follow the M3a job idioms exactly (job_submit,

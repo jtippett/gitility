@@ -26,9 +26,7 @@ defmodule Gitility.Milestone3aCommitGraphTest do
     child_id = {Runtime, System.unique_integer([:positive])}
 
     runtime =
-      start_supervised!(
-        Supervisor.child_spec({Runtime, workers: 1}, id: child_id)
-      )
+      start_supervised!(Supervisor.child_spec({Runtime, workers: 1}, id: child_id))
 
     {:ok, repository} = Repository.open(fixture("sha1-graph.git"), runtime: runtime)
     head = fixture_oid(:sha1_graph_head)
@@ -133,6 +131,7 @@ defmodule Gitility.Milestone3aCommitGraphTest do
     assert object_page.truncated
     assert object_page.stats.stopped_by == :max_objects
     assert is_binary(object_page.next_cursor)
+
     assert object_page.warnings == [
              %{code: :truncated, message: "page truncated by max_objects"}
            ]
@@ -150,6 +149,7 @@ defmodule Gitility.Milestone3aCommitGraphTest do
 
     assert {:ok, ^expected_all} =
              Gitility.merge_base(repository.odb, left, OID.to_string(right), all: true)
+
     assert {:ok, first} = Gitility.merge_base(snapshot, OID.to_string(left), right)
     assert first == hd(expected_all)
 
@@ -175,11 +175,13 @@ defmodule Gitility.Milestone3aCommitGraphTest do
         "committer C <c@example.invalid> 2 +0000\n\nchild\n"
 
     child = object_oid(:commit, payload)
+
     assert {:ok, odb} =
              ODB.from_objects(
                [%Object{oid: child, type: :commit, data: payload}],
                runtime: runtime
              )
+
     snapshot = %Snapshot{odb: odb, commit_oid: child, tree_oid: tree}
 
     assert {:error, %Error{code: :missing_object, details: %{oid: ^missing}}} =
@@ -223,6 +225,7 @@ defmodule Gitility.Milestone3aCommitGraphTest do
     snapshot: snapshot
   } do
     assert_raise ArgumentError, fn -> Gitility.log(snapshot, unknown: true) end
+
     assert_raise ArgumentError, ~r/:first_parent.*boolean/, fn ->
       Gitility.log(snapshot, first_parent: :yes)
     end
@@ -233,7 +236,11 @@ defmodule Gitility.Milestone3aCommitGraphTest do
 
     left = fixture_oid(:sha1_graph_criss_left)
     right = fixture_oid(:sha1_graph_criss_right)
-    assert_raise ArgumentError, fn -> Gitility.merge_base(snapshot, left, right, unknown: true) end
+
+    assert_raise ArgumentError, fn ->
+      Gitility.merge_base(snapshot, left, right, unknown: true)
+    end
+
     assert_raise ArgumentError, ~r/:all.*boolean/, fn ->
       Gitility.merge_base(snapshot, left, right, all: :yes)
     end

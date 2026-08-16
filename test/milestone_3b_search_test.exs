@@ -18,19 +18,27 @@ defmodule Gitility.M3bBlockingBackend do
 
   @impl true
   def read_many(oids, {objects, observer}) do
-    send(observer, {:m3b_provider_read_blocked, self()})
+    blob_read? =
+      Enum.any?(oids, fn oid ->
+        match?(%Gitility.Object{type: :blob}, Map.get(objects, oid))
+      end)
 
-    receive do
-      :release_m3b_provider_read ->
-        {:ok, Map.new(oids, &{&1, Map.get(objects, &1, :not_found)})}
+    if blob_read? do
+      send(observer, {:m3b_provider_read_blocked, self()})
+
+      receive do
+        :release_m3b_provider_read -> :ok
+      end
     end
+
+    {:ok, Map.new(oids, &{&1, Map.get(objects, &1, :not_found)})}
   end
 end
 
 defmodule Gitility.Milestone3bSearchTest do
   use ExUnit.Case, async: true
 
-  alias Gitility.{Error, Job, Limits, ODB, Repository, Runtime, SearchMatch, Snapshot}
+  alias Gitility.{Error, Job, Limits, ODB, Repository, Runtime, SearchMatch}
 
   @fixtures Path.expand("../fixtures/generated", __DIR__)
 
@@ -38,13 +46,25 @@ defmodule Gitility.Milestone3bSearchTest do
     child_id = {Runtime, System.unique_integer([:positive])}
 
     runtime =
-      start_supervised!(
-        Supervisor.child_spec({Runtime, workers: 1}, id: child_id)
-      )
+      start_supervised!(Supervisor.child_spec({Runtime, workers: 1}, id: child_id))
 
     {:ok, repository} = Repository.open(fixture("sha1-search.git"), runtime: runtime)
-    {:ok, snapshot} = Repository.snapshot(repository, {:branch, "main"})
+    {:ok, snapshot} = Repository.snapshot(repository, {:oid, fixture_oid(:sha1_search_head)})
     %{runtime: runtime, repository: repository, snapshot: snapshot}
+  end
+
+  defp fixture_oid(name) do
+    @fixtures
+    |> Path.join("OIDS")
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.find_value(fn line ->
+      case String.split(line, "=", parts: 2) do
+        [key, value] -> if key == Atom.to_string(name), do: value
+        _ -> nil
+      end
+    end) ||
+      raise "missing OIDS key #{name}"
   end
 
   test "literal, regex, case, scope, pathspec, binary, and context options have happy paths", %{
@@ -53,7 +73,7 @@ defmodule Gitility.Milestone3bSearchTest do
     assert {:ok, literal} = Gitility.search(snapshot, "needle")
     assert literal.items != []
     assert Enum.all?(literal.items, &match?(%SearchMatch{}, &1))
-    assert literal.stats.binary_skipped == 1
+    assert literal.stats.binary_skipped == 2
 
     assert {:ok, insensitive} =
              Gitility.search(snapshot, "needle",
@@ -61,7 +81,8 @@ defmodule Gitility.Milestone3bSearchTest do
                pathspecs: ["deep/**"]
              )
 
-    assert [%SearchMatch{column: 5, submatches: [_, _]}] = insensitive.items
+    assert [%SearchMatch{column: 5, submatches: [_, _], submatches_truncated: false}] =
+             insensitive.items
 
     assert {:ok, regex} = Gitility.search(snapshot, "n[e]{2}dle", mode: :regex)
     assert length(regex.items) == length(literal.items)
@@ -101,6 +122,7 @@ defmodule Gitility.Milestone3bSearchTest do
 
     assert [%SearchMatch{preview_truncated: true}] = long.items
     assert Enum.all?(long.items, &(byte_size(&1.preview) <= 1_024))
+
     assert Enum.all?(long.items, fn item ->
              Enum.all?(item.context_before ++ item.context_after, &(byte_size(&1) <= 1_024))
            end)
@@ -110,6 +132,7 @@ defmodule Gitility.Milestone3bSearchTest do
     snapshot: snapshot
   } do
     opts = [pathspecs: ["many-on-one-line.txt", "pages/**"], limit: 3]
+
     assert {:ok, complete} =
              Gitility.search(snapshot, "needle",
                pathspecs: ["many-on-one-line.txt", "pages/**"],
@@ -179,6 +202,7 @@ defmodule Gitility.Milestone3bSearchTest do
     assert skipped.stats.binary_skipped == 1
     assert skipped.stats.oversize_skipped == 1
     assert Enum.any?(skipped.warnings, &(&1.code == :binary_skipped))
+
     assert Enum.any?(skipped.warnings, fn warning ->
              warning.code == :oversize_skipped and
                String.contains?(warning.message, "max_object_bytes")
@@ -207,6 +231,7 @@ defmodule Gitility.Milestone3bSearchTest do
              Gitility.search(snapshot, "needle", path: "missing")
 
     assert {:error, %Error{code: :invalid_argument}} = Gitility.search(%{}, "needle")
+
     assert {:error, %Error{code: :invalid_argument}} =
              Gitility.search(snapshot, "needle", context_lines: 33)
 
@@ -223,9 +248,7 @@ defmodule Gitility.Milestone3bSearchTest do
     provider =
       start_supervised!(
         {ODB,
-         backend: {Gitility.M3bObjectBackend, objects},
-         runtime: context.runtime,
-         concurrency: 1}
+         backend: {Gitility.M3bObjectBackend, objects}, runtime: context.runtime, concurrency: 1}
       )
 
     assert {:ok, provider_odb} = ODB.handle(provider)

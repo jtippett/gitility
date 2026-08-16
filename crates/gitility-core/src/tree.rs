@@ -133,6 +133,7 @@ pub struct QueryStats {
     pub blobs_deduped: u64,
     pub binary_skipped: u64,
     pub oversize_skipped: u64,
+    pub payload_rereads: u64,
     pub stopped_by: Option<&'static str>,
 }
 
@@ -292,6 +293,7 @@ pub fn list_tree(
             blobs_deduped: 0,
             binary_skipped: 0,
             oversize_skipped: 0,
+            payload_rereads: 0,
             stopped_by,
         },
     })
@@ -556,7 +558,7 @@ fn decode_owned_tree_entries(
         .collect()
 }
 
-fn read_tree_entries_for_walk(
+pub(crate) fn read_tree_entries_for_walk(
     store: &dyn ObjectDb,
     oid: Oid,
     budget: &Budget,

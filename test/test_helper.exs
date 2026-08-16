@@ -8,6 +8,7 @@ Code.require_file("differential/oracle.ex", __DIR__)
 Code.require_file("differential/allowlist.ex", __DIR__)
 
 {generator_hash, 0} = System.cmd("git", ["hash-object", fixture_generator])
+
 fixtures_current? =
   File.regular?(completion_marker) and
     case File.read(hash_marker) do
@@ -16,7 +17,9 @@ fixtures_current? =
     end
 
 unless fixtures_current? do
-  IO.puts("Generated fixture corpus is missing, incomplete, or stale; running fixtures/generate.sh")
+  IO.puts(
+    "Generated fixture corpus is missing, incomplete, or stale; running fixtures/generate.sh"
+  )
 
   case System.cmd("bash", [fixture_generator],
          cd: project_root,

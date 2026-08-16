@@ -134,6 +134,16 @@ defmodule Gitility.Native do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  def job_submit_submodules(
+        _runtime,
+        _resource,
+        _commit_oid,
+        _tree_oid,
+        _limits,
+        _detach
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def job_submit_peel(_runtime, _resource, _oid, _to, _limits),
     do: :erlang.nif_error(:nif_not_loaded)
 

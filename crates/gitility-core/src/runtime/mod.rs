@@ -30,6 +30,7 @@ use crate::object::{ObjectHeader, ObjectKind, Oid};
 use crate::packfetch::HydrationStats;
 use crate::search::SearchPage;
 use crate::snapshot::Snapshot;
+use crate::submodules::Submodule;
 use crate::tree::TreePage;
 pub use observer::TestObserver;
 use std::collections::{BTreeMap, VecDeque};
@@ -78,6 +79,7 @@ pub enum JobOutput {
     History(LogPage),
     Blame(Blame),
     File(FileRead),
+    Submodules(Vec<Submodule>),
     Header(Option<ObjectHeader>),
     Object { kind: ObjectKind, data: Vec<u8> },
     ReadMany(ReadManyOutput),

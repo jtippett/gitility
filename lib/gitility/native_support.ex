@@ -17,6 +17,7 @@ defmodule Gitility.NativeSupport do
     Runtime,
     SearchMatch,
     Stats,
+    Submodule,
     TreeEntry
   }
 
@@ -299,6 +300,19 @@ defmodule Gitility.NativeSupport do
       lfs_pointer: file.lfs_pointer,
       stats: struct!(Stats, Map.to_list(file.stats))
     }
+  end
+
+  def job_payload(%{submodules: submodules}) do
+    Enum.map(submodules, fn submodule ->
+      %Submodule{
+        name: submodule.name,
+        path: submodule.path,
+        url: submodule.url,
+        branch: submodule.branch,
+        commit_oid: if(submodule.commit_oid, do: job_oid(submodule.commit_oid)),
+        status: submodule.status
+      }
+    end)
   end
 
   def job_payload(%{files: files, stats: stats, warnings: warnings, truncated: truncated}) do

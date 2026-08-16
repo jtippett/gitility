@@ -637,6 +637,132 @@ make_lfs_pointer() {
   export_bare "$work_repository" "$bare_repository" sha1
 }
 
+make_submodules() {
+  local work_repository=$1
+  local bare_repository=$2
+  local base_tree
+  local tree_input
+  local dir_tree
+  local sub_tree
+  local augmented_tree
+  local head_commit
+  local malformed_blob
+  local malformed_tree
+  local malformed_commit
+
+  init_work_repo "$work_repository" sha1
+  mkdir -p "$work_repository/lfs"
+
+  # Exercise Git config's byte-oriented parser rather than a line-oriented
+  # approximation: odd case, both comment forms, quoted comment markers and
+  # escapes, and a continuation with no indentation (so no whitespace is
+  # introduced into the value).
+  printf '%s\n' \
+    '# leading comment' \
+    '[SuBmOdUlE "normal"]' \
+    '  PaTh = normal' \
+    '  URL = "https://example.invalid/normal.git#fragment" ; trailing comment' \
+    '  UpDaTe = checkout' \
+    '  ShAlLoW = false' \
+    '' \
+    '[submodule "Different Name"]' \
+    '  path = different' \
+    '  url = "../relative path.git"' \
+    '' \
+    '[submodule "remote"]' \
+    '  path = with-url' \
+    '  url = "ssh://example.invalid/repo\\path.git"' \
+    '  branch = release/\' \
+    'v1' \
+    '' \
+    '; nested gitlink declaration' \
+    '[submodule "Nested Name"]' \
+    '  path = "sub/dir/mod"' \
+    '  url = "https://example.invalid/nested.git"' \
+    '' \
+    '[submodule "orphaned"]' \
+    '  path = orphaned' \
+    '  url = "https://example.invalid/orphaned.git"' \
+    >"$work_repository/.gitmodules"
+
+  printf '%s\n%s\n%s\n' \
+    'version https://git-lfs.github.com/spec/v1' \
+    'oid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+    'size 12345' >"$work_repository/lfs/valid.bin"
+  printf '%s\n%s\n%s\n%s\n' \
+    'version https://git-lfs.github.com/spec/v1' \
+    'x-extra forward-compatible' \
+    'size 54321' \
+    'oid sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789' \
+    >"$work_repository/lfs/unknown-key.bin"
+  printf '%s\n%s\n%s\n' \
+    'version https://git-lfs.github.com/spec/v1' \
+    'oid sha256:not-a-64-byte-lowercase-hex-digest' \
+    'size 7' >"$work_repository/lfs/almost-pointer.bin"
+  {
+    printf '%s\n%s\n%s\n' \
+      'version https://git-lfs.github.com/spec/v1' \
+      'oid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+      'size 12345'
+    awk 'BEGIN { printf "x-padding "; for (i = 0; i < 1024; i++) printf "x"; printf "\n" }'
+  } >"$work_repository/lfs/over-1024.bin"
+
+  commit_all_at "$work_repository" '2001-08-01T00:00:00+0000' \
+    'Add submodule metadata and LFS recognition corpus'
+  base_tree="$(git -C "$work_repository" write-tree)"
+
+  dir_tree="$(
+    printf '160000 commit %040d\tmod\000' 4 |
+      git -C "$work_repository" mktree --missing -z
+  )"
+  sub_tree="$(
+    printf '040000 tree %s\tdir\000' "$dir_tree" |
+      git -C "$work_repository" mktree --missing -z
+  )"
+  tree_input="$scratch_dir/submodules-root-tree"
+  git -C "$work_repository" ls-tree -z "$base_tree" >"$tree_input"
+  printf '160000 commit %040d\tdifferent\000' 2 >>"$tree_input"
+  printf '160000 commit %040d\tnormal\000' 1 >>"$tree_input"
+  printf '040000 tree %s\tsub\000' "$sub_tree" >>"$tree_input"
+  printf '160000 commit %040d\tundeclared\000' 5 >>"$tree_input"
+  printf '160000 commit %040d\twith-url\000' 3 >>"$tree_input"
+  augmented_tree="$(git -C "$work_repository" mktree --missing -z <"$tree_input")"
+  head_commit="$(
+    env GIT_AUTHOR_DATE='2001-08-01T00:01:00+0000' \
+      GIT_COMMITTER_DATE='2001-08-01T00:01:00+0000' \
+      git -C "$work_repository" commit-tree "$augmented_tree" \
+      -m 'Pin active, nested, and undeclared gitlinks'
+  )"
+  git -C "$work_repository" update-ref refs/heads/main "$head_commit"
+  git -C "$work_repository" tag fixture/submodules-head "$head_commit"
+
+  # Keep the same gitlink tree while replacing only .gitmodules with invalid
+  # Git config. The oracle below must reject this exact blob.
+  git -C "$work_repository" read-tree "$augmented_tree"
+  printf '[submodule "broken]\npath = broken\n' >"$work_repository/.gitmodules"
+  git -C "$work_repository" add .gitmodules
+  malformed_blob="$(git -C "$work_repository" rev-parse :'.gitmodules')"
+  malformed_tree="$(git -C "$work_repository" write-tree)"
+  malformed_commit="$(
+    env GIT_AUTHOR_DATE='2001-08-01T00:02:00+0000' \
+      GIT_COMMITTER_DATE='2001-08-01T00:02:00+0000' \
+      git -C "$work_repository" commit-tree "$malformed_tree" -p "$head_commit" \
+      -m 'Malformed gitmodules probe'
+  )"
+  git -C "$work_repository" tag fixture/submodules-malformed "$malformed_commit"
+
+  export_bare "$work_repository" "$bare_repository" sha1
+  test "$(git -C "$bare_repository" ls-tree -r main | awk '$1 == "160000" { count++ } END { print count + 0 }')" = 5
+  test "$(git -C "$bare_repository" rev-parse main:sub/dir/mod)" = "$(printf '%040d' 4)"
+  test "$(git -C "$bare_repository" cat-file -s main:lfs/over-1024.bin)" -gt 1024
+  test "$(git -C "$bare_repository" config --blob main:.gitmodules --get submodule.remote.branch)" = release/v1
+  test "$(git -C "$bare_repository" config --blob main:.gitmodules --get submodule.remote.url)" = 'ssh://example.invalid/repo\path.git'
+  if git -C "$bare_repository" config --blob "$malformed_blob" --list >/dev/null 2>&1; then
+    printf 'error: canonical Git accepted malformed .gitmodules fixture\n' >&2
+    exit 1
+  fi
+}
+
 make_nested() {
   local work_repository=$1
   local bare_repository=$2
@@ -864,6 +990,7 @@ lfs_work="$scratch_dir/lfs-pointer-work"
 nested_work="$scratch_dir/sha1-nested-work"
 search_work="$scratch_dir/sha1-search-work"
 diff_work="$scratch_dir/sha1-diff-work"
+submodules_work="$scratch_dir/sha1-submodules-work"
 
 make_basic sha1 "$sha1_work" "$output_dir/sha1-basic.git"
 make_basic sha256 "$sha256_work" "$output_dir/sha256-basic.git"
@@ -874,6 +1001,7 @@ make_lfs_pointer "$lfs_work" "$output_dir/lfs-pointer.git"
 make_nested "$nested_work" "$output_dir/sha1-nested.git"
 make_search "$search_work" "$output_dir/sha1-search.git"
 make_diff "$diff_work" "$output_dir/sha1-diff.git"
+make_submodules "$submodules_work" "$output_dir/sha1-submodules.git"
 
 # Fully packed and deliberately mixed object layouts.
 cp -R "$output_dir/sha1-basic.git" "$output_dir/sha1-basic-packed.git"
@@ -1052,6 +1180,8 @@ nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
 search_head="$(git -C "$output_dir/sha1-search.git" rev-parse HEAD)"
 diff_base="$(git -C "$output_dir/sha1-diff.git" rev-parse fixture/diff-base)"
 diff_head="$(git -C "$output_dir/sha1-diff.git" rev-parse fixture/diff-head)"
+submodules_head="$(git -C "$output_dir/sha1-submodules.git" rev-parse fixture/submodules-head)"
+submodules_malformed="$(git -C "$output_dir/sha1-submodules.git" rev-parse fixture/submodules-malformed)"
 
 {
   printf 'git_version=%s\n' "$git_version"
@@ -1092,6 +1222,8 @@ diff_head="$(git -C "$output_dir/sha1-diff.git" rev-parse fixture/diff-head)"
   printf 'sha1_search_head=%s\n' "$search_head"
   printf 'sha1_diff_base=%s\n' "$diff_base"
   printf 'sha1_diff_head=%s\n' "$diff_head"
+  printf 'sha1_submodules_head=%s\n' "$submodules_head"
+  printf 'sha1_submodules_malformed=%s\n' "$submodules_malformed"
   printf 'sha1_nested_root_txt=%s\n' \
     "$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD:root.txt)"
   printf 'sha1_nested_deep_txt=%s\n' \

@@ -11,18 +11,18 @@ use gitility_core::{
     blame as core_blame, diff as core_diff, history as core_history,
     is_ancestor as core_is_ancestor, list_tree as core_list_tree, log as core_log,
     merge_base as core_merge_base, peel as core_peel, read_file as core_read_file,
-    search as core_search, BlameOptions, Budget, BudgetLimits, BusyReason,
-    ByteRange as CoreByteRange, CacheOptions, CacheStats, CallbackRangeTransport, DiffFormat,
-    DiffLineOrigin, DiffOptions, DiffStatus, DiffWarningCode, Error, ErrorCode, FileKind,
-    FileOptions, HashKind, HistoryOptions, HydrationStats, Job as CoreJob, JobObserver, JobOutput,
-    JobSpec, JobState, LayeredOdb, LocalOdb, LocalOdbOptions, LogIdentity, LogOptions, LogOrder,
-    ObjectDb, ObjectHeader, ObjectKind, ObjectReadResult, Oid, PackDescriptor, PackFetchOdb,
-    PackFetchOptions, PackManifest, PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind,
-    ProviderOdb, ProviderOptions, ProviderPayload, ProviderReplyValue, ProviderRequest,
-    ProviderTransport, QueryStats, RangePayload, RangePendingTable, RangeRequest, RangeRequestKind,
-    RangeRequestSender, ReadManyBudget, RenameTracking, Runtime as CoreRuntime, RuntimeConfig,
-    SearchBinaryMode, SearchMode, SearchOptions, Snapshot, StaticOdb, SubmitError, TreeItemKind,
-    TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
+    search as core_search, submodules as core_submodules, BlameOptions, Budget, BudgetLimits,
+    BusyReason, ByteRange as CoreByteRange, CacheOptions, CacheStats, CallbackRangeTransport,
+    DiffFormat, DiffLineOrigin, DiffOptions, DiffStatus, DiffWarningCode, Error, ErrorCode,
+    FileKind, FileOptions, HashKind, HistoryOptions, HydrationStats, Job as CoreJob, JobObserver,
+    JobOutput, JobSpec, JobState, LayeredOdb, LocalOdb, LocalOdbOptions, LogIdentity, LogOptions,
+    LogOrder, ObjectDb, ObjectHeader, ObjectKind, ObjectReadResult, Oid, PackDescriptor,
+    PackFetchOdb, PackFetchOptions, PackManifest, PeelTarget, PendingTable, ProviderCacheOptions,
+    ProviderKind, ProviderOdb, ProviderOptions, ProviderPayload, ProviderReplyValue,
+    ProviderRequest, ProviderTransport, QueryStats, RangePayload, RangePendingTable, RangeRequest,
+    RangeRequestKind, RangeRequestSender, ReadManyBudget, RenameTracking, Runtime as CoreRuntime,
+    RuntimeConfig, SearchBinaryMode, SearchMode, SearchOptions, Snapshot, StaticOdb, SubmitError,
+    SubmoduleStatus, TreeItemKind, TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
 };
 use rustler::{
     types::{map::MapIterator, tuple::get_tuple},
@@ -953,6 +953,21 @@ struct FileMap<'a> {
     truncated: bool,
     lfs_pointer: Option<LfsPointerMap>,
     stats: StatsMap,
+}
+
+#[derive(NifMap)]
+struct SubmoduleMap<'a> {
+    name: Option<Binary<'a>>,
+    path: Binary<'a>,
+    url: Option<Binary<'a>>,
+    branch: Option<Binary<'a>>,
+    commit_oid: Option<Binary<'a>>,
+    status: Atom,
+}
+
+#[derive(NifMap)]
+struct SubmodulesMap<'a> {
+    submodules: Vec<SubmoduleMap<'a>>,
 }
 
 enum ObjectOrNotFound<'a> {
@@ -2680,6 +2695,48 @@ fn job_submit_read_file<'a>(
 }
 
 #[rustler::nif]
+#[allow(clippy::too_many_arguments)]
+fn job_submit_submodules<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    store: ResourceArc<StoreResource>,
+    raw_commit_oid: Binary<'a>,
+    raw_tree_oid: Binary<'a>,
+    limits: LimitsMap,
+    detach: bool,
+) -> NifResult<Term<'a>> {
+    let commit_oid = match oid_for_store(&store, raw_commit_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let tree_oid = match oid_for_store(&store, raw_tree_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let task_store = store.clone();
+    let task = Box::new(move |budget: &Budget| {
+        core_submodules(
+            task_store.0.as_dyn(),
+            &Snapshot {
+                commit_oid,
+                tree_oid,
+            },
+            budget,
+        )
+        .map(JobOutput::Submodules)
+    });
+    submit_job(
+        env,
+        runtime,
+        detach,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Other,
+        task,
+    )
+}
+
+#[rustler::nif]
 fn job_submit_peel<'a>(
     env: Env<'a>,
     runtime: ResourceArc<RuntimeResource>,
@@ -3065,6 +3122,20 @@ fn encode_job_output<'a>(
             stats: stats_map(file.stats, elapsed_ms, atoms::limit(), provider_spend),
         }
         .encode(env),
+        JobOutput::Submodules(submodules) => SubmodulesMap {
+            submodules: submodules
+                .into_iter()
+                .map(|submodule| SubmoduleMap {
+                    name: submodule.name.map(|name| binary(env, &name)),
+                    path: binary(env, &submodule.path),
+                    url: submodule.url.map(|url| binary(env, &url)),
+                    branch: submodule.branch.map(|branch| binary(env, &branch)),
+                    commit_oid: submodule.commit_oid.map(|oid| binary(env, oid.as_bytes())),
+                    status: submodule_status_atom(submodule.status),
+                })
+                .collect(),
+        }
+        .encode(env),
         JobOutput::Header(Some(header)) => HeaderMap {
             kind: object_kind_atom(header.kind),
             size: header.size,
@@ -3229,6 +3300,21 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
                     .map(|pointer| length(pointer.oid.as_bytes()))
                     .unwrap_or(0),
             ),
+        JobOutput::Submodules(submodules) => submodules.iter().fold(0, |total, submodule| {
+            total
+                .saturating_add(submodule.name.as_deref().map(length).unwrap_or(0))
+                .saturating_add(length(&submodule.path))
+                .saturating_add(submodule.url.as_deref().map(length).unwrap_or(0))
+                .saturating_add(submodule.branch.as_deref().map(length).unwrap_or(0))
+                .saturating_add(
+                    submodule
+                        .commit_oid
+                        .as_ref()
+                        .map(|oid| length(oid.as_bytes()))
+                        .unwrap_or(0),
+                )
+                .saturating_add(16)
+        }),
         JobOutput::Header(_) => 16,
         JobOutput::Object { data, .. } => length(data),
         JobOutput::ReadMany(results) => results.iter().fold(0, |total, (oid, object)| {
@@ -3554,6 +3640,14 @@ fn file_kind_atom(kind: FileKind) -> Atom {
     }
 }
 
+fn submodule_status_atom(status: SubmoduleStatus) -> Atom {
+    match status {
+        SubmoduleStatus::Active => atoms::active(),
+        SubmoduleStatus::Undeclared => atoms::undeclared(),
+        SubmoduleStatus::Orphaned => atoms::orphaned(),
+    }
+}
+
 fn diff_status_atom(status: DiffStatus) -> Atom {
     match status {
         DiffStatus::Added => atoms::added(),
@@ -3707,6 +3801,9 @@ mod atoms {
         renamed,
         copied,
         type_changed,
+        active,
+        undeclared,
+        orphaned,
         context,
         addition,
         deletion,

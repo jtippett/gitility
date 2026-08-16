@@ -144,12 +144,14 @@ impl ErrorOrder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorFile {
     Shallow,
+    Gitmodules,
 }
 
 impl ErrorFile {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Shallow => "shallow",
+            Self::Gitmodules => ".gitmodules",
         }
     }
 }

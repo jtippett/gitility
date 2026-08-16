@@ -38,6 +38,9 @@ The corpus contains:
 - `sha1-diff.git`: adds, deletes, modifications, modes, type changes,
   symlinks, gitlinks, binary transitions, newline edges, pathspec scoping, and
   exact, edited, borderline, and copy-shaped rewrite candidates.
+- `sha1-submodules.git`: Git-config-rich `.gitmodules` metadata correlated
+  with active, orphaned, undeclared, and nested gitlinks, plus valid,
+  forward-compatible, malformed, and over-1024-byte LFS pointer candidates.
 - `sha1-basic-packed.git`, `sha1-basic-mixed.git`, and
   `sha1-history-midx.git`: fully packed, mixed loose/packed, and two-pack
   multi-pack-index layouts.

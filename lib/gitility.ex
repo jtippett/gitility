@@ -130,6 +130,35 @@ defmodule Gitility do
     )
   end
 
+  @doc """
+  Returns `.gitmodules` declarations correlated with actual snapshot gitlinks.
+
+  Results are ordered by raw path bytes. `:active` rows have both a declaration
+  and gitlink, `:undeclared` rows are gitlinks missing from `.gitmodules`, and
+  `:orphaned` rows are declarations with no tree entry.
+
+  The only option is `:limits`. URLs are returned as inert bytes: Gitility
+  never resolves them, never opens the pinned gitlink commits, and never
+  traverses into submodules.
+  """
+  @spec submodules(Snapshot.t(), keyword()) ::
+          {:ok, [Gitility.Submodule.t()]} | {:error, Error.t()}
+  def submodules(snapshot, opts \\ [])
+
+  def submodules(%Snapshot{} = snapshot, opts) do
+    limits = submodules_options!(opts)
+
+    NativeSupport.await_sync(
+      fn -> submit_submodules(snapshot, limits, false) end,
+      limits.timeout_ms,
+      :submodules
+    )
+  end
+
+  def submodules(_snapshot, _opts) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Snapshot", operation: :submodules)}
+  end
+
   ## ————————————————————————————————————————————————————————————————
   ## Search
   ## ————————————————————————————————————————————————————————————————
@@ -755,6 +784,22 @@ defmodule Gitility do
     submit_read_file(snapshot, path, opts, limits, detach)
   end
 
+  @doc "Asynchronous `submodules/2`; returns the `Gitility.Job`."
+  @spec async_submodules(Snapshot.t(), keyword()) ::
+          {:ok, Job.t()} | {:error, Error.t()}
+  def async_submodules(snapshot, opts \\ [])
+
+  def async_submodules(%Snapshot{} = snapshot, opts) do
+    opts = Keyword.validate!(opts, limits: nil, detach: false)
+    detach = NativeSupport.boolean_option!(opts, :detach)
+    limits = opts |> Keyword.delete(:detach) |> submodules_options!()
+    submit_submodules(snapshot, limits, detach)
+  end
+
+  def async_submodules(_snapshot, _opts) do
+    {:error, Error.new(:invalid_argument, "expected a Gitility.Snapshot", operation: :submodules)}
+  end
+
   defp list_tree_options!(opts) do
     opts =
       Keyword.validate!(opts,
@@ -850,6 +895,13 @@ defmodule Gitility do
     limits = opts[:limits] || Limits.new()
     _limits_map = NativeSupport.limits_map!(limits)
     {opts, limits}
+  end
+
+  defp submodules_options!(opts) do
+    opts = Keyword.validate!(opts, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    _limits_map = NativeSupport.limits_map!(limits)
+    limits
   end
 
   defp submit_list_tree(
@@ -1116,6 +1168,25 @@ defmodule Gitility do
         )
       end)
     end
+  end
+
+  defp submit_submodules(
+         %Snapshot{odb: %ODB{ref: resource, runtime: runtime}} = snapshot,
+         limits,
+         detach
+       ) do
+    limits_map = NativeSupport.limits_map!(limits)
+
+    NativeSupport.submit_job(runtime, :submodules, fn runtime_resource ->
+      Native.job_submit_submodules(
+        runtime_resource,
+        resource,
+        snapshot.commit_oid.bytes,
+        snapshot.tree_oid.bytes,
+        limits_map,
+        detach
+      )
+    end)
   end
 
   @doc "Asynchronous `search/3`; returns the `Gitility.Job`."

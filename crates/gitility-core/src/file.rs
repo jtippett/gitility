@@ -336,21 +336,33 @@ fn line_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
 
 fn parse_lfs_pointer(payload: &[u8]) -> Option<LfsPointer> {
     const VERSION: &[u8] = b"version https://git-lfs.github.com/spec/v1";
+    const LEGACY_VERSION: &[u8] = b"version https://hawser.github.com/spec/v1";
     const OID_PREFIX: &[u8] = b"sha256:";
+    const MAX_POINTER_BYTES: usize = 1_024;
 
-    if !payload.ends_with(b"\n") || std::str::from_utf8(payload).is_err() {
+    if payload.len() > MAX_POINTER_BYTES {
         return None;
     }
-    let body = payload.strip_suffix(b"\n")?;
+
+    // Git LFS's compatibility parser accepts a missing final newline, CRLF,
+    // and the pre-1.0 Hawser URL. Recognition intentionally follows that
+    // reader behavior rather than requiring the stricter canonical writer
+    // form. Empty physical lines are tolerated only at EOF.
+    let mut body = payload;
+    while let Some(without_lf) = body.strip_suffix(b"\n") {
+        body = without_lf.strip_suffix(b"\r").unwrap_or(without_lf);
+    }
     let mut lines = body.split(|byte| *byte == b'\n');
-    if lines.next()? != VERSION {
+    let first = lines.next()?;
+    let first = first.strip_suffix(b"\r").unwrap_or(first);
+    if first != VERSION && first != LEGACY_VERSION {
         return None;
     }
 
-    let mut previous_key: Option<&[u8]> = None;
     let mut oid = None;
     let mut size = None;
     for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         let separator = line.iter().position(|byte| *byte == b' ')?;
         let key = &line[..separator];
         let value = &line[separator + 1..];
@@ -359,13 +371,14 @@ fn parse_lfs_pointer(payload: &[u8]) -> Option<LfsPointer> {
             || !key
                 .iter()
                 .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-'))
-            || previous_key.is_some_and(|previous| previous >= key)
         {
             return None;
         }
-        previous_key = Some(key);
         match key {
             b"oid" => {
+                if oid.is_some() {
+                    return None;
+                }
                 let digest = value.strip_prefix(OID_PREFIX)?;
                 if digest.len() != 64
                     || !digest
@@ -377,6 +390,9 @@ fn parse_lfs_pointer(payload: &[u8]) -> Option<LfsPointer> {
                 oid = Some(std::str::from_utf8(digest).ok()?.to_owned());
             }
             b"size" => {
+                if size.is_some() {
+                    return None;
+                }
                 if !value.iter().all(u8::is_ascii_digit) {
                     return None;
                 }
@@ -645,7 +661,7 @@ mod tests {
             .data
             .starts_with(b"version https://git-lfs.github.com/spec/v1\n"));
 
-        let extension = b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 12345\nx-foo preserved\n";
+        let extension = b"version https://git-lfs.github.com/spec/v1\nx-foo preserved\nsize 12345\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
         assert_eq!(
             parse_lfs_pointer(extension),
             Some(LfsPointer {
@@ -653,6 +669,64 @@ mod tests {
                 size: 12_345,
             })
         );
+    }
+
+    #[test]
+    fn lfs_compatibility_forms_keep_the_version_first_and_exact() {
+        let digest = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut without_newline =
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:".to_vec();
+        without_newline.extend_from_slice(digest);
+        without_newline.extend_from_slice(b"\nsize 12345");
+        assert!(parse_lfs_pointer(&without_newline).is_some());
+
+        let mut legacy = b"version https://hawser.github.com/spec/v1\r\noid sha256:".to_vec();
+        legacy.extend_from_slice(digest);
+        legacy.extend_from_slice(b"\r\nsize 12345\r\n");
+        assert!(parse_lfs_pointer(&legacy).is_some());
+
+        for payload in [
+            b" version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1\n".as_slice(),
+            b"oid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nversion https://git-lfs.github.com/spec/v1\nsize 1\n",
+            b"version https://git-lfs.github.com/spec/v2\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1\n",
+        ] {
+            assert_eq!(parse_lfs_pointer(payload), None);
+        }
+    }
+
+    #[test]
+    fn lfs_metadata_keys_are_order_independent_and_duplicates_are_rejected() {
+        let reordered = b"version https://git-lfs.github.com/spec/v1\nsize 18446744073709551615\nx-extra future\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+        assert_eq!(
+            parse_lfs_pointer(reordered),
+            Some(LfsPointer {
+                oid: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                size: u64::MAX,
+            })
+        );
+
+        for payload in [
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1\n".as_slice(),
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1\nsize 2\n",
+        ] {
+            assert_eq!(parse_lfs_pointer(payload), None);
+        }
+    }
+
+    #[test]
+    fn lfs_pointer_recognition_is_capped_at_1024_bytes() {
+        fn pointer_of_size(size: usize) -> Vec<u8> {
+            let prefix = b"version https://git-lfs.github.com/spec/v1\nx-padding ";
+            let suffix = b"\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1\n";
+            let padding = size - prefix.len() - suffix.len();
+            let mut pointer = prefix.to_vec();
+            pointer.extend(std::iter::repeat_n(b'x', padding));
+            pointer.extend_from_slice(suffix);
+            pointer
+        }
+
+        assert!(parse_lfs_pointer(&pointer_of_size(1_024)).is_some());
+        assert_eq!(parse_lfs_pointer(&pointer_of_size(1_025)), None);
     }
 
     #[test]
@@ -792,7 +866,9 @@ mod tests {
             b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n".as_slice(),
             b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize nope\n",
             b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1\n",
-            b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1",
+            b"version https://git-lfs.github.com/spec/v1\noid sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1\n",
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 18446744073709551616\n",
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1\nbad_key value\n",
         ] {
             assert_eq!(parse_lfs_pointer(payload), None);
         }

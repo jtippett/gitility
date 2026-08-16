@@ -37,6 +37,7 @@ pub mod runtime;
 pub mod search;
 pub mod snapshot;
 pub mod static_odb;
+pub mod submodules;
 pub mod tree;
 pub mod verify;
 
@@ -85,5 +86,6 @@ pub use search::{
 };
 pub use snapshot::{open as open_snapshot, peel, PeelTarget, Snapshot};
 pub use static_odb::StaticOdb;
+pub use submodules::{submodules, Submodule, SubmoduleStatus};
 pub use tree::{list_tree, QueryStats, TreeItem, TreeItemKind, TreeOptions, TreePage, TypeFilter};
 pub use verify::verify;

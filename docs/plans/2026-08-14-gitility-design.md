@@ -1210,10 +1210,20 @@ offset  size  field
 11+D    2     generation length G    (u16 LE; 0 = no storage generation)
 13+D    G     storage generation bytes
 13+D+G  2     position length N      (u16 LE)
-15+D+G  N     position payload       (operation-specific; list_tree and
-                                      search: the raw path bytes of the
-                                      last emitted item, resumed by
+15+D+G  N     position payload       (operation-specific; list_tree:
+                                      the raw path bytes of the last
+                                      emitted entry, resumed by
                                       strictly-greater traversal order;
+                                      search: u32 LE match ordinal
+                                      within the file, then the raw
+                                      path bytes — resume emits that
+                                      path's matches strictly after
+                                      the ordinal, then strictly-greater
+                                      paths (amended 2026-08-16, before
+                                      any search cursor existed: a
+                                      path-only payload would drop the
+                                      rest of a file's matches at a
+                                      mid-file page boundary);
                                       log/history: last emitted commit
                                       digest)
 …       4     CRC32 (IEEE) of every preceding byte (LE)

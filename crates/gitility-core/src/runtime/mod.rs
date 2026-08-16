@@ -21,6 +21,7 @@ mod sync;
 pub mod thread_budget;
 
 use crate::budget::{Budget, BudgetLimits};
+use crate::diff::Diff;
 use crate::error::{Error, ErrorCode};
 use crate::file::FileRead;
 use crate::log::LogPage;
@@ -69,6 +70,7 @@ impl Default for RuntimeConfig {
 /// Stable result shapes retained by a completed job until result encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutput {
+    Diff(Diff),
     Tree(TreePage),
     Search(SearchPage),
     Log(LogPage),

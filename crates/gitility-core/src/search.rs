@@ -767,9 +767,7 @@ fn scan_blob(
         });
     };
     budget.check()?;
-    if opts.binary == SearchBinaryMode::Skip
-        && payload[..payload.len().min(BINARY_PROBE_BYTES)].contains(&0)
-    {
+    if opts.binary == SearchBinaryMode::Skip && is_binary_payload(&payload) {
         return Ok(ScannedBlob {
             scan: CachedScan::BinarySkipped,
             // Retained only until this candidate is accounted; the cache
@@ -782,6 +780,12 @@ fn scan_blob(
         scan: CachedScan::Matches(matches),
         payload: Some(payload),
     })
+}
+
+/// Git-compatible binary classification shared by search and diff: a NUL in
+/// the first 8000 bytes marks the payload binary.
+pub(crate) fn is_binary_payload(payload: &[u8]) -> bool {
+    payload[..payload.len().min(BINARY_PROBE_BYTES)].contains(&0)
 }
 
 /// Reads one blob payload through the graph seam. `ObjectTooLarge` is a skip

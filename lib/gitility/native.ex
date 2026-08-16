@@ -78,6 +78,20 @@ defmodule Gitility.Native do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  def job_submit_diff(
+        _runtime,
+        _base_resource,
+        _base_commit_oid,
+        _base_tree_oid,
+        _head_resource,
+        _head_commit_oid,
+        _head_tree_oid,
+        _opts,
+        _limits,
+        _detach
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def job_submit_merge_base(_runtime, _resource, _left, _right, _limits),
     do: :erlang.nif_error(:nif_not_loaded)
 

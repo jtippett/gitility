@@ -29,11 +29,17 @@ impl PathspecMatcher {
 
 /// Matches one raw-byte path with Git's path-aware wildmatch rules.
 ///
-/// A single `*` never crosses `/`; a path-positioned `**` may.
+/// A single `*` never crosses `/`; a path-positioned `**` may. The explicit
+/// `:(glob)` magic used by Git's CLI is accepted and selects these same
+/// path-aware glob rules.
 pub fn matches(pattern: &[u8], path: &[u8]) -> bool {
-    if !pattern
-        .iter()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+    let (pattern, force_glob) = pattern
+        .strip_prefix(b":(glob)")
+        .map_or((pattern, false), |pattern| (pattern, true));
+    if !force_glob
+        && !pattern
+            .iter()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'['))
     {
         return path == pattern
             || (path.starts_with(pattern) && path.get(pattern.len()) == Some(&b'/'));
@@ -74,5 +80,13 @@ mod tests {
         assert!(matcher.matches(b"lib/gitility.ex"));
         assert!(!matcher.matches(b"library"));
         assert!(!matcher.matches(b"src/lib"));
+    }
+
+    #[test]
+    fn explicit_glob_magic_is_supported() {
+        let matcher = PathspecMatcher::new(&[b":(glob)sub/**".to_vec()]);
+        assert!(matcher.matches(b"sub/file"));
+        assert!(matcher.matches(b"sub/deep/file"));
+        assert!(!matcher.matches(b"outside/file"));
     }
 }

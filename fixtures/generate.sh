@@ -11,7 +11,7 @@ corrupt_helper="$script_dir/corrupt.py"
 checksum_helper="$script_dir/checksums.py"
 generator_hash="$(git hash-object "$script_dir/generate.sh")"
 
-for command in awk cat chmod cmp cp dd env find git grep ln mkdir mktemp mv python3 rm seq; do
+for command in awk cat chmod cmp cp dd env find git grep ln mkdir mktemp mv python3 rm seq wc; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'error: fixture generation requires %s\n' "$command" >&2
     exit 1
@@ -548,6 +548,126 @@ make_search() {
   git -C "$bare_repository" fsck --full --strict --no-dangling >/dev/null
 }
 
+make_diff() {
+  local work_repository=$1
+  local bare_repository=$2
+  local base_normal
+  local head_normal
+  local base_tree
+  local head_tree
+  local base_tree_input
+  local head_tree_input
+  local raw_base_blob
+  local raw_head_blob
+  local augmented_base_tree
+  local augmented_head_tree
+  local base_commit
+  local head_commit
+  local line_number
+
+  init_work_repo "$work_repository" sha1
+  mkdir -p "$work_repository/dir/sub"
+
+  printf 'deleted in head\n' >"$work_repository/delete.txt"
+  : >"$work_repository/modify.txt"
+  for line_number in $(seq 1 32); do
+    printf 'stable middle line %02d\n' "$line_number" >>"$work_repository/modify.txt"
+  done
+  printf 'identical clean rename payload\n' >"$work_repository/rename-clean-old.txt"
+  : >"$work_repository/rename-edit-old.txt"
+  for line_number in $(seq 1 30); do
+    printf 'rename edit line %02d\n' "$line_number" >>"$work_repository/rename-edit-old.txt"
+  done
+  : >"$work_repository/rename-borderline-old.txt"
+  for line_number in $(seq 1 20); do
+    printf 'borderline original %02d\n' "$line_number" \
+      >>"$work_repository/rename-borderline-old.txt"
+  done
+  : >"$work_repository/copy-source.txt"
+  for line_number in $(seq 1 20); do
+    printf 'copy source line %02d\n' "$line_number" >>"$work_repository/copy-source.txt"
+  done
+  printf 'mode-only payload\n' >"$work_repository/mode-only.sh"
+  printf 'old regular-file target\n' >"$work_repository/type-change"
+  printf 'binary-before\000tail\n' >"$work_repository/binary.dat"
+  printf 'text before transition\n' >"$work_repository/text-to-binary.dat"
+  printf 'first\r\nsecond\r\nthird\r\n' >"$work_repository/crlf.txt"
+  printf 'first line\nold eof' >"$work_repository/eof-no-newline.txt"
+  printf 'scoped old\n' >"$work_repository/dir/sub/modified.txt"
+  printf 'scoped delete\n' >"$work_repository/dir/sub/deleted.txt"
+  commit_all_at "$work_repository" '2001-07-01T00:00:00+0000' \
+    'Structured diff base'
+  base_normal="$(git -C "$work_repository" rev-parse HEAD)"
+
+  printf 'added in head\n' >"$work_repository/add.txt"
+  rm "$work_repository/delete.txt"
+  awk '{ if (NR == 5) print "first separated replacement"; else if (NR == 27) print "second separated replacement"; else print }' \
+    "$work_repository/modify.txt" >"$scratch_dir/diff-modify.txt"
+  mv "$scratch_dir/diff-modify.txt" "$work_repository/modify.txt"
+  git -C "$work_repository" mv rename-clean-old.txt rename-clean-new.txt
+  git -C "$work_repository" mv rename-edit-old.txt rename-edit-new.txt
+  awk '{ if (NR == 10 || NR == 20) printf "rename EDIT line %02d\\n", NR; else print }' \
+    "$work_repository/rename-edit-new.txt" >"$scratch_dir/diff-rename-edit.txt"
+  mv "$scratch_dir/diff-rename-edit.txt" "$work_repository/rename-edit-new.txt"
+  git -C "$work_repository" mv rename-borderline-old.txt rename-borderline-new.txt
+  awk '{ if (NR <= 10) print; else printf "borderline replacement %02d\\n", NR }' \
+    "$work_repository/rename-borderline-new.txt" >"$scratch_dir/diff-borderline.txt"
+  mv "$scratch_dir/diff-borderline.txt" "$work_repository/rename-borderline-new.txt"
+  cp "$work_repository/copy-source.txt" "$work_repository/copy-near.txt"
+  printf 'copy source changed in place\n' >>"$work_repository/copy-source.txt"
+  chmod 755 "$work_repository/mode-only.sh"
+  rm "$work_repository/type-change"
+  ln -s 'new-symlink-target' "$work_repository/type-change"
+  printf 'binary-after\000tail\n' >"$work_repository/binary.dat"
+  printf 'now binary\000transition\n' >"$work_repository/text-to-binary.dat"
+  printf 'first\r\nSECOND\r\nthird\r\n' >"$work_repository/crlf.txt"
+  printf 'first line\nnew eof' >"$work_repository/eof-no-newline.txt"
+  : >"$work_repository/empty-added.txt"
+  printf 'scoped new\n' >"$work_repository/dir/sub/modified.txt"
+  rm "$work_repository/dir/sub/deleted.txt"
+  printf 'scoped add\n' >"$work_repository/dir/sub/added.txt"
+  commit_all_at "$work_repository" '2001-07-01T00:01:00+0000' \
+    'Structured diff head'
+  head_normal="$(git -C "$work_repository" rev-parse HEAD)"
+
+  base_tree="$(git -C "$work_repository" rev-parse "$base_normal^{tree}")"
+  head_tree="$(git -C "$work_repository" rev-parse "$head_normal^{tree}")"
+  raw_base_blob="$(printf 'latin-1 base caf\351\n' | git -C "$work_repository" hash-object -w --stdin)"
+  raw_head_blob="$(printf 'latin-1 head ol\351\n' | git -C "$work_repository" hash-object -w --stdin)"
+  base_tree_input="$scratch_dir/diff-base-tree"
+  head_tree_input="$scratch_dir/diff-head-tree"
+  git -C "$work_repository" ls-tree -z "$base_tree" >"$base_tree_input"
+  git -C "$work_repository" ls-tree -z "$head_tree" >"$head_tree_input"
+  printf '100644 blob %s\tlatin-\351-path.txt\000' "$raw_base_blob" >>"$base_tree_input"
+  printf '160000 commit %040d\tsubmodule-bumped\000' 1 >>"$base_tree_input"
+  printf '100644 blob %s\tlatin-\351-path.txt\000' "$raw_head_blob" >>"$head_tree_input"
+  printf '160000 commit %040d\tsubmodule-added\000' 2 >>"$head_tree_input"
+  printf '160000 commit %040d\tsubmodule-bumped\000' 3 >>"$head_tree_input"
+  augmented_base_tree="$(git -C "$work_repository" mktree --missing -z <"$base_tree_input")"
+  augmented_head_tree="$(git -C "$work_repository" mktree --missing -z <"$head_tree_input")"
+  base_commit="$(
+    env GIT_AUTHOR_DATE='2001-07-01T00:02:00+0000' \
+      GIT_COMMITTER_DATE='2001-07-01T00:02:00+0000' \
+      git -C "$work_repository" commit-tree "$augmented_base_tree" \
+      -m 'Augment structured diff base with raw and gitlink entries'
+  )"
+  head_commit="$(
+    env GIT_AUTHOR_DATE='2001-07-01T00:03:00+0000' \
+      GIT_COMMITTER_DATE='2001-07-01T00:03:00+0000' \
+      git -C "$work_repository" commit-tree "$augmented_head_tree" -p "$base_commit" \
+      -m 'Augment structured diff head with raw and gitlink entries'
+  )"
+  git -C "$work_repository" update-ref refs/heads/main "$head_commit" "$head_normal"
+  git -C "$work_repository" tag fixture/diff-base "$base_commit"
+  git -C "$work_repository" tag fixture/diff-head "$head_commit"
+
+  export_bare "$work_repository" "$bare_repository" sha1
+  git -C "$bare_repository" fsck --full --strict --no-dangling >/dev/null
+  test "$(git -C "$bare_repository" rev-parse fixture/diff-base)" = "$base_commit"
+  test "$(git -C "$bare_repository" rev-parse fixture/diff-head)" = "$head_commit"
+  test "$(git -C "$bare_repository" diff-tree -r --no-commit-id --name-only "$base_commit" "$head_commit" -- dir/sub | wc -l | awk '{ print $1 }')" = 3
+}
+
 sha1_work="$scratch_dir/sha1-basic-work"
 sha256_work="$scratch_dir/sha256-basic-work"
 history_work="$scratch_dir/sha1-history-work"
@@ -555,6 +675,7 @@ graph_work="$scratch_dir/sha1-graph-work"
 lfs_work="$scratch_dir/lfs-pointer-work"
 nested_work="$scratch_dir/sha1-nested-work"
 search_work="$scratch_dir/sha1-search-work"
+diff_work="$scratch_dir/sha1-diff-work"
 
 make_basic sha1 "$sha1_work" "$output_dir/sha1-basic.git"
 make_basic sha256 "$sha256_work" "$output_dir/sha256-basic.git"
@@ -563,6 +684,7 @@ make_graph "$graph_work" "$output_dir/sha1-graph.git"
 make_lfs_pointer "$lfs_work" "$output_dir/lfs-pointer.git"
 make_nested "$nested_work" "$output_dir/sha1-nested.git"
 make_search "$search_work" "$output_dir/sha1-search.git"
+make_diff "$diff_work" "$output_dir/sha1-diff.git"
 
 # Fully packed and deliberately mixed object layouts.
 cp -R "$output_dir/sha1-basic.git" "$output_dir/sha1-basic-packed.git"
@@ -738,6 +860,8 @@ graph_head="$(git -C "$output_dir/sha1-graph.git" rev-parse HEAD)"
 lfs_head="$(git -C "$output_dir/lfs-pointer.git" rev-parse HEAD)"
 nested_head="$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD)"
 search_head="$(git -C "$output_dir/sha1-search.git" rev-parse HEAD)"
+diff_base="$(git -C "$output_dir/sha1-diff.git" rev-parse fixture/diff-base)"
+diff_head="$(git -C "$output_dir/sha1-diff.git" rev-parse fixture/diff-head)"
 
 {
   printf 'git_version=%s\n' "$git_version"
@@ -771,6 +895,8 @@ search_head="$(git -C "$output_dir/sha1-search.git" rev-parse HEAD)"
   printf 'lfs_pointer_head=%s\n' "$lfs_head"
   printf 'sha1_nested_head=%s\n' "$nested_head"
   printf 'sha1_search_head=%s\n' "$search_head"
+  printf 'sha1_diff_base=%s\n' "$diff_base"
+  printf 'sha1_diff_head=%s\n' "$diff_head"
   printf 'sha1_nested_root_txt=%s\n' \
     "$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD:root.txt)"
   printf 'sha1_nested_deep_txt=%s\n' \

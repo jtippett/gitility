@@ -3,6 +3,7 @@ defmodule Gitility.NativeSupport do
 
   alias Gitility.{
     Commit,
+    Diff,
     Error,
     File,
     Identity,
@@ -273,6 +274,15 @@ defmodule Gitility.NativeSupport do
     }
   end
 
+  def job_payload(%{files: files, stats: stats, warnings: warnings, truncated: truncated}) do
+    %Diff{
+      files: Enum.map(files, &diff_file_payload/1),
+      stats: struct!(Stats, Map.to_list(stats)),
+      warnings: warnings,
+      truncated: truncated
+    }
+  end
+
   def job_payload(payload), do: payload
 
   def invalid_argument(message), do: {:error, Error.new(:invalid_argument, message)}
@@ -295,6 +305,42 @@ defmodule Gitility.NativeSupport do
       time: identity.time,
       tz: identity.tz,
       tz_offset_minutes: identity.tz_offset_minutes
+    }
+  end
+
+  defp diff_file_payload(file) do
+    %Diff.File{
+      status: file.status,
+      old_path: file.old_path,
+      new_path: file.new_path,
+      old_oid: if(file.old_oid, do: job_oid(file.old_oid)),
+      new_oid: if(file.new_oid, do: job_oid(file.new_oid)),
+      old_mode: file.old_mode,
+      new_mode: file.new_mode,
+      similarity: file.similarity,
+      additions: file.additions,
+      deletions: file.deletions,
+      binary: file.binary,
+      hunks: Enum.map(file.hunks, &diff_hunk_payload/1)
+    }
+  end
+
+  defp diff_hunk_payload(hunk) do
+    %Diff.Hunk{
+      old_start: hunk.old_start,
+      old_lines: hunk.old_lines,
+      new_start: hunk.new_start,
+      new_lines: hunk.new_lines,
+      header: hunk.header,
+      lines:
+        Enum.map(hunk.lines, fn line ->
+          %Diff.Line{
+            origin: line.origin,
+            content: line.content,
+            old_line: line.old_line,
+            new_line: line.new_line
+          }
+        end)
     }
   end
 

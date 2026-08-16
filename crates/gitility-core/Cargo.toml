@@ -10,12 +10,14 @@ rust-version.workspace = true
 # cargo-public-api installed; its rustdoc JSON input currently needs nightly.
 bstr = { version = "=1.13.1", default-features = false, features = ["std"] }
 gix-config = { version = "=0.59.0", default-features = false }
+gix-diff = { path = "vendor/gix-diff", version = "=0.66.0", default-features = false, features = ["blob", "sha1", "sha256"] }
 gix-glob = { version = "=0.27.0", default-features = false }
 gix-hash = { version = "=0.26.0", default-features = false, features = ["sha1", "sha256"] }
 gix-object = { version = "=0.63.0", default-features = false, features = ["sha1", "sha256"] }
 gix-odb = { version = "=0.83.0", default-features = false, features = ["sha1", "sha256"] }
 gix-revision = { version = "=0.48.0", default-features = false, features = ["merge_base", "sha1"] }
 gix-traverse = { version = "=0.60.0", default-features = false, features = ["sha1"] }
+gix-worktree = { version = "=0.55.0", default-features = false, features = ["attributes"] }
 regex = { version = "=1.13.1", default-features = false, features = ["std"] }
 sha1-checked = { version = "=0.10.0", default-features = false }
 sha2 = { version = "=0.11.0", default-features = false }

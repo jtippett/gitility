@@ -8,17 +8,18 @@
 
 use gitility_core::runtime::thread_budget;
 use gitility_core::{
-    is_ancestor as core_is_ancestor, list_tree as core_list_tree, log as core_log,
-    merge_base as core_merge_base, peel as core_peel, read_file as core_read_file,
+    diff as core_diff, is_ancestor as core_is_ancestor, list_tree as core_list_tree,
+    log as core_log, merge_base as core_merge_base, peel as core_peel, read_file as core_read_file,
     search as core_search, Budget, BudgetLimits, BusyReason, ByteRange as CoreByteRange,
-    CacheOptions, CacheStats, CallbackRangeTransport, Error, ErrorCode, FileKind, FileOptions,
-    HashKind, HydrationStats, Job as CoreJob, JobObserver, JobOutput, JobSpec, JobState,
-    LayeredOdb, LocalOdb, LocalOdbOptions, LogIdentity, LogOptions, LogOrder, ObjectDb,
-    ObjectHeader, ObjectKind, ObjectReadResult, Oid, PackDescriptor, PackFetchOdb,
-    PackFetchOptions, PackManifest, PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind,
-    ProviderOdb, ProviderOptions, ProviderPayload, ProviderReplyValue, ProviderRequest,
-    ProviderTransport, QueryStats, RangePayload, RangePendingTable, RangeRequest, RangeRequestKind,
-    RangeRequestSender, ReadManyBudget, Runtime as CoreRuntime, RuntimeConfig, SearchBinaryMode,
+    CacheOptions, CacheStats, CallbackRangeTransport, DiffFormat, DiffLineOrigin, DiffOptions,
+    DiffStatus, DiffWarningCode, Error, ErrorCode, FileKind, FileOptions, HashKind, HydrationStats,
+    Job as CoreJob, JobObserver, JobOutput, JobSpec, JobState, LayeredOdb, LocalOdb,
+    LocalOdbOptions, LogIdentity, LogOptions, LogOrder, ObjectDb, ObjectHeader, ObjectKind,
+    ObjectReadResult, Oid, PackDescriptor, PackFetchOdb, PackFetchOptions, PackManifest,
+    PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions,
+    ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport, QueryStats,
+    RangePayload, RangePendingTable, RangeRequest, RangeRequestKind, RangeRequestSender,
+    ReadManyBudget, RenameTracking, Runtime as CoreRuntime, RuntimeConfig, SearchBinaryMode,
     SearchMode, SearchOptions, Snapshot, StaticOdb, SubmitError, TreeItemKind, TreeOptions,
     TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
 };
@@ -672,6 +673,15 @@ struct SearchOptionsMap<'a> {
 }
 
 #[derive(NifMap)]
+struct DiffOptionsMap<'a> {
+    format: Atom,
+    pathspecs: Vec<Binary<'a>>,
+    context_lines: u32,
+    renames: bool,
+    copies: bool,
+}
+
+#[derive(NifMap)]
 struct ErrorMap<'a> {
     code: Atom,
     message: String,
@@ -769,6 +779,46 @@ struct SearchMatchMap<'a> {
 }
 
 #[derive(NifMap)]
+struct DiffLineMap<'a> {
+    origin: Atom,
+    content: Binary<'a>,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+}
+
+#[derive(NifMap)]
+struct DiffHunkMap<'a> {
+    old_start: u32,
+    old_lines: u32,
+    new_start: u32,
+    new_lines: u32,
+    header: Option<Binary<'a>>,
+    lines: Vec<DiffLineMap<'a>>,
+}
+
+#[derive(NifMap)]
+struct DiffFileMap<'a> {
+    status: Atom,
+    old_path: Option<Binary<'a>>,
+    new_path: Option<Binary<'a>>,
+    old_oid: Option<Binary<'a>>,
+    new_oid: Option<Binary<'a>>,
+    old_mode: Option<u32>,
+    new_mode: Option<u32>,
+    similarity: Option<u8>,
+    additions: Option<u32>,
+    deletions: Option<u32>,
+    binary: bool,
+    hunks: Vec<DiffHunkMap<'a>>,
+}
+
+#[derive(NifMap)]
+struct DiffWarningMap {
+    code: Atom,
+    message: String,
+}
+
+#[derive(NifMap)]
 struct StatsMap {
     objects_requested: u64,
     objects_read: u64,
@@ -836,6 +886,14 @@ struct SearchPageMap<'a> {
     next_cursor: Option<Binary<'a>>,
     truncated: bool,
     stats: StatsMap,
+}
+
+#[derive(NifMap)]
+struct DiffMap<'a> {
+    files: Vec<DiffFileMap<'a>>,
+    stats: StatsMap,
+    warnings: Vec<DiffWarningMap>,
+    truncated: bool,
 }
 
 #[derive(NifMap)]
@@ -2223,6 +2281,123 @@ fn job_submit_log<'a>(
 }
 
 #[rustler::nif]
+#[allow(clippy::too_many_arguments)]
+fn job_submit_diff<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    base_store: ResourceArc<StoreResource>,
+    base_commit_oid: Binary<'a>,
+    base_tree_oid: Binary<'a>,
+    head_store: ResourceArc<StoreResource>,
+    head_commit_oid: Binary<'a>,
+    head_tree_oid: Binary<'a>,
+    opts: DiffOptionsMap<'a>,
+    limits: LimitsMap,
+    detach: bool,
+) -> NifResult<Term<'a>> {
+    if base_store.0.as_dyn().hash_kind() != head_store.0.as_dyn().hash_kind() {
+        let error = Error::new(
+            ErrorCode::HashMismatch,
+            "diff object stores use different hash algorithms",
+        );
+        return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+    }
+    let base_commit_oid = match oid_for_store(&base_store, base_commit_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let base_tree_oid = match oid_for_store(&base_store, base_tree_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let head_commit_oid = match oid_for_store(&head_store, head_commit_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let head_tree_oid = match oid_for_store(&head_store, head_tree_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let format = match parse_diff_format(opts.format) {
+        Ok(format) => format,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let max_diff_files = match usize::try_from(limits.max_diff_files) {
+        Ok(value) => value,
+        Err(_) => {
+            let error = Error::new(ErrorCode::InvalidArgument, "max_diff_files is too large");
+            return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+        }
+    };
+    let max_diff_hunks = match usize::try_from(limits.max_diff_hunks) {
+        Ok(value) => value,
+        Err(_) => {
+            let error = Error::new(ErrorCode::InvalidArgument, "max_diff_hunks is too large");
+            return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+        }
+    };
+    let max_diff_lines = match usize::try_from(limits.max_diff_lines) {
+        Ok(value) => value,
+        Err(_) => {
+            let error = Error::new(ErrorCode::InvalidArgument, "max_diff_lines is too large");
+            return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+        }
+    };
+    let options = DiffOptions {
+        format,
+        pathspecs: opts
+            .pathspecs
+            .iter()
+            .map(|pathspec| pathspec.as_slice().to_vec())
+            .collect(),
+        context_lines: opts.context_lines,
+        renames: if opts.renames {
+            RenameTracking::Similarity
+        } else {
+            RenameTracking::Disabled
+        },
+        copies: opts.copies,
+        max_diff_files,
+        max_diff_hunks,
+        max_diff_lines,
+        max_object_bytes: limits.max_object_bytes,
+    };
+    let task_base_store = base_store.clone();
+    let task_head_store = head_store.clone();
+    let task = Box::new(move |budget: &Budget| {
+        core_diff(
+            task_base_store.0.as_dyn(),
+            &Snapshot {
+                commit_oid: base_commit_oid,
+                tree_oid: base_tree_oid,
+            },
+            task_head_store.0.as_dyn(),
+            &Snapshot {
+                commit_oid: head_commit_oid,
+                tree_oid: head_tree_oid,
+            },
+            &options,
+            budget,
+        )
+        .map(JobOutput::Diff)
+    });
+    // Diff turns max_object_bytes into a successful suppression warning. A
+    // provider may understate its header, so payload reads must reach core for
+    // a second check against the semantic value retained in `options`.
+    let mut core_limits = budget_limits(limits);
+    core_limits.max_object_bytes = u64::MAX;
+    submit_job(
+        env,
+        runtime,
+        detach,
+        limits,
+        core_limits,
+        JobResultKind::Other,
+        task,
+    )
+}
+
+#[rustler::nif]
 fn job_submit_merge_base<'a>(
     env: Env<'a>,
     runtime: ResourceArc<RuntimeResource>,
@@ -2474,6 +2649,57 @@ fn encode_job_output<'a>(
     provider_spend: (u64, u64, u64, u64),
 ) -> NifResult<Term<'a>> {
     let term = match output {
+        JobOutput::Diff(diff) => DiffMap {
+            files: diff
+                .files
+                .into_iter()
+                .map(|file| DiffFileMap {
+                    status: diff_status_atom(file.status),
+                    old_path: file.old_path.map(|path| binary(env, &path)),
+                    new_path: file.new_path.map(|path| binary(env, &path)),
+                    old_oid: file.old_oid.map(|oid| binary(env, oid.as_bytes())),
+                    new_oid: file.new_oid.map(|oid| binary(env, oid.as_bytes())),
+                    old_mode: file.old_mode,
+                    new_mode: file.new_mode,
+                    similarity: file.similarity,
+                    additions: file.additions,
+                    deletions: file.deletions,
+                    binary: file.binary,
+                    hunks: file
+                        .hunks
+                        .into_iter()
+                        .map(|hunk| DiffHunkMap {
+                            old_start: hunk.old_start,
+                            old_lines: hunk.old_lines,
+                            new_start: hunk.new_start,
+                            new_lines: hunk.new_lines,
+                            header: hunk.header.map(|header| binary(env, &header)),
+                            lines: hunk
+                                .lines
+                                .into_iter()
+                                .map(|line| DiffLineMap {
+                                    origin: diff_line_origin_atom(line.origin),
+                                    content: binary(env, &line.content),
+                                    old_line: line.old_line,
+                                    new_line: line.new_line,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            stats: stats_map(diff.stats, elapsed_ms, atoms::limit(), provider_spend),
+            warnings: diff
+                .warnings
+                .into_iter()
+                .map(|warning| DiffWarningMap {
+                    code: diff_warning_atom(warning.code),
+                    message: warning.message,
+                })
+                .collect(),
+            truncated: diff.truncated,
+        }
+        .encode(env),
         JobOutput::Tree(page) => {
             let entries = page
                 .entries
@@ -2655,6 +2881,32 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
     }
 
     match output {
+        JobOutput::Diff(diff) => diff.files.iter().fold(0u64, |total, file| {
+            let hunks = file.hunks.iter().fold(0u64, |hunk_total, hunk| {
+                let lines = hunk.lines.iter().fold(0u64, |line_total, line| {
+                    line_total.saturating_add(length(&line.content))
+                });
+                hunk_total
+                    .saturating_add(hunk.header.as_deref().map(length).unwrap_or(0))
+                    .saturating_add(lines)
+            });
+            total
+                .saturating_add(file.old_path.as_deref().map(length).unwrap_or(0))
+                .saturating_add(file.new_path.as_deref().map(length).unwrap_or(0))
+                .saturating_add(
+                    file.old_oid
+                        .as_ref()
+                        .map(|oid| length(oid.as_bytes()))
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    file.new_oid
+                        .as_ref()
+                        .map(|oid| length(oid.as_bytes()))
+                        .unwrap_or(0),
+                )
+                .saturating_add(hunks)
+        }),
         JobOutput::Tree(page) => page.entries.iter().fold(
             page.next_cursor.as_deref().map(length).unwrap_or(0),
             |total, entry| {
@@ -2964,6 +3216,21 @@ fn parse_search_binary_mode(mode: Atom) -> Result<SearchBinaryMode, Error> {
     }
 }
 
+fn parse_diff_format(format: Atom) -> Result<DiffFormat, Error> {
+    if format == atoms::summary() {
+        Ok(DiffFormat::Summary)
+    } else if format == atoms::stats() {
+        Ok(DiffFormat::Stats)
+    } else if format == atoms::patch() {
+        Ok(DiffFormat::Patch)
+    } else {
+        Err(Error::new(
+            ErrorCode::InvalidArgument,
+            "diff format must be summary, stats, or patch",
+        ))
+    }
+}
+
 fn type_filter(types: &[Atom]) -> Result<TypeFilter, Error> {
     let mut filter = TypeFilter::NONE;
     for kind in types {
@@ -3024,6 +3291,32 @@ fn file_kind_atom(kind: FileKind) -> Atom {
         FileKind::Binary => atoms::binary(),
         FileKind::Symlink => atoms::symlink(),
         FileKind::Gitlink => atoms::gitlink(),
+    }
+}
+
+fn diff_status_atom(status: DiffStatus) -> Atom {
+    match status {
+        DiffStatus::Added => atoms::added(),
+        DiffStatus::Deleted => atoms::deleted(),
+        DiffStatus::Modified => atoms::modified(),
+        DiffStatus::Renamed => atoms::renamed(),
+        DiffStatus::Copied => atoms::copied(),
+        DiffStatus::TypeChanged => atoms::type_changed(),
+    }
+}
+
+fn diff_line_origin_atom(origin: DiffLineOrigin) -> Atom {
+    match origin {
+        DiffLineOrigin::Context => atoms::context(),
+        DiffLineOrigin::Addition => atoms::addition(),
+        DiffLineOrigin::Deletion => atoms::deletion(),
+    }
+}
+
+fn diff_warning_atom(code: DiffWarningCode) -> Atom {
+    match code {
+        DiffWarningCode::Truncated => atoms::truncated(),
+        DiffWarningCode::OversizeSkipped => atoms::oversize_skipped(),
     }
 }
 
@@ -3140,7 +3433,21 @@ mod atoms {
         regex,
         skip,
         text,
+        summary,
+        stats,
+        patch,
         binary,
+        added,
+        deleted,
+        modified,
+        renamed,
+        copied,
+        type_changed,
+        context,
+        addition,
+        deletion,
+        truncated,
+        oversize_skipped,
         header,
         object,
         prefetch,

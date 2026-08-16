@@ -202,6 +202,54 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
+  @doc "Runs `git diff-tree` with a NUL-delimited raw change stream."
+  @spec diff_tree_raw(Path.t(), binary(), binary(), [binary()], [binary()]) :: result([map()])
+  def diff_tree_raw(repository, left, right, options \\ [], pathspecs \\ []) do
+    arguments =
+      ["diff-tree", "-r", "--no-commit-id", "--raw", "-z", "--no-abbrev", "--no-ext-diff"] ++
+        options ++ [left, right] ++ nul_pathspec_arguments(pathspecs)
+
+    with {:ok, output} <- git(repository, arguments) do
+      output
+      |> nul_fields()
+      |> parse_raw_changes([])
+    end
+  end
+
+  @doc "Runs `git diff --numstat -z` and preserves raw path bytes."
+  @spec diff_numstat(Path.t(), binary(), binary(), [binary()], [binary()]) :: result([map()])
+  def diff_numstat(repository, left, right, options \\ [], pathspecs \\ []) do
+    arguments =
+      ["diff", "--numstat", "-z", "--no-ext-diff"] ++
+        options ++ [left, right] ++ nul_pathspec_arguments(pathspecs)
+
+    with {:ok, output} <- git(repository, arguments) do
+      parse_records(output, &parse_numstat_record/1)
+    end
+  end
+
+  @doc "Runs histogram diff for one raw-byte path and returns structured hunks."
+  @spec diff_hunks(Path.t(), binary(), binary(), binary(), 0..32) :: result([map()])
+  def diff_hunks(repository, left, right, path, context_lines) do
+    arguments = [
+      "diff",
+      "-p",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-renames",
+      "--diff-algorithm=histogram",
+      "-U#{context_lines}",
+      left,
+      right,
+      "--",
+      path
+    ]
+
+    with {:ok, output} <- git(repository, arguments) do
+      parse_patch_hunks(output)
+    end
+  end
+
   @spec diff_patch(Path.t(), binary(), binary(), [binary()]) :: result(binary())
   def diff_patch(repository, left, right, options \\ []) do
     git(
@@ -404,6 +452,100 @@ defmodule Gitility.Differential.Oracle do
   # Git's default wildmatch lets `*` cross `/`; Gitility deliberately uses
   # glob magic, so an unprefixed `*.txt` would be a false-positive oracle.
   defp pathspec_arguments(pathspecs), do: ["--" | Enum.map(pathspecs, &(":(glob)" <> &1))]
+
+  defp nul_pathspec_arguments([]), do: []
+  defp nul_pathspec_arguments(pathspecs), do: ["--" | pathspecs]
+
+  defp parse_numstat_record(record) do
+    with {:ok, additions, rest} <- take_field(record, ?\t),
+         {:ok, deletions, path} <- take_field(rest, ?\t),
+         {:ok, additions} <- parse_numstat_count(additions),
+         {:ok, deletions} <- parse_numstat_count(deletions) do
+      {:ok, %{path: path, additions: additions, deletions: deletions}}
+    else
+      _ -> {:error, "malformed git diff --numstat record: #{inspect(record)}"}
+    end
+  end
+
+  defp parse_numstat_count(<<"-">>), do: {:ok, nil}
+
+  defp parse_numstat_count(value) do
+    case Integer.parse(value) do
+      {count, ""} when count >= 0 -> {:ok, count}
+      _ -> {:error, :invalid_count}
+    end
+  end
+
+  defp parse_patch_hunks(output) do
+    output
+    |> :binary.split(<<"\n">>, [:global])
+    |> Enum.reduce({[], nil}, &parse_patch_line/2)
+    |> then(fn {hunks, current} ->
+      {:ok, hunks |> maybe_finish_hunk(current) |> Enum.reverse()}
+    end)
+  end
+
+  defp parse_patch_line(<<"@@ ", _rest::binary>> = line, {hunks, current}) do
+    hunks = maybe_finish_hunk(hunks, current)
+
+    case Regex.run(~r/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/, line) do
+      [_, old_start, old_lines, new_start, new_lines] ->
+        old_lines = if old_lines == "", do: "1", else: old_lines
+        new_lines = if new_lines == "", do: "1", else: new_lines
+        {hunks, new_patch_hunk(old_start, old_lines, new_start, new_lines)}
+
+      _ ->
+        raise "malformed git patch hunk header: #{inspect(line)}"
+    end
+  end
+
+  defp parse_patch_line(<<"\\ No newline at end of file">>, state), do: state
+
+  defp parse_patch_line(<<origin, content::binary>>, {hunks, current})
+       when origin in [?\s, ?+, ?-] and not is_nil(current) do
+    {line_origin, old_line, new_line, next_old, next_new} =
+      case origin do
+        ?\s -> {:context, current.old_line, current.new_line, 1, 1}
+        ?+ -> {:addition, nil, current.new_line, 0, 1}
+        ?- -> {:deletion, current.old_line, nil, 1, 0}
+      end
+
+    line = %{origin: line_origin, content: content, old_line: old_line, new_line: new_line}
+
+    current = %{
+      current
+      | old_line: current.old_line + next_old,
+        new_line: current.new_line + next_new,
+        lines: [line | current.lines]
+    }
+
+    {hunks, current}
+  end
+
+  defp parse_patch_line(_metadata, state), do: state
+
+  defp new_patch_hunk(old_start, old_lines, new_start, new_lines) do
+    %{
+      old_start: String.to_integer(old_start),
+      old_lines: String.to_integer(old_lines),
+      new_start: String.to_integer(new_start),
+      new_lines: String.to_integer(new_lines),
+      old_line: String.to_integer(old_start),
+      new_line: String.to_integer(new_start),
+      lines: []
+    }
+  end
+
+  defp maybe_finish_hunk(hunks, nil), do: hunks
+
+  defp maybe_finish_hunk(hunks, hunk) do
+    [
+      hunk
+      |> Map.take([:old_start, :old_lines, :new_start, :new_lines, :lines])
+      |> Map.update!(:lines, &Enum.reverse/1)
+      | hunks
+    ]
+  end
 
   defp parse_raw_changes([], changes), do: {:ok, Enum.reverse(changes)}
 

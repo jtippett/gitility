@@ -283,14 +283,28 @@ defmodule Gitility do
     * `:format` — `:summary`, `:stats`, or `:patch` (default `:patch`).
     * `:pathspecs` — glob patterns limiting the diff.
     * `:context_lines` — context per hunk (default `3`).
-    * `:renames` — `:none` | `:exact` | `:similarity` (default `:similarity`).
-    * `:copies` — also detect copies (default `false`).
+    * `:renames` — `false` (default) or `:similarity`. Rename detection is
+      opt-in because it reads candidate payloads.
+    * `:copies` — also detect copies from the changed-path candidate set
+      (default `false`); this does not perform `--find-copies-harder`.
     * `:limits` — a `Gitility.Limits` override.
   """
   @spec diff(Snapshot.t(), Snapshot.t(), keyword()) :: {:ok, Diff.t()} | {:error, Error.t()}
-  def diff(base_snapshot, head_snapshot, opts \\ []) do
-    _ = {base_snapshot, head_snapshot, opts}
-    NotImplementedError.stub!(:"diff/3", "Milestone 3")
+  def diff(base_snapshot, head_snapshot, opts \\ [])
+
+  def diff(%Snapshot{} = base_snapshot, %Snapshot{} = head_snapshot, opts) do
+    {opts, limits} = diff_options!(opts)
+
+    NativeSupport.await_sync(
+      fn -> submit_diff(base_snapshot, head_snapshot, opts, limits, false) end,
+      limits.timeout_ms,
+      :diff
+    )
+  end
+
+  def diff(_base_snapshot, _head_snapshot, _opts) do
+    {:error,
+     Error.new(:invalid_argument, "expected two Gitility.Snapshot values", operation: :diff)}
   end
 
   @doc """
@@ -586,6 +600,22 @@ defmodule Gitility do
   defp validate_search_context_lines(_lines),
     do: raise(ArgumentError, ":context_lines must be an integer")
 
+  defp validate_diff_format(format) when format in [:summary, :stats, :patch], do: {:ok, format}
+
+  defp validate_diff_format(format) when is_atom(format),
+    do: NativeSupport.invalid_argument(":format must be :summary, :stats, or :patch")
+
+  defp validate_diff_format(_format), do: raise(ArgumentError, ":format must be an atom")
+
+  defp validate_diff_renames(false), do: {:ok, false}
+  defp validate_diff_renames(:similarity), do: {:ok, true}
+
+  defp validate_diff_renames(value) when is_atom(value),
+    do: NativeSupport.invalid_argument(":renames must be false or :similarity")
+
+  defp validate_diff_renames(_value),
+    do: raise(ArgumentError, ":renames must be false or :similarity")
+
   defp validate_log_time(nil, _key), do: {:ok, nil}
   defp validate_log_time(%DateTime{} = value, _key), do: {:ok, DateTime.to_unix(value)}
   defp validate_log_time(value, _key) when is_integer(value), do: {:ok, value}
@@ -691,6 +721,22 @@ defmodule Gitility do
       )
 
     limits = opts[:limits] || Limits.new()
+    {opts, limits}
+  end
+
+  defp diff_options!(opts) do
+    opts =
+      Keyword.validate!(opts,
+        format: :patch,
+        pathspecs: [],
+        context_lines: 3,
+        renames: false,
+        copies: false,
+        limits: nil
+      )
+
+    limits = opts[:limits] || Limits.new()
+    _limits_map = NativeSupport.limits_map!(limits)
     {opts, limits}
   end
 
@@ -818,6 +864,69 @@ defmodule Gitility do
     end
   end
 
+  defp submit_diff(
+         %Snapshot{
+           odb: %ODB{ref: base_resource, hash: base_hash, runtime: base_runtime}
+         } = base,
+         %Snapshot{
+           odb: %ODB{ref: head_resource, hash: head_hash, runtime: head_runtime}
+         } = head,
+         opts,
+         limits,
+         detach
+       ) do
+    limits_map = NativeSupport.limits_map!(limits)
+    copies = NativeSupport.boolean_option!(opts, :copies)
+
+    with :ok <- validate_diff_runtime(base_runtime, head_runtime),
+         :ok <- validate_diff_hash(base_hash, head_hash),
+         {:ok, format} <- validate_diff_format(opts[:format]),
+         {:ok, pathspecs} <- validate_pathspecs(opts[:pathspecs]),
+         {:ok, context_lines} <- validate_search_context_lines(opts[:context_lines]),
+         {:ok, renames} <- validate_diff_renames(opts[:renames]),
+         :ok <- validate_diff_copies(copies, renames) do
+      NativeSupport.submit_job(base_runtime, :diff, fn runtime_resource ->
+        Native.job_submit_diff(
+          runtime_resource,
+          base_resource,
+          base.commit_oid.bytes,
+          base.tree_oid.bytes,
+          head_resource,
+          head.commit_oid.bytes,
+          head.tree_oid.bytes,
+          %{
+            format: format,
+            pathspecs: pathspecs,
+            context_lines: context_lines,
+            renames: renames,
+            copies: copies
+          },
+          limits_map,
+          detach
+        )
+      end)
+    end
+  end
+
+  defp validate_diff_runtime(runtime, runtime), do: :ok
+
+  defp validate_diff_runtime(_base, _head) do
+    {:error, Error.new(:runtime_mismatch, "diff snapshots use different runtimes")}
+  end
+
+  defp validate_diff_hash(hash, hash), do: :ok
+
+  defp validate_diff_hash(_base, _head) do
+    {:error, Error.new(:hash_mismatch, "diff snapshots use different hash algorithms")}
+  end
+
+  defp validate_diff_copies(false, _renames), do: :ok
+  defp validate_diff_copies(true, true), do: :ok
+
+  defp validate_diff_copies(true, false) do
+    NativeSupport.invalid_argument(":copies true requires :renames to be :similarity")
+  end
+
   defp submit_read_file(
          %Snapshot{odb: %ODB{ref: resource, runtime: runtime}} = snapshot,
          path,
@@ -905,9 +1014,28 @@ defmodule Gitility do
   @doc "Asynchronous `diff/3`; returns the `Gitility.Job`."
   @spec async_diff(Snapshot.t(), Snapshot.t(), keyword()) ::
           {:ok, Job.t()} | {:error, Error.t()}
-  def async_diff(base_snapshot, head_snapshot, opts \\ []) do
-    _ = {base_snapshot, head_snapshot, opts}
-    NotImplementedError.stub!(:"async_diff/3", "Milestone 3")
+  def async_diff(base_snapshot, head_snapshot, opts \\ [])
+
+  def async_diff(%Snapshot{} = base_snapshot, %Snapshot{} = head_snapshot, opts) do
+    opts =
+      Keyword.validate!(opts,
+        format: :patch,
+        pathspecs: [],
+        context_lines: 3,
+        renames: false,
+        copies: false,
+        limits: nil,
+        detach: false
+      )
+
+    detach = NativeSupport.boolean_option!(opts, :detach)
+    {opts, limits} = opts |> Keyword.delete(:detach) |> diff_options!()
+    submit_diff(base_snapshot, head_snapshot, opts, limits, detach)
+  end
+
+  def async_diff(_base_snapshot, _head_snapshot, _opts) do
+    {:error,
+     Error.new(:invalid_argument, "expected two Gitility.Snapshot values", operation: :diff)}
   end
 
   @doc "Asynchronous `blame/3`; returns the `Gitility.Job`."

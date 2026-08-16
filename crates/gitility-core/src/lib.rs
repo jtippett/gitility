@@ -17,6 +17,7 @@ pub mod budget;
 mod commit_graph;
 pub mod cursor;
 pub mod decode;
+pub mod diff;
 pub mod error;
 pub mod file;
 pub mod layered_odb;
@@ -44,6 +45,10 @@ pub use budget::{Budget, BudgetLimits};
 pub use cursor::{decode as decode_cursor, encode as encode_cursor, Cursor, CursorExpected};
 pub use decode::{
     decode_commit, decode_tag, decode_tree, Commit, Identity, Tag, TreeEntry, TreeIter,
+};
+pub use diff::{
+    diff, Diff, DiffFile, DiffFormat, DiffHunk, DiffLine, DiffLineOrigin, DiffOptions, DiffStatus,
+    DiffWarning, DiffWarningCode, RenameTracking,
 };
 pub use error::{Error, ErrorCode};
 pub use file::{read_file, FileKind, FileOptions, FileRead, LfsPointer};

@@ -23,3 +23,10 @@ for the certified ASCII folding cases, `-I` for the default binary policy, and
 `-a` for `binary: :text`. Regex search is intentionally Rust-unit-tested rather
 than compared here because Git and `regex::bytes` accept different pattern
 classes.
+
+Structured-diff parity uses NUL-delimited `git diff-tree --raw -z` and
+`git diff --numstat -z` streams for every file path. Patch comparisons first
+obtain those raw paths and invoke one histogram diff per path, so patch headers
+are never used as a path parser. Rename/copy candidate selection may differ
+between Git and gitoxide; every exact differing case must be triaged rather
+than normalized in the adapter.

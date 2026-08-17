@@ -63,7 +63,10 @@ CREATE TABLE gitility_chunks (
   seq     INTEGER NOT NULL,             -- 0-based
   bytes   BLOB NOT NULL,
   PRIMARY KEY (file_id, seq)
-) WITHOUT ROWID;
+);
+-- This is intentionally an ordinary rowid table. The implicit rowid is an
+-- implementation handle for incremental Blob I/O; it is not a logical format
+-- field and publishers/readers must resolve it from (file_id, seq).
 -- Chunk size: exactly 1 MiB (1_048_576 bytes) for every chunk except
 -- the last of a file, which is 1..1_048_576 bytes. Readers MUST verify
 -- chunk-count and byte-size consistency (byte_size vs sum of lengths)
@@ -107,7 +110,9 @@ CREATE TABLE gitility_refs (
   SQLite's own durability (writer uses journal_mode=WAL during build,
   then `PRAGMA wal_checkpoint(TRUNCATE)` + journal_mode=DELETE before
   handing the file off, so the artifact is a SINGLE file with no -wal
-  sidecar — an S3 upload is one object).
+  sidecar — an S3 upload is one object). With turso_core 0.7.2 the
+  rusqlite fallback performs the DELETE-mode finalization because Turso
+  supports only WAL/MVCC and leaves a zero-byte WAL after TRUNCATE.
 - page_size fixed at 4096 (recorded; changing it is a major bump).
 - Logical determinism: identical input (packs, refs, metadata) yields
   identical LOGICAL content (row sets); byte-identical FILES are not
@@ -121,8 +126,9 @@ CREATE TABLE gitility_refs (
 - Open: sniff application_id/user_version → read gitility_metadata →
   cross-check format_version → pin current_generation → load the
   manifest set → serve PackFetch/RangeBackend-style chunk reads via
-  incremental blob I/O. Pack and idx checksums verified on hydration
-  exactly as the M2e backends do (unconditional).
+  incremental blob I/O (the rusqlite fallback under the current Turso
+  pin). Pack and idx checksums verified on hydration exactly as the M2e
+  backends do (unconditional).
 - The refs table implements RefDB.Backend: resolve/list from the
   pinned generation's rows; refresh() re-reads current_generation and
   re-pins (an explicit, caller-visible generation move — snapshots
@@ -145,12 +151,13 @@ CREATE TABLE gitility_refs (
 
 ## Open questions for James before freeze
 
-1. `WITHOUT ROWID` on gitility_chunks keeps (file_id, seq) clustered —
-   good locality for sequential hydration — but stores blob payloads
-   in the primary B-tree. rusqlite/turso incremental blob I/O works on
-   rowid tables' blob columns; if turso's incremental-read API needs a
-   rowid table, chunks drops WITHOUT ROWID (the conformance spike in
-   M4b settles this empirically before freeze — flagged, not assumed).
+1. RESOLVED by the M4b conformance spike (`crates/bundle-spike`): use an
+   ordinary rowid table. turso_core 0.7.2 has no public incremental Blob API
+   for either shape and materializes a full 1 MiB `Value::Blob` for a 64 KiB
+   request; its experimental WITHOUT ROWID point path was also drastically
+   slower. rusqlite's documented incremental Blob API works on the
+   Turso-written rowid table and rejects WITHOUT ROWID. Keep 1 MiB chunks and
+   activate the recorded rusqlite fallback for offset reads.
 2. Should refs carry per-ref annotated-tag TARGETS (kind='tag' rows
    point at the tag object; peeled_hex gives the commit)? Current
    answer: yes, both, so RefDB peeling needs no ODB read.

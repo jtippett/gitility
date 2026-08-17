@@ -51,7 +51,8 @@ defmodule Gitility.Milestone1cQueryTest do
     File.write!(Path.join(worktree, "worktree-only"), "must not be read")
     on_exit(fn -> File.rm_rf!(worktree) end)
 
-    assert {:ok, %Repository{refs: nil}} = Repository.open(worktree)
+    # Since Milestone 4a, Repository.open composes the local ref store.
+    assert {:ok, %Repository{refs: %Gitility.RefDB{}}} = Repository.open(worktree)
 
     assert {:error, %Error{code: :invalid_argument}} =
              Repository.open(worktree, require_bare: true)
@@ -85,10 +86,10 @@ defmodule Gitility.Milestone1cQueryTest do
     assert {:error, %Error{code: :unsupported_hash}} =
              Snapshot.open(sha256_repo.odb, fixture_oid(:sha256_basic_head))
 
-    assert {:error, %Error{code: :unsupported_operation, message: message}} =
-             Repository.snapshot(repo, :head)
-
-    assert message =~ "0.2 / Milestone 4"
+    # Ref selectors went live in Milestone 4a: :head now resolves on a
+    # local repository. The refs-absent refusal is covered in
+    # milestone_4a_refs_test.exs against an ODB-only composition.
+    assert {:ok, %Snapshot{commit_oid: ^head}} = Repository.snapshot(repo, :head)
   end
 
   test "recursive tree listing preserves every fixture path byte-for-byte", %{
@@ -512,16 +513,19 @@ defmodule Gitility.Milestone1cQueryTest do
              Gitility.list_tree(snapshot, "", limit: 0)
   end
 
-  test "ref-backed selector policies are explicit unsupported operations", %{repo: repo} do
-    for selector <- [
-          {:branch, "main"},
-          {:tag, "v1"},
-          {:ref, "x"},
-          {:revspec, "HEAD~1"}
-        ] do
-      assert {:error, %Error{code: :unsupported_operation}} =
-               Repository.snapshot(repo, selector)
-    end
+  test "ref selectors resolve since M4a; revspec stays an explicit unsupported operation", %{
+    repo: repo,
+    head: head
+  } do
+    assert {:ok, %Snapshot{commit_oid: ^head}} = Repository.snapshot(repo, {:branch, "main"})
+
+    # Nonexistent names are honest misses, not policy refusals.
+    assert {:error, %Error{code: :ref_not_found}} =
+             Repository.snapshot(repo, {:tag, "v1-missing"})
+
+    # The advanced selector remains policy-refused in 0.x.
+    assert {:error, %Error{code: :unsupported_operation}} =
+             Repository.snapshot(repo, {:revspec, "HEAD~1"})
   end
 
   defp collect_pages(snapshot, opts, cursor \\ nil, acc \\ []) do

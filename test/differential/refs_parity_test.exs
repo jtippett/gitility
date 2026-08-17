@@ -51,6 +51,8 @@ defmodule Gitility.Differential.RefsParityTest do
     {actual, warnings} = collect_pages(context.refs, nil, 17)
     expected_by_name = Map.new(expected, &{&1.name, &1})
 
+    # Dangling refs make git abort metadata lookup, so the oracle
+    # carries nil there; normalize to the "" our mapper emits.
     assert Enum.map(actual, fn ref ->
              oracle = Map.fetch!(expected_by_name, ref.name)
 
@@ -74,17 +76,24 @@ defmodule Gitility.Differential.RefsParityTest do
              peeled = if target.peeled, do: OID.to_string(target.peeled), else: ""
              {ref.name, OID.to_string(target.oid), type, peeled}
            end) ==
-             Enum.map(expected, &{&1.name, &1.object, &1.type, &1.peeled})
+             Enum.map(expected, &{&1.name, &1.object, &1.type, &1.peeled || ""})
 
     assert length(actual) == 75
-    assert Enum.all?(warnings, &(&1.code == :malformed_ref))
+    # Pagination adds routine :truncated warnings; the skip warnings are
+    # the ones under test here. Exactly three across ALL pages: cursor
+    # resumes replay the emitted prefix but must not re-warn for it (the
+    # earlier page already delivered those warnings). Dangling refs warn
+    # nothing — their identity lists fine and only the best-effort peel
+    # is unavailable.
+    warnings = Enum.filter(warnings, &(&1.code == :malformed_ref))
     assert length(warnings) == 3
     assert Enum.any?(warnings, &String.contains?(&1.message, "refs/heads/zz-empty"))
     assert Enum.any?(warnings, &String.contains?(&1.message, "refs/heads/zz-garbage"))
     assert Enum.any?(warnings, &String.contains?(&1.message, "4096-byte limit"))
 
     assert {:ok, expected_heads} = Oracle.refs(context.path, "refs/heads/page/")
-    {actual_heads, []} = collect_pages(context.refs, "refs/heads/page/", 13)
+    {actual_heads, head_warnings} = collect_pages(context.refs, "refs/heads/page/", 13)
+    assert Enum.filter(head_warnings, &(&1.code == :malformed_ref)) == []
 
     assert Enum.map(actual_heads, & &1.name) ==
              Enum.map(expected_heads, & &1.name)

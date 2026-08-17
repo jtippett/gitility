@@ -381,7 +381,18 @@ impl RefDb for LocalRefDb {
             let reference = match reference {
                 Ok(reference) => reference,
                 Err(error) => {
-                    warnings.push(iteration_warning(error, &self.git_dir));
+                    let warning = iteration_warning(error, &self.git_dir);
+                    // A cursor resume replays the already-emitted prefix;
+                    // skip warnings there were delivered on the earlier page
+                    // (same philosophy as the H6 no-recharge rule). Warnings
+                    // whose ref name is unknown are always emitted.
+                    let already_reported = resume
+                        .as_deref()
+                        .is_some_and(|last| warning.name.as_slice() <= last)
+                        && warning.name.as_slice() != b"<unknown>";
+                    if !already_reported {
+                        warnings.push(warning);
+                    }
                     continue;
                 }
             };

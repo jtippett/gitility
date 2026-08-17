@@ -1692,6 +1692,38 @@ earlier OID tie-break and shallow-error text; see
 5. Implement path history with rename following as Gitility's own walk (R3).
 6. Add LFS pointer and gitlink metadata.
 
+Decision record (M3d review): blame binaries are forced to text semantics via
+a blame-only diff driver so attribution matches canonical git line-for-line
+(upstream gix-blame silently attributed NUL-containing files to the root
+commit); the first three divergence-allowlist entries were approved —
+`merge_rule` ×2 (path history emits a merge iff the path differs from its
+FIRST parent; `git log --full-history` also emits merges TREESAME-broken only
+against a non-first parent) and `follow_copy_detection` ×1 (git's `--follow`
+enables copy detection; our rename pass deliberately does not). With
+`--follow`, `--diff-merges=first-parent` empirically makes the pinned git
+2.55.0 match our merge rule exactly (a no-op without `--follow`). See
+[`m3d-review-fixes.md`](milestones/m3d-review-fixes.md).
+
+Decision record (M3e review): `.gitmodules` is parsed by Gitility's own
+scoped git-config parser (`git_config.rs`) with byte-parity against the
+pinned git 2.55.0 blob reader as its sole correctness target — gix-config
+0.59.0 silently loses value bytes on trailing continuations, accepts files
+git rejects, and skips dotted-subsection lowercasing. Declarations degrade
+per-entry (pathless ones are ignored, as git's own submodule machinery
+ignores them); submodule paths are inert correlation bytes; gitlink commits
+are never opened. LFS pointer recognition matches the git-lfs 3.7.1 reader
+on every probed axis except the 1024-byte cap side (we follow the spec text
+and reject 1025-byte candidates the binary silently prefix-reads). See
+[`m3e-review-fixes.md`](milestones/m3e-review-fixes.md).
+
+**MILESTONE 3 COMPLETE (03f5e12, 2026-08-17).** Exit criterion met: the full
+semantic API (log, merge_base, ancestor?, search, diff, blame, history,
+submodules, LFS recognition) passes the differential suite against pinned git
+2.55.0; the allowlist holds exactly three reviewed entries (above); every
+observed divergence was triaged in a review-fix decision record; every query
+runs as a cancellable job over the M2 budget seam with its cancellation
+cadence documented per query.
+
 Exit criterion: the full semantic API passes the differential suite under the
 allowlist policy, every divergence is triaged, and every query cancels within
 a documented latency.

@@ -107,10 +107,20 @@ defmodule Gitility.RefDB do
   Resolves a full raw-byte reference name. Symbolic chains are followed with
   a hard 16-hop limit. A missing name returns `{:ok, :not_found}`; it is not
   a backend error.
+
+  Local resolution is one logical store call and retains one packed-refs
+  snapshot across the entire chain. Provider resolution is deliberately
+  per-hop atomic: each symbolic hop is a separate backend `resolve/2` call.
+  A provider that requires a chain-coherent answer must resolve symbolics
+  internally and return a direct target, which is also the recommended shape
+  for API-backed providers. An optional provider `resolve_following/2`
+  callback may be considered after 1.0; it is not part of the 0.x contract.
   """
   @spec resolve(t(), binary(), keyword()) ::
           {:ok, RefTarget.t() | :not_found} | {:error, Error.t()}
-  def resolve(%__MODULE__{ref: resource, runtime: runtime}, name, opts \\ [])
+  def resolve(ref_db, name, opts \\ [])
+
+  def resolve(%__MODULE__{ref: resource, runtime: runtime}, name, opts)
       when is_binary(name) do
     opts = Keyword.validate!(opts, limits: nil)
     limits = opts[:limits] || Limits.new()
@@ -132,6 +142,30 @@ defmodule Gitility.RefDB do
   end
 
   @doc """
+  Starts an asynchronous reference resolution job.
+
+  This has the same per-hop provider semantics and options as `resolve/3`.
+  """
+  @spec async_resolve(t(), binary(), keyword()) ::
+          {:ok, Gitility.Job.t()} | {:error, Error.t()}
+  def async_resolve(ref_db, name, opts \\ [])
+
+  def async_resolve(%__MODULE__{ref: resource, runtime: runtime}, name, opts)
+      when is_binary(name) do
+    opts = Keyword.validate!(opts, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+
+    NativeSupport.submit_job(runtime, :ref_resolve, fn runtime_resource ->
+      Native.job_submit_ref_resolve(runtime_resource, resource, name, limits_map)
+    end)
+  end
+
+  def async_resolve(%__MODULE__{}, _name, _opts) do
+    raise ArgumentError, "reference name must be a binary"
+  end
+
+  @doc """
   Lists refs in deterministic byte order as one `Gitility.Page`.
 
   Local cursors store the raw full name of the last emitted ref and resume at
@@ -140,6 +174,24 @@ defmodule Gitility.RefDB do
   behind the continuation, while later names remain eligible. Provider
   backends own their continuation state and must provide the same page-level
   ordering guarantee.
+
+  Local cursors are intentionally repository-agnostic: their identity digest
+  is all zeroes, so a cursor can resume the same prefix and hash algorithm in
+  another repository. This is useful for caller-controlled repository swaps;
+  Gitility does not claim the two namespaces contain the same refs.
+
+  A prefix uses the local store's prefixed iterator. Cursor resume still skips
+  refs up to the last emitted name within that prefix on every page, so the
+  per-page resume cost is linear in the already-consumed prefix.
+
+  Listing deliberately returns unfollowed targets: a symbolic ref remains
+  symbolic. This differs from `git for-each-ref`, which resolves symbolic
+  targets. Call `resolve/3` when a resolved identity is required.
+
+  Full ref names are capped at 4096 bytes on both local and provider paths.
+  Longer local entries are skipped with a warning. This deliberately differs
+  from Git, which accepts larger names; names over 4 KiB are treated as hostile
+  input.
 
   Resolve-only providers return `:unsupported_operation`.
   """
@@ -173,12 +225,42 @@ defmodule Gitility.RefDB do
     end
   end
 
+  @doc """
+  Starts an asynchronous reference-listing job.
+
+  Query normalization, cursor validation, and limits match `list/3`.
+  """
+  @spec async_list(t(), RefQuery.t() | keyword(), keyword()) ::
+          {:ok, Gitility.Job.t()} | {:error, Error.t()}
+  def async_list(ref_db, query \\ %RefQuery{}, opts \\ [])
+
+  def async_list(%__MODULE__{ref: resource, runtime: runtime}, query, opts) do
+    opts = Keyword.validate!(opts, limits: nil)
+    limits = opts[:limits] || Limits.new()
+    limits_map = NativeSupport.limits_map!(limits)
+    query = normalize_query!(query)
+
+    with {:ok, cursor} <- decode_cursor(query.cursor) do
+      NativeSupport.submit_job(runtime, :ref_list, fn runtime_resource ->
+        Native.job_submit_ref_list(
+          runtime_resource,
+          resource,
+          query.prefix,
+          query.limit,
+          cursor,
+          limits_map
+        )
+      end)
+    end
+  end
+
   @doc "Refreshes a provider backend. Missing optional refresh is a no-op."
   @spec refresh(t()) :: :ok | {:error, Error.t()}
   def refresh(%__MODULE__{kind: :provider, provider: provider}) do
     try do
       case GenServer.call(provider, :refresh, 30_000) do
-        :ok -> :ok
+        :ok ->
+          :ok
 
         {:error, :provider_timeout} ->
           {:error,
@@ -243,7 +325,8 @@ defmodule Gitility.RefDB do
   end
 
   defp validate_backend({module, _init_arg}) when is_atom(module) do
-    if function_exported?(module, :init, 1) and function_exported?(module, :resolve, 2) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :init, 1) and
+         function_exported?(module, :resolve, 2) do
       :ok
     else
       NativeSupport.invalid_argument(

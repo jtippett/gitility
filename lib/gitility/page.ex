@@ -30,7 +30,7 @@ defmodule Gitility.Page do
   `%{code: :truncated, message: "page truncated by <limit>"}`.
   """
   @type warning :: %{
-          code: :truncated | :binary_skipped | :oversize_skipped,
+          code: :truncated | :binary_skipped | :oversize_skipped | :malformed_ref,
           message: String.t()
         }
 

@@ -1,7 +1,7 @@
 defmodule Gitility.Differential.RefsParityTest do
   use ExUnit.Case, async: true
 
-  alias Gitility.{OID, RefDB, Repository}
+  alias Gitility.{ODB, OID, RefDB, Repository}
   alias Gitility.Differential.Oracle
 
   @moduletag :gitility_engine
@@ -45,9 +45,18 @@ defmodule Gitility.Differential.RefsParityTest do
 
   test "NUL-safe listing parity and cursor reconstruction span at least three pages", context do
     assert {:ok, expected} = Oracle.refs(context.path)
-    actual = collect_pages(context.refs, nil, 17)
+    # Git accepts the >4 KiB hostile-input probe; Gitility's documented local
+    # divergence skips it with a warning at the uniform provider/local ceiling.
+    expected = Enum.reject(expected, &(byte_size(&1.name) > 4096))
+    {actual, warnings} = collect_pages(context.refs, nil, 17)
+    expected_by_name = Map.new(expected, &{&1.name, &1})
 
     assert Enum.map(actual, fn ref ->
+             oracle = Map.fetch!(expected_by_name, ref.name)
+
+             # Documented divergence: list/3 intentionally returns symbolic
+             # targets unfollowed while git for-each-ref resolves them. Resolve
+             # only for the parity projection; the listing contract stays raw.
              target =
                if ref.target.kind == :symbolic do
                  {:ok, resolved} = RefDB.resolve(context.refs, ref.name)
@@ -56,13 +65,28 @@ defmodule Gitility.Differential.RefsParityTest do
                  ref.target
                end
 
-             {ref.name, OID.to_string(target.oid)}
-           end) ==
-             Enum.map(expected, &{&1.name, &1.object})
+             type =
+               if oracle.type do
+                 {:ok, header} = ODB.header(context.repository.odb, target.oid)
+                 Atom.to_string(header.type)
+               end
 
-    assert length(actual) >= 60
+             peeled = if target.peeled, do: OID.to_string(target.peeled), else: ""
+             {ref.name, OID.to_string(target.oid), type, peeled}
+           end) ==
+             Enum.map(expected, &{&1.name, &1.object, &1.type, &1.peeled})
+
+    assert length(actual) == 75
+    assert Enum.all?(warnings, &(&1.code == :malformed_ref))
+    assert length(warnings) == 3
+    assert Enum.any?(warnings, &String.contains?(&1.message, "refs/heads/zz-empty"))
+    assert Enum.any?(warnings, &String.contains?(&1.message, "refs/heads/zz-garbage"))
+    assert Enum.any?(warnings, &String.contains?(&1.message, "4096-byte limit"))
+
     assert {:ok, expected_heads} = Oracle.refs(context.path, "refs/heads/page/")
-    assert Enum.map(collect_pages(context.refs, "refs/heads/page/", 13), & &1.name) ==
+    {actual_heads, []} = collect_pages(context.refs, "refs/heads/page/", 13)
+
+    assert Enum.map(actual_heads, & &1.name) ==
              Enum.map(expected_heads, & &1.name)
   end
 
@@ -106,6 +130,7 @@ defmodule Gitility.Differential.RefsParityTest do
         case Oracle.check_ref_format(name) do
           {:ok, normalized} -> normalized == name
           {:error, _} -> false
+          {:skip, :non_utf8_argv_unsupported} -> :skip
         end
 
       gitility_accepts =
@@ -114,7 +139,15 @@ defmodule Gitility.Differential.RefsParityTest do
           {:error, error} -> error.code != :malformed_ref
         end
 
-      assert gitility_accepts == git_accepts, inspect(name)
+      case git_accepts do
+        :skip ->
+          # Linux accepts raw argv bytes; only platforms whose Erlang port
+          # rejects non-UTF-8 argv may skip this one oracle probe.
+          refute match?({:unix, :linux}, :os.type())
+
+        accepted ->
+          assert gitility_accepts == accepted, inspect(name)
+      end
     end)
   end
 
@@ -125,9 +158,11 @@ defmodule Gitility.Differential.RefsParityTest do
 
       cursor ->
         {:ok, page} = RefDB.list(refs, prefix: prefix, limit: limit, cursor: cursor)
-        {page.items, page.next_cursor || :done}
+        {{page.items, page.warnings}, page.next_cursor || :done}
     end)
     |> Enum.to_list()
-    |> List.flatten()
+    |> Enum.reduce({[], []}, fn {items, warnings}, {all_items, all_warnings} ->
+      {all_items ++ items, all_warnings ++ warnings}
+    end)
   end
 end

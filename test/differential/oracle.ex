@@ -167,16 +167,18 @@ defmodule Gitility.Differential.Oracle do
   @spec refs(Path.t(), binary() | nil) :: result([map()])
   def refs(repository, prefix \\ nil) do
     arguments =
-      ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(objecttype)"] ++
+      ["for-each-ref", "--format=%(refname)%00%(objectname)"] ++
         if(prefix, do: [prefix], else: [])
 
-    with {:ok, output} <- git(repository, arguments) do
+    # Broken loose refs warn on stderr but do not invalidate the honest stdout
+    # listing. Keep the streams separate so warnings cannot become fake rows.
+    with {:ok, output} <- git_stdout(repository, arguments) do
       rows =
         output
         |> :binary.split("\n", [:global, :trim_all])
         |> Enum.map(fn row ->
-          [name, object, type] = :binary.split(row, <<0>>, [:global])
-          %{name: name, object: object, type: type}
+          [name, object] = :binary.split(row, <<0>>, [:global])
+          Map.merge(%{name: name, object: object}, ref_metadata(repository, name))
         end)
 
       {:ok, rows}
@@ -185,12 +187,18 @@ defmodule Gitility.Differential.Oracle do
 
   @spec check_ref_format(binary()) :: result(binary())
   def check_ref_format(name) do
-    case System.cmd("git", ["check-ref-format", "--normalize", name],
-           env: @git_environment,
-           stderr_to_stdout: true
-         ) do
-      {output, 0} -> {:ok, trim_metadata(output)}
-      {output, status} -> {:error, %{status: status, output: output}}
+    try do
+      case System.cmd("git", ["check-ref-format", "--normalize", name],
+             env: @git_environment,
+             stderr_to_stdout: true
+           ) do
+        {output, 0} -> {:ok, trim_metadata(output)}
+        {output, status} -> {:error, %{status: status, output: output}}
+      end
+    rescue
+      # Some non-Linux Erlang ports reject non-UTF-8 argv before Git starts.
+      # That is a platform transport limitation, not a ref-format verdict.
+      ArgumentError -> {:skip, :non_utf8_argv_unsupported}
     end
   end
 
@@ -378,6 +386,39 @@ defmodule Gitility.Differential.Oracle do
          ) do
       {output, 0} -> {:ok, output}
       {output, status} -> {:error, %{status: status, output: output}}
+    end
+  end
+
+  defp git_stdout(repository, arguments) do
+    command_arguments = @git_options ++ ["-C", Path.expand(repository)] ++ arguments
+
+    case System.cmd("git", command_arguments, env: @git_environment) do
+      {output, 0} -> {:ok, output}
+      {output, status} -> {:error, %{status: status, output: output}}
+    end
+  end
+
+  defp ref_metadata(repository, name) do
+    try do
+      case git_stdout(repository, [
+             "for-each-ref",
+             "--format=%(objecttype)%00%(*objectname)",
+             name
+           ]) do
+        {:ok, row} ->
+          case row |> trim_metadata() |> :binary.split(<<0>>, [:global]) do
+            [type, peeled] -> %{type: type, peeled: peeled}
+            _fields -> %{type: nil, peeled: nil}
+          end
+
+        # Asking Git 2.55 for objecttype on a dangling ref aborts. Identity
+        # parity still comes from the successful name/object listing above.
+        {:error, _error} ->
+          %{type: nil, peeled: nil}
+      end
+    rescue
+      # Same non-UTF-8 argv limitation documented by check_ref_format/1.
+      ArgumentError -> %{type: nil, peeled: nil}
     end
   end
 

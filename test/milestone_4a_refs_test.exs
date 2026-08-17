@@ -126,6 +126,15 @@ defmodule Gitility.M4a.MutableRefBackend do
   end
 
   @impl true
+  def list(%RefQuery{}, %{mode: :empty_truncated}) do
+    {:ok,
+     struct!(Page,
+       items: [],
+       next_cursor: Base.url_encode64("loop", padding: false),
+       truncated: true
+     )}
+  end
+
   def list(%RefQuery{} = query, %{agent: agent}) do
     refs = Agent.get(agent, & &1.refs)
     resume = decode_cursor(query.cursor)
@@ -134,7 +143,8 @@ defmodule Gitility.M4a.MutableRefBackend do
       refs
       |> Enum.map(fn {name, target} -> struct!(Ref, name: name, target: target) end)
       |> Enum.filter(fn ref ->
-        (is_nil(query.prefix) or :binary.match(ref.name, query.prefix) == {0, byte_size(query.prefix)}) and
+        (is_nil(query.prefix) or
+           :binary.match(ref.name, query.prefix) == {0, byte_size(query.prefix)}) and
           (is_nil(resume) or ref.name > resume)
       end)
       |> Enum.sort_by(& &1.name)
@@ -190,6 +200,33 @@ defmodule Gitility.Milestone4aRefsTest do
              Repository.snapshot(context.repository, {:revspec, "main~2"})
   end
 
+  test "reftable ref-open failure preserves OID-only repository access", context do
+    assert {:ok, repository} = Repository.open(fixture("sha1-reftable.git"))
+    assert repository.refs == nil
+    assert %Error{details: %{reason: stored_reason}} = repository.ref_error
+    assert stored_reason =~ "reftable"
+
+    assert {:ok, snapshot} =
+             Repository.snapshot(repository, {:oid, context.oids.sha1_refs_head})
+
+    assert snapshot.commit_oid == OID.parse!(context.oids.sha1_refs_head)
+
+    for selector <- [
+          {:ref, "refs/heads/main"},
+          {:branch, "main"},
+          {:tag, "v1.0.0"},
+          :head
+        ] do
+      assert {:error,
+              %Error{
+                code: :unsupported_operation,
+                details: %{capability: :refs, reason: reason}
+              }} = Repository.snapshot(repository, selector)
+
+      assert reason =~ "reftable"
+    end
+  end
+
   test "the four ref selectors name the missing refs capability", context do
     assert {:ok, odb_only} = Repository.from_stores(odb: context.repository.odb, refs: nil)
 
@@ -199,8 +236,7 @@ defmodule Gitility.Milestone4aRefsTest do
           {:tag, "refs-chain"},
           :head
         ] do
-      assert {:error,
-              %Error{code: :unsupported_operation, details: %{capability: :refs}}} =
+      assert {:error, %Error{code: :unsupported_operation, details: %{capability: :refs}}} =
                Repository.snapshot(odb_only, selector)
     end
 
@@ -222,6 +258,35 @@ defmodule Gitility.Milestone4aRefsTest do
 
     assert {:error, %Error{code: :not_a_commit}} =
              Repository.snapshot(context.repository, {:ref, "refs/tags/refs-chain"})
+  end
+
+  test "tag-to-tree, lightweight tag, unborn HEAD, traversal, and component edges", context do
+    assert {:error, %Error{code: :not_a_commit}} =
+             Repository.snapshot(context.repository, {:tag, "refs-tree"})
+
+    assert {:ok, lightweight} =
+             Repository.snapshot(context.repository, {:tag, "basic-lightweight"})
+
+    assert lightweight.commit_oid == OID.parse!(context.oids.sha1_refs_parent)
+
+    assert {:error, %Error{code: :malformed_ref}} =
+             Repository.snapshot(context.repository, {:branch, "../main"})
+
+    for name <- ["refs/heads/trail./x", "refs/heads/a.b.c", "refs/heads/bracket]name"] do
+      assert {:ok, target} = RefDB.resolve(context.refs, name)
+      assert target.kind == :direct
+    end
+
+    assert {:ok, unborn} = Repository.open(fixture("sha1-refs-unborn.git"))
+    assert {:error, %Error{code: :ref_not_found}} = Repository.snapshot(unborn, :head)
+
+    assert {:ok, cycle_repo} = Repository.open(fixture("sha1-refs-cycle.git"))
+
+    assert {:error, %Error{code: :malformed_ref, details: %{reason: cycle}}} =
+             Repository.snapshot(cycle_repo, {:branch, "cycle-a"})
+
+    assert cycle =~ "refs/heads/cycle-a"
+    assert cycle =~ "refs/heads/cycle-b"
   end
 
   test "symbolic cycles are malformed and name the cycle", context do
@@ -254,11 +319,30 @@ defmodule Gitility.Milestone4aRefsTest do
     assert {:error, %Error{code: :provider_down, retryable: true}} = Task.await(waiter, 1_000)
   end
 
-  test "one snapshot resolve is single-shot even when a backend alternates", context do
+  test "provider symbolic chains are per-hop atomic while direct targets use one call", context do
     first = OID.parse!(context.oids.sha1_refs_head)
     second = OID.parse!(context.oids.sha1_refs_parent)
 
-    ref_db =
+    symbolic_ref_db =
+      start_ref_provider!(
+        %{
+          init_refs: %{
+            "refs/heads/moving" => [MutableRefBackend.symbolic("refs/heads/target")],
+            "refs/heads/target" => [direct(first), direct(second)]
+          },
+          mode: :alternating
+        },
+        runtime: context.repository.odb.runtime
+      )
+
+    assert {:ok, repository} =
+             Repository.from_stores(odb: context.repository.odb, refs: symbolic_ref_db)
+
+    assert {:ok, snapshot} = Repository.snapshot(repository, {:branch, "moving"})
+    assert snapshot.commit_oid == second
+    assert Agent.get(provider_agent(symbolic_ref_db), & &1.resolves) == 2
+
+    direct_ref_db =
       start_ref_provider!(
         %{
           init_refs: %{"refs/heads/moving" => [direct(first), direct(second)]},
@@ -267,10 +351,12 @@ defmodule Gitility.Milestone4aRefsTest do
         runtime: context.repository.odb.runtime
       )
 
-    assert {:ok, repository} = Repository.from_stores(odb: context.repository.odb, refs: ref_db)
-    assert {:ok, snapshot} = Repository.snapshot(repository, {:branch, "moving"})
-    assert snapshot.commit_oid == first
-    assert Agent.get(provider_agent(ref_db), & &1.resolves) == 1
+    assert {:ok, direct_repository} =
+             Repository.from_stores(odb: context.repository.odb, refs: direct_ref_db)
+
+    assert {:ok, direct_snapshot} = Repository.snapshot(direct_repository, {:branch, "moving"})
+    assert direct_snapshot.commit_oid == first
+    assert Agent.get(provider_agent(direct_ref_db), & &1.resolves) == 1
   end
 
   test "moving a ref never changes an existing snapshot, including async queries", context do
@@ -304,7 +390,7 @@ defmodule Gitility.Milestone4aRefsTest do
 
   test "local pagination reconstructs byte order and invalidates changed prefixes", context do
     {items, cursors} = collect_pages(context.refs, "refs/heads/page/", 17)
-    assert length(items) == 64
+    assert length(items) == 55
     assert length(cursors) >= 3
     assert Enum.map(items, & &1.name) == Enum.sort(Enum.map(items, & &1.name))
 
@@ -316,6 +402,58 @@ defmodule Gitility.Milestone4aRefsTest do
                limit: 17,
                cursor: first_cursor
              )
+  end
+
+  test "local ref cursors cross repositories and reject forgery", context do
+    assert {:ok, first} = RefDB.list(context.refs, prefix: "refs/heads/page/", limit: 10)
+    assert first.next_cursor
+
+    assert {:ok, detached} = Repository.open(fixture("sha1-refs-detached.git"))
+
+    assert {:ok, resumed} =
+             RefDB.list(detached.refs,
+               prefix: "refs/heads/page/",
+               limit: 10,
+               cursor: first.next_cursor
+             )
+
+    assert hd(resumed.items).name > List.last(first.items).name
+
+    decoded = Base.url_decode64!(first.next_cursor, padding: false)
+    <<first_byte, rest::binary>> = decoded
+    forged = Base.url_encode64(<<Bitwise.bxor(first_byte, 1), rest::binary>>, padding: false)
+
+    assert {:error, %Error{code: :invalid_cursor}} =
+             RefDB.list(context.refs,
+               prefix: "refs/heads/page/",
+               limit: 10,
+               cursor: forged
+             )
+  end
+
+  test "ref jobs have async parity and ref-page stats include peel reads", context do
+    assert {:ok, resolve_job} = RefDB.async_resolve(context.refs, "refs/heads/main")
+    assert {:ok, resolved} = Gitility.Job.await(resolve_job, 5_000)
+    assert resolved.oid == OID.parse!(context.oids.sha1_refs_head)
+
+    assert {:ok, list_job} =
+             RefDB.async_list(context.refs, prefix: "refs/heads/page/", limit: 7)
+
+    assert {:ok, page} = Gitility.Job.await(list_job, 5_000)
+    assert length(page.items) == 7
+
+    assert {:ok, loose_peel} =
+             RefDB.list(context.refs, prefix: "refs/meta/loose-tag-object", limit: 5)
+
+    assert loose_peel.stats.objects_read >= 2
+    assert loose_peel.stats.objects_requested == loose_peel.stats.objects_read
+    assert loose_peel.stats.decompressed_bytes > 0
+
+    assert {:ok, packed_peel} =
+             RefDB.list(context.refs, prefix: "refs/zz-tag-object", limit: 5)
+
+    assert packed_peel.stats.objects_read == 0
+    assert packed_peel.stats.decompressed_bytes == 0
   end
 
   test "strictly-greater provider pages stay coherent while refs mutate", context do
@@ -422,6 +560,22 @@ defmodule Gitility.Milestone4aRefsTest do
     assert :ok = RefDB.refresh(refs)
   end
 
+  test "provider listing rejects infinite-loop pages and oversized inbound cursors", context do
+    empty =
+      start_ref_provider!(
+        %{init_refs: %{}, mode: :empty_truncated},
+        runtime: context.repository.odb.runtime
+      )
+
+    assert {:error, %Error{code: :provider_protocol_error}} = RefDB.list(empty)
+
+    ordinary = start_ref_provider!(%{}, runtime: context.repository.odb.runtime)
+    oversized = :binary.copy(<<0>>, 4097) |> Base.url_encode64(padding: false)
+
+    assert {:error, %Error{code: :provider_protocol_error}} =
+             RefDB.list(ordinary, cursor: oversized)
+  end
+
   defp collect_pages(refs, prefix, limit) do
     Stream.unfold({nil, []}, fn
       :done ->
@@ -436,7 +590,8 @@ defmodule Gitility.Milestone4aRefsTest do
             do: previous_cursors ++ [page.next_cursor],
             else: previous_cursors
 
-        {{page.items, cursors}, if(page.next_cursor, do: {page.next_cursor, cursors}, else: :done)}
+        {{page.items, cursors},
+         if(page.next_cursor, do: {page.next_cursor, cursors}, else: :done)}
     end)
     |> Enum.to_list()
     |> Enum.reduce({[], []}, fn {items, cursors}, {all_items, _} ->

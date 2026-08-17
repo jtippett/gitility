@@ -24,10 +24,14 @@ defmodule Gitility.Repository do
   alias Gitility.{Error, Native, NativeSupport, ODB, OID, RefDB, RefTarget, Snapshot}
 
   @typedoc "A repository handle: object store plus optional ref store."
-  @type t :: %__MODULE__{odb: ODB.t(), refs: RefDB.t() | nil}
+  @type t :: %__MODULE__{
+          odb: ODB.t(),
+          refs: RefDB.t() | nil,
+          ref_error: Error.t() | nil
+        }
 
   @enforce_keys [:odb]
-  defstruct [:odb, :refs]
+  defstruct [:odb, :refs, :ref_error]
 
   @typedoc "A commit selector — see the moduledoc."
   @type selector ::
@@ -82,10 +86,20 @@ defmodule Gitility.Repository do
              require_bare: require_bare,
              verify_pack_checksums: verify_pack_checksums
            }) do
-        {:ok, {resource, ref_resource, hash}} ->
+        {:ok, {resource, ref_resource, hash, ref_error}} ->
           odb = %ODB{kind: :local, ref: resource, hash: hash, runtime: runtime}
-          refs = %RefDB{kind: :local, ref: ref_resource, runtime: runtime}
-          {:ok, %__MODULE__{odb: odb, refs: refs}}
+
+          refs =
+            if ref_resource,
+              do: %RefDB{kind: :local, ref: ref_resource, runtime: runtime},
+              else: nil
+
+          ref_error =
+            if ref_error,
+              do: NativeSupport.nif_error(ref_error, :repository_open_refs),
+              else: nil
+
+          {:ok, %__MODULE__{odb: odb, refs: refs, ref_error: ref_error}}
 
         {:error, error} ->
           {:error, NativeSupport.nif_error(error, :repository_open)}
@@ -96,6 +110,10 @@ defmodule Gitility.Repository do
   @doc """
   Composes independently-created stores into a repository. The stores must
   share a runtime (`:runtime_mismatch` otherwise).
+
+  Store identity is otherwise deliberately not compared. Cross-repository
+  composition — for example, refs from one repository with an ODB from
+  another — is the caller's responsibility and is not detected by Gitility.
 
   ## Options
 
@@ -109,10 +127,10 @@ defmodule Gitility.Repository do
 
     case {stores[:odb], stores[:refs]} do
       {%ODB{} = odb, nil} ->
-        {:ok, %__MODULE__{odb: odb, refs: nil}}
+        {:ok, %__MODULE__{odb: odb, refs: nil, ref_error: nil}}
 
       {%ODB{} = odb, %RefDB{} = refs} when odb.runtime == refs.runtime ->
-        {:ok, %__MODULE__{odb: odb, refs: refs}}
+        {:ok, %__MODULE__{odb: odb, refs: refs, ref_error: nil}}
 
       {%ODB{}, %RefDB{}} ->
         {:error,
@@ -178,13 +196,20 @@ defmodule Gitility.Repository do
     NativeSupport.invalid_argument("selector is not a supported safe selector")
   end
 
-  defp snapshot_from_ref(%__MODULE__{refs: nil}, _name, _mode, opts) do
+  defp snapshot_from_ref(%__MODULE__{refs: nil, ref_error: ref_error}, _name, _mode, opts) do
     _opts = Keyword.validate!(opts, limits: nil)
+
+    reason =
+      case ref_error do
+        %Error{details: %{reason: reason}} when is_binary(reason) -> reason
+        %Error{message: message} -> message
+        nil -> "repository has no reference store"
+      end
 
     {:error,
      Error.new(:unsupported_operation, "repository has no reference store",
        operation: :repository_snapshot,
-       details: %{capability: :refs}
+       details: %{capability: :refs, reason: reason}
      )}
   end
 
@@ -215,12 +240,6 @@ defmodule Gitility.Repository do
             Snapshot.open_direct(odb, oid, opts)
           end
         end
-
-      {:ok, %RefTarget{kind: :symbolic}} ->
-        {:error,
-         Error.new(:provider_protocol_error, "reference resolution returned an unfollowed target",
-           operation: :repository_snapshot
-         )}
 
       {:error, %Error{} = error} ->
         {:error, error}

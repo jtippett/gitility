@@ -1016,12 +1016,19 @@ git -C "$output_dir/sha1-refs.git" update-ref refs/heads/packed-only "$refs_head
 git -C "$output_dir/sha1-refs.git" update-ref refs/heads/both "$refs_head"
 git -C "$output_dir/sha1-refs.git" update-ref refs/heads/a/b/c "$refs_parent"
 git -C "$output_dir/sha1-refs.git" update-ref refs/heads/@ "$refs_head"
-for ref_number in $(seq 0 63); do
+for ref_number in $(seq 0 54); do
   git -C "$output_dir/sha1-refs.git" update-ref \
     "refs/heads/page/$(printf '%03d' "$ref_number")" "$refs_head"
 done
 tag_at "$output_dir/sha1-refs.git" '2001-08-01T00:00:00+0000' refs-base "$refs_head"
 tag_at "$output_dir/sha1-refs.git" '2001-08-01T00:01:00+0000' refs-chain refs-base
+tag_at "$output_dir/sha1-refs.git" '2001-08-01T00:02:00+0000' refs-tree \
+  "$(git -C "$output_dir/sha1-refs.git" rev-parse "$refs_head^{tree}")"
+refs_base_tag="$(git -C "$output_dir/sha1-refs.git" rev-parse refs/tags/refs-base)"
+dangling_tag_payload="$scratch_dir/refs-dangling-tag"
+printf 'object %040d\ntype commit\ntag dangling-packed\ntagger Gitility Fixture <fixtures@gitility.invalid> 996624180 +0000\n\nDangling packed tag fixture\n' \
+  2 >"$dangling_tag_payload"
+dangling_tag_oid="$(git -C "$output_dir/sha1-refs.git" hash-object -t tag -w --stdin <"$dangling_tag_payload")"
 git -C "$output_dir/sha1-refs.git" pack-refs --all
 
 # Recreate loose entries after packing: packed-only remains only packed;
@@ -1031,6 +1038,15 @@ git -C "$output_dir/sha1-refs.git" update-ref refs/heads/loose-only "$refs_paren
 git -C "$output_dir/sha1-refs.git" update-ref refs/heads/both "$refs_parent"
 git -C "$output_dir/sha1-refs.git" symbolic-ref \
   refs/heads/symbolic-main refs/heads/main
+git -C "$output_dir/sha1-refs.git" update-ref refs/heads/trail./x "$refs_head"
+git -C "$output_dir/sha1-refs.git" update-ref refs/heads/a.b.c "$refs_parent"
+git -C "$output_dir/sha1-refs.git" update-ref 'refs/heads/bracket]name' "$refs_head"
+git -C "$output_dir/sha1-refs.git" update-ref refs/meta/loose-tag-object \
+  "$refs_base_tag"
+mkdir -p "$output_dir/sha1-refs.git/refs/heads"
+printf '%040d\n' 1 >"$output_dir/sha1-refs.git/refs/heads/zz-dangling-loose"
+: >"$output_dir/sha1-refs.git/refs/heads/zz-empty"
+printf 'not an object id or symbolic ref\n' >"$output_dir/sha1-refs.git/refs/heads/zz-garbage"
 raw_ref_name="$(printf 'refs/heads/raw-\377')"
 git check-ref-format "$raw_ref_name"
 # APFS cannot represent this otherwise-valid name as a loose-ref filename.
@@ -1052,8 +1068,29 @@ if ! $raw_ref_inserted; then
 fi
 mv "$packed_refs_tmp" "$packed_refs"
 
+# Git accepts names larger than Gitility's uniform 4096-byte hostile-input
+# ceiling. Keep one packed so tests prove it is skipped with a warning rather
+# than making continuation encoding fail forever. The zz prefixes preserve
+# packed-refs byte order while appending both records.
+printf '%s %s\n' "$dangling_tag_oid" refs/tags/zz-dangling-packed >>"$packed_refs"
+overlong_ref_name="refs/zz-overlong-$(awk 'BEGIN { for (i = 0; i < 4080; i++) printf "a" }')"
+test "${#overlong_ref_name}" -gt 4096
+printf '%s %s\n' "$refs_head" "$overlong_ref_name" >>"$packed_refs"
+printf '%s %s\n^%s\n' "$refs_base_tag" refs/zz-tag-object "$refs_head" >>"$packed_refs"
+
+cp -R "$output_dir/sha1-refs.git" "$output_dir/sha1-refs-cycle.git"
+printf 'ref: refs/heads/cycle-b\n' >"$output_dir/sha1-refs-cycle.git/refs/heads/cycle-a"
+printf 'ref: refs/heads/cycle-a\n' >"$output_dir/sha1-refs-cycle.git/refs/heads/cycle-b"
 cp -R "$output_dir/sha1-refs.git" "$output_dir/sha1-refs-detached.git"
 git -C "$output_dir/sha1-refs-detached.git" update-ref --no-deref HEAD "$refs_parent"
+cp -R "$output_dir/sha1-refs.git" "$output_dir/sha1-refs-unborn.git"
+printf 'ref: refs/heads/does-not-exist\n' >"$output_dir/sha1-refs-unborn.git/HEAD"
+
+# The object database remains readable while this deliberately unsupported
+# ref storage extension makes LocalRefDb::open fail.
+cp -R "$output_dir/sha1-basic.git" "$output_dir/sha1-reftable.git"
+git -C "$output_dir/sha1-reftable.git" config core.repositoryFormatVersion 1
+git -C "$output_dir/sha1-reftable.git" config extensions.refStorage reftable
 test "$(git -C "$output_dir/sha1-refs.git" rev-parse refs/heads/both)" = "$refs_parent"
 test "$(git -C "$output_dir/sha1-refs.git" rev-parse refs-chain^{commit})" = "$refs_head"
 test "$(git -C "$output_dir/sha1-refs.git" symbolic-ref refs/heads/symbolic-main)" = \
@@ -1285,6 +1322,8 @@ submodules_malformed="$(git -C "$output_dir/sha1-submodules.git" rev-parse fixtu
   printf 'sha1_refs_parent=%s\n' "$refs_parent"
   printf 'sha1_refs_chain_tag=%s\n' \
     "$(git -C "$output_dir/sha1-refs.git" rev-parse refs/tags/refs-chain)"
+  printf 'sha1_refs_tree_tag=%s\n' \
+    "$(git -C "$output_dir/sha1-refs.git" rev-parse refs/tags/refs-tree)"
   printf 'sha1_nested_root_txt=%s\n' \
     "$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD:root.txt)"
   printf 'sha1_nested_deep_txt=%s\n' \

@@ -1020,6 +1020,7 @@ struct RefPageMap<'a> {
     next_cursor: Option<Binary<'a>>,
     truncated: bool,
     stats: StatsMap,
+    warnings: Vec<DiffWarningMap>,
 }
 
 #[derive(NifMap)]
@@ -1296,15 +1297,22 @@ fn open_local<'a>(env: Env<'a>, path: Binary<'a>, opts: OpenLocalOptions) -> Nif
     match result {
         Ok((store, hash)) => {
             let store = Arc::new(store);
-            match LocalRefDb::open(path, Arc::clone(&store)) {
-                Ok(refs) => Ok(Result::<_, ErrorMap>::Ok((
-                    ResourceArc::new(StoreResource(StoreImpl::Local(store))),
-                    ResourceArc::new(RefStoreResource(RefStoreImpl::Local(refs))),
-                    hash_atom(hash),
-                ))
-                .encode(env)),
-                Err(error) => Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
-            }
+            let (refs, refs_error) = match LocalRefDb::open(path, Arc::clone(&store)) {
+                Ok(refs) => (
+                    Some(ResourceArc::new(RefStoreResource(RefStoreImpl::Local(
+                        refs,
+                    )))),
+                    None,
+                ),
+                Err(error) => (None, Some(error_map(env, error)?)),
+            };
+            Ok(Result::<_, ErrorMap>::Ok((
+                ResourceArc::new(StoreResource(StoreImpl::Local(store))),
+                refs,
+                hash_atom(hash),
+                refs_error,
+            ))
+            .encode(env))
         }
         Err(error) => Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
     }
@@ -1655,6 +1663,14 @@ fn decode_ref_provider_reply(
         .decode::<Atom>()
         .map_err(|_| ref_protocol_error("invalid reply envelope"))?;
     if tag == atoms::error() {
+        if tuple[1]
+            .decode::<Atom>()
+            .is_ok_and(|reason| reason == atoms::provider_protocol_error())
+        {
+            return Err(ref_protocol_error(
+                "ref provider returned an invalid continuation cursor",
+            ));
+        }
         return Ok(
             if tuple[1]
                 .decode::<Atom>()
@@ -1745,6 +1761,7 @@ fn decode_ref_page(request: &RefRequestResource, term: Term<'_>) -> Result<RefPa
         refs,
         next_cursor,
         truncated,
+        warnings: Vec::new(),
     })
 }
 
@@ -3712,6 +3729,8 @@ fn encode_job_output<'a>(
                 | JobResultKind::Other => atoms::limit(),
             };
             let mut stats = QueryStats {
+                objects_read: provider_spend.0,
+                bytes_read: provider_spend.1,
                 entries_emitted: page.refs.len() as u64,
                 ..QueryStats::default()
             };
@@ -3730,6 +3749,14 @@ fn encode_job_output<'a>(
                 next_cursor: page.next_cursor.map(|cursor| binary(env, &cursor)),
                 truncated: page.truncated,
                 stats: stats_map(stats, elapsed_ms, stopped_by, provider_spend),
+                warnings: page
+                    .warnings
+                    .into_iter()
+                    .map(|warning| DiffWarningMap {
+                        code: atoms::malformed_ref(),
+                        message: warning.message,
+                    })
+                    .collect(),
             }
             .encode(env)
         }
@@ -3912,14 +3939,20 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
                     .unwrap_or(0),
             ),
         JobOutput::RefTarget(target) => target.as_ref().map_or(0, ref_target_size),
-        JobOutput::Refs(page) => page.refs.iter().fold(
-            page.next_cursor.as_deref().map(length).unwrap_or(0),
-            |total, (name, target)| {
-                total
-                    .saturating_add(length(name))
-                    .saturating_add(ref_target_size(target))
-            },
-        ),
+        JobOutput::Refs(page) => page
+            .refs
+            .iter()
+            .fold(
+                page.next_cursor.as_deref().map(length).unwrap_or(0),
+                |total, (name, target)| {
+                    total
+                        .saturating_add(length(name))
+                        .saturating_add(ref_target_size(target))
+                },
+            )
+            .saturating_add(page.warnings.iter().fold(0, |total, warning| {
+                total.saturating_add(length(warning.message.as_bytes()))
+            })),
         JobOutput::Submodules(submodules) => submodules.iter().fold(0, |total, submodule| {
             total
                 .saturating_add(submodule.name.as_deref().map(length).unwrap_or(0))
@@ -4480,6 +4513,8 @@ mod atoms {
         deletion,
         truncated,
         oversize_skipped,
+        malformed_ref,
+        provider_protocol_error,
         header,
         object,
         prefetch,

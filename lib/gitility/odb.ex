@@ -728,7 +728,8 @@ defmodule Gitility.ODB do
   end
 
   defp validate_provider_backend({module, _init_arg}) when is_atom(module) do
-    if function_exported?(module, :init, 1) and function_exported?(module, :read_many, 2) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :init, 1) and
+         function_exported?(module, :read_many, 2) do
       :ok
     else
       NativeSupport.invalid_argument(

@@ -304,6 +304,15 @@ impl<T: RefProviderTransport> RefDb for ProviderRefDb<T> {
                 "reference page limit must be positive",
             ));
         }
+        if query
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > MAX_CURSOR_BYTES)
+        {
+            return Err(protocol_error(
+                "ref provider received a cursor larger than 4096 bytes",
+            ));
+        }
         match self.send_and_wait(RefProviderKind::List, None, Some(query.clone()), budget)? {
             RefProviderPayload::UnsupportedOperation => Err(Error::new(
                 ErrorCode::UnsupportedOperation,
@@ -370,6 +379,11 @@ fn validate_page(page: &RefPage, query: &RefQuery) -> Result<(), Error> {
     if page.truncated != page.next_cursor.is_some() {
         return Err(protocol_error(
             "ref provider page truncation and cursor fields disagree",
+        ));
+    }
+    if page.refs.is_empty() && page.truncated {
+        return Err(protocol_error(
+            "ref provider returned an empty truncated page",
         ));
     }
     let mut previous: Option<&[u8]> = None;
@@ -446,6 +460,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::object::{HashKind, Oid};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Weak;
 
     #[derive(Clone)]
@@ -514,6 +529,55 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_resolution_observes_independent_provider_hops_and_directs_use_one_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let responder_calls = Arc::clone(&calls);
+        let moving = provider(move |request| {
+            let generation = responder_calls.fetch_add(1, Ordering::SeqCst);
+            match (generation, request.name.as_deref()) {
+                (0, Some(b"refs/heads/moving")) => RefProviderPayload::Resolve(Some(
+                    RefTarget::Symbolic(b"refs/heads/target".to_vec()),
+                )),
+                (1, Some(b"refs/heads/target")) => {
+                    RefProviderPayload::Resolve(Some(RefTarget::Direct {
+                        oid: oid(2),
+                        peeled: None,
+                    }))
+                }
+                _ => RefProviderPayload::Resolve(None),
+            }
+        });
+        assert_eq!(
+            crate::refs::resolve_symbolic(&moving, b"refs/heads/moving", &Budget::unlimited())
+                .unwrap(),
+            Some(RefTarget::Direct {
+                oid: oid(2),
+                peeled: None,
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let direct_calls = Arc::new(AtomicUsize::new(0));
+        let responder_calls = Arc::clone(&direct_calls);
+        let direct = provider(move |_| {
+            responder_calls.fetch_add(1, Ordering::SeqCst);
+            RefProviderPayload::Resolve(Some(RefTarget::Direct {
+                oid: oid(1),
+                peeled: None,
+            }))
+        });
+        assert_eq!(
+            crate::refs::resolve_symbolic(&direct, b"refs/heads/direct", &Budget::unlimited())
+                .unwrap(),
+            Some(RefTarget::Direct {
+                oid: oid(1),
+                peeled: None,
+            })
+        );
+        assert_eq!(direct_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn list_requires_order_prefix_limit_and_cursor_consistency() {
         let good = provider(|request| {
             assert_eq!(request.kind, RefProviderKind::List);
@@ -536,6 +600,7 @@ mod tests {
                 ],
                 next_cursor: None,
                 truncated: false,
+                warnings: Vec::new(),
             })
         });
         assert_eq!(
@@ -556,8 +621,9 @@ mod tests {
         let broken = provider(|_| {
             RefProviderPayload::List(RefPage {
                 refs: Vec::new(),
-                next_cursor: None,
+                next_cursor: Some(b"loop".to_vec()),
                 truncated: true,
+                warnings: Vec::new(),
             })
         });
         assert_eq!(
@@ -573,6 +639,33 @@ mod tests {
                 .code,
             ErrorCode::ProviderProtocolError
         );
+    }
+
+    #[test]
+    fn inbound_provider_cursor_is_capped_before_callback_dispatch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let responder_calls = Arc::clone(&calls);
+        let store = provider(move |_| {
+            responder_calls.fetch_add(1, Ordering::SeqCst);
+            RefProviderPayload::List(RefPage {
+                refs: Vec::new(),
+                next_cursor: None,
+                truncated: false,
+                warnings: Vec::new(),
+            })
+        });
+        let error = store
+            .list(
+                RefQuery {
+                    prefix: None,
+                    limit: 1,
+                    cursor: Some(vec![0; MAX_CURSOR_BYTES + 1]),
+                },
+                &Budget::unlimited(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProviderProtocolError);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub use provider_refs::{
 };
 pub use refs::{
     resolve_symbolic, validate_full_ref_name, LocalRefDb, RefDb, RefPage, RefQuery, RefTarget,
-    MAX_SYMBOLIC_REF_HOPS,
+    RefWarning, MAX_REF_NAME_BYTES, MAX_SYMBOLIC_REF_HOPS,
 };
 pub use runtime::{
     BusyReason, Job, JobObserver, JobOutput, JobSpec, JobState, JobTask, OwnerKey, ReadManyOutput,

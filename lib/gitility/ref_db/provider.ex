@@ -13,8 +13,14 @@ defmodule Gitility.RefDB.Provider do
 
   @impl GenServer
   def init(opts) do
+    # Trap exits so orderly supervisor shutdown runs terminate/2. Without
+    # this, the provider dies on the supervisor's exit signal without calling
+    # terminate/2 at all: the ref adaptation reproduced the ODB provider's
+    # direct probe at 0/100 clean stops. The watchdog remains the independent
+    # waiter-wakeup path if the provider crashes instead of stopping cleanly.
     Process.flag(:trap_exit, true)
     {backend, _init_arg} = Keyword.fetch!(opts, :backend)
+    # backend.init/1 already ran in the caller (see Provider.Supervisor).
     backend_state = Keyword.fetch!(opts, :backend_state)
 
     case Native.ref_provider_store_new(%{
@@ -50,8 +56,7 @@ defmodule Gitility.RefDB.Provider do
 
   @impl GenServer
   def handle_call(:handle, _from, state) do
-    {:reply,
-     {:ok, {state.store, self(), state.runtime, state.request_timeout}}, state}
+    {:reply, {:ok, {state.store, self(), state.runtime, state.request_timeout}}, state}
   end
 
   def handle_call(:refresh, from, state) do
@@ -71,6 +76,7 @@ defmodule Gitility.RefDB.Provider do
            ) do
         {:ok, pid} ->
           monitor = Process.monitor(pid)
+
           timer =
             Process.send_after(
               self(),
@@ -228,6 +234,7 @@ defmodule Gitility.RefDB.Provider do
          ) do
       {:ok, pid} ->
         monitor = Process.monitor(pid)
+
         timer =
           Process.send_after(
             self(),
@@ -291,6 +298,10 @@ defmodule Gitility.RefDB.Provider do
       {:error, :unsupported_operation} ->
         Native.ref_provider_reply(request, {:error, :unsupported_operation})
 
+      {:error, {:invalid_cursor, cursor}} ->
+        log_backend_error(kind, {:invalid_cursor, cursor})
+        Native.ref_provider_reply(request, {:error, :provider_protocol_error})
+
       {:error, reason} ->
         log_backend_error(kind, reason)
         Native.ref_provider_reply(request, {:error, :backend_error})
@@ -318,7 +329,7 @@ defmodule Gitility.RefDB.Provider do
   defp normalize_reply(:list, {:ok, %Page{} = page}) do
     case decode_cursor(page.next_cursor) do
       {:ok, cursor} -> {:ok, %{page | next_cursor: cursor}}
-      :error -> {:ok, %{page | next_cursor: {:invalid_cursor, page.next_cursor}}}
+      {:error, :invalid_cursor} -> {:error, {:invalid_cursor, page.next_cursor}}
     end
   end
 
@@ -327,7 +338,9 @@ defmodule Gitility.RefDB.Provider do
 
   defp invoke_refresh(backend, state) do
     case backend.refresh(state) do
-      :ok -> :ok
+      :ok ->
+        :ok
+
       {:error, reason} ->
         log_backend_error(:refresh, reason)
         {:error, :backend_error}
@@ -354,11 +367,11 @@ defmodule Gitility.RefDB.Provider do
   defp decode_cursor(cursor) when is_binary(cursor) do
     case Base.url_decode64(cursor, padding: false) do
       {:ok, decoded} -> {:ok, decoded}
-      :error -> :error
+      :error -> {:error, :invalid_cursor}
     end
   end
 
-  defp decode_cursor(_cursor), do: :error
+  defp decode_cursor(_cursor), do: {:error, :invalid_cursor}
 
   defp log_backend_error(kind, reason) do
     Logger.error("Gitility ref provider #{kind} callback failed: #{safe_inspect(reason)}")

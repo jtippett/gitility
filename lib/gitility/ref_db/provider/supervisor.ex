@@ -1,5 +1,12 @@
 defmodule Gitility.RefDB.Provider.Supervisor do
-  @moduledoc false
+  @moduledoc """
+  Internal reference-provider supervision tree.
+
+  Child order is an invariant: the watchdog starts before the provider, so
+  reverse-order shutdown stops the provider (and wakes native waiters) while
+  the watchdog is still alive. The provider synchronously installs its watch
+  during `init/1`, closing the corresponding startup window.
+  """
 
   use Supervisor
 
@@ -13,6 +20,12 @@ defmodule Gitility.RefDB.Provider.Supervisor do
     watchdog_name = {:global, {Provider, id, Gitility.RefDB.Watchdog}}
     {backend, init_arg} = Keyword.fetch!(opts, :backend)
 
+    # Run backend init/1 HERE, in the caller, before any process exists. A
+    # backend init failure must return as {:error, reason} without killing the
+    # caller, but the caller must still be the actual OTP parent of the
+    # supervisor. A bootstrap starter process breaks orderly parent shutdown:
+    # the tree sees the real caller's exit as an unrelated linked-process
+    # death and may never stop. Up-front init preserves both contracts.
     case run_backend_init(backend, init_arg) do
       {:ok, backend_state} ->
         configured_opts =

@@ -209,7 +209,7 @@ defmodule Gitility.NativeSupport do
     }
   end
 
-  def job_payload(%{refs: refs, next_cursor: cursor, stats: stats} = page) do
+  def job_payload(%{refs: refs, next_cursor: cursor, stats: stats, warnings: warnings} = page) do
     items =
       Enum.map(refs, fn ref ->
         %Ref{name: ref.name, target: ref_target_payload(ref.target)}
@@ -220,7 +220,7 @@ defmodule Gitility.NativeSupport do
       next_cursor: if(cursor, do: Base.url_encode64(cursor, padding: false)),
       truncated: page.truncated,
       stats: struct!(Stats, Map.to_list(stats)),
-      warnings: page_warnings(page.truncated, stats.stopped_by)
+      warnings: warnings ++ page_warnings(page.truncated, stats.stopped_by)
     }
   end
 

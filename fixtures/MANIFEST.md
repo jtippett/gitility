@@ -48,10 +48,15 @@ The corpus contains:
   multi-pack-index layouts.
 - `sha1-refs.git`: a read-only ref-store corpus with packed-only and
   loose-only refs, a loose ref shadowing a different packed target, a
-  symbolic ref beyond `HEAD`, deeply nested and component-edge names, a
-  non-UTF-8 ref name, an annotated tag-to-tag-to-commit chain, and 64
-  pagination refs. `sha1-refs-detached.git` is the same corpus with detached
-  `HEAD`.
+  symbolic ref beyond `HEAD`, deeply nested and
+  component-edge names, a non-UTF-8 ref name, annotated tag chains and a
+  tag-to-tree, dangling loose/packed refs, broken empty/garbage loose refs,
+  packed and loose non-tag refs targeting tag objects, an over-4096-byte
+  packed name, and 55 pagination refs.
+  `sha1-refs-detached.git` changes only `HEAD`; `sha1-refs-unborn.git` points
+  `HEAD` at a missing branch; `sha1-refs-cycle.git` adds an on-disk symbolic
+  cycle. `sha1-reftable.git` retains a readable files ODB while declaring the
+  deliberately unsupported reftable ref storage format.
 - `sha1-alternate.git`, `sha1-missing.git`, `sha1-history-shallow.git`, and
   `sha1-history-replace.git`: relative alternate storage, an intentionally
   absent blob, a shallow/graft-like boundary, and a replace-ref edge case.

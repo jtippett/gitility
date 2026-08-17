@@ -16,8 +16,14 @@ defmodule Gitility.RefDB.Backend do
 
   Reference names are full raw binaries (`refs/heads/main`); convenience
   branch/tag selectors are expanded by Gitility before the backend is
-  called. Symbolic refs are followed by Gitility with a hard hop limit —
-  the backend only reports what a name points at.
+  called. Symbolic refs are followed by Gitility with a hard hop limit.
+  Each hop is an independent, per-hop-atomic `resolve/2` call, so a moving
+  backend may expose different generations across one symbolic chain. A
+  backend that needs chain-coherent answers must resolve symbolic refs
+  internally and return direct targets; this is the recommended shape and is
+  what typical API-backed providers naturally return. An optional
+  `resolve_following/2` callback is a possible post-1.0 extension, not part of
+  the 0.x behaviour.
   """
 
   @typedoc "Opaque backend state, produced by `c:init/1`, passed read-only."
@@ -31,6 +37,10 @@ defmodule Gitility.RefDB.Backend do
 
   @doc """
   Resolves one full reference name to its target, or `:not_found`.
+
+  A symbolic target causes Gitility to make another independent `resolve/2`
+  callback for the next hop. Return a direct target if the backend requires a
+  chain-coherent result.
   """
   @callback resolve(binary(), state()) ::
               {:ok, Gitility.RefTarget.t() | :not_found} | {:error, term()}

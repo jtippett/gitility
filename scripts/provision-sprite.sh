@@ -27,11 +27,16 @@ echo "==> provision: verifying base image (OTP/Elixir expected preinstalled)"
 rexec 'elixir --version | tail -2 && erl -noshell -eval "io:format(\"OTP ~s~n\", [erlang:system_info(otp_release)]), halt()."'
 
 echo "==> provision: rustup (stable toolchain)"
+# The sprite image ships its own rustup with the DEFAULT toolchain pinned
+# to an old release (observed: default 1.90 while stable was 1.97) —
+# `rustup default stable` + update is required, not just presence.
 rexec 'command -v cargo >/dev/null 2>&1 || {
   curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
 }
 . "$HOME/.cargo/env" 2>/dev/null || true
 export PATH="$HOME/.cargo/bin:$PATH"
+rustup default stable >/dev/null
+rustup update stable 2>/dev/null | tail -1 || true
 rustc --version && cargo --version'
 
 echo "==> provision: build deps for canonical git"

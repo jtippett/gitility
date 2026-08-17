@@ -35,6 +35,23 @@ defmodule Gitility.Snapshot do
   """
   @spec open(ODB.t(), OID.t() | String.t(), keyword()) :: {:ok, t()} | {:error, Error.t()}
   def open(%ODB{ref: resource, hash: hash} = odb, commit_oid, opts \\ []) do
+    open_with(odb, resource, hash, commit_oid, opts, :snapshot_open, fn
+      runtime_resource, oid, limits_map ->
+        Native.job_submit_snapshot_open(runtime_resource, resource, oid.bytes, limits_map)
+    end)
+  end
+
+  @doc false
+  @spec open_direct(ODB.t(), OID.t() | String.t(), keyword()) ::
+          {:ok, t()} | {:error, Error.t()}
+  def open_direct(%ODB{ref: resource, hash: hash} = odb, commit_oid, opts \\ []) do
+    open_with(odb, resource, hash, commit_oid, opts, :snapshot_open, fn
+      runtime_resource, oid, limits_map ->
+        Native.job_submit_snapshot_open_direct(runtime_resource, resource, oid.bytes, limits_map)
+    end)
+  end
+
+  defp open_with(odb, _resource, hash, commit_oid, opts, operation, submit) do
     opts = Keyword.validate!(opts, limits: nil)
     limits = opts[:limits] || Limits.new()
     limits_map = NativeSupport.limits_map!(limits)
@@ -43,17 +60,12 @@ defmodule Gitility.Snapshot do
          {:ok, result} <-
            NativeSupport.await_sync(
              fn ->
-               NativeSupport.submit_job(odb.runtime, :snapshot_open, fn runtime_resource ->
-                 Native.job_submit_snapshot_open(
-                   runtime_resource,
-                   resource,
-                   oid.bytes,
-                   limits_map
-                 )
+               NativeSupport.submit_job(odb.runtime, operation, fn runtime_resource ->
+                 submit.(runtime_resource, oid, limits_map)
                end)
              end,
              limits.timeout_ms,
-             :snapshot_open
+             operation
            ) do
       {:ok,
        %__MODULE__{

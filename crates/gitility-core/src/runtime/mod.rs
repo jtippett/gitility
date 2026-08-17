@@ -28,6 +28,7 @@ use crate::file::FileRead;
 use crate::log::LogPage;
 use crate::object::{ObjectHeader, ObjectKind, Oid};
 use crate::packfetch::HydrationStats;
+use crate::refs::{RefPage, RefTarget};
 use crate::search::SearchPage;
 use crate::snapshot::Snapshot;
 use crate::submodules::Submodule;
@@ -83,6 +84,8 @@ pub enum JobOutput {
     Header(Option<ObjectHeader>),
     Object { kind: ObjectKind, data: Vec<u8> },
     ReadMany(ReadManyOutput),
+    RefTarget(Option<RefTarget>),
+    Refs(RefPage),
     Oid(Oid),
     Oids(Vec<Oid>),
     Boolean(bool),

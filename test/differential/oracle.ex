@@ -156,6 +156,44 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
+  @spec symbolic_ref(Path.t(), binary()) :: result(binary())
+  def symbolic_ref(repository, name) do
+    with {:ok, output} <- git(repository, ["symbolic-ref", name]) do
+      {:ok, trim_metadata(output)}
+    end
+  end
+
+  @doc "Returns byte-preserving ref rows from Git's NUL-safe format fields."
+  @spec refs(Path.t(), binary() | nil) :: result([map()])
+  def refs(repository, prefix \\ nil) do
+    arguments =
+      ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(objecttype)"] ++
+        if(prefix, do: [prefix], else: [])
+
+    with {:ok, output} <- git(repository, arguments) do
+      rows =
+        output
+        |> :binary.split("\n", [:global, :trim_all])
+        |> Enum.map(fn row ->
+          [name, object, type] = :binary.split(row, <<0>>, [:global])
+          %{name: name, object: object, type: type}
+        end)
+
+      {:ok, rows}
+    end
+  end
+
+  @spec check_ref_format(binary()) :: result(binary())
+  def check_ref_format(name) do
+    case System.cmd("git", ["check-ref-format", "--normalize", name],
+           env: @git_environment,
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> {:ok, trim_metadata(output)}
+      {output, status} -> {:error, %{status: status, output: output}}
+    end
+  end
+
   @spec tag_refs(Path.t()) :: result([map()])
   def tag_refs(repository) do
     with {:ok, output} <-

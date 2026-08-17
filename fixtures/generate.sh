@@ -1007,6 +1007,59 @@ make_search "$search_work" "$output_dir/sha1-search.git"
 make_diff "$diff_work" "$output_dir/sha1-diff.git"
 make_submodules "$submodules_work" "$output_dir/sha1-submodules.git"
 
+# Reference-store fixture: loose/packed overlay precedence, symbolic refs,
+# annotated tag-to-tag peeling, raw-byte names, and multi-page enumeration.
+cp -R "$output_dir/sha1-basic.git" "$output_dir/sha1-refs.git"
+refs_head="$(git -C "$output_dir/sha1-refs.git" rev-parse HEAD)"
+refs_parent="$(git -C "$output_dir/sha1-refs.git" rev-parse HEAD^)"
+git -C "$output_dir/sha1-refs.git" update-ref refs/heads/packed-only "$refs_head"
+git -C "$output_dir/sha1-refs.git" update-ref refs/heads/both "$refs_head"
+git -C "$output_dir/sha1-refs.git" update-ref refs/heads/a/b/c "$refs_parent"
+git -C "$output_dir/sha1-refs.git" update-ref refs/heads/@ "$refs_head"
+for ref_number in $(seq 0 63); do
+  git -C "$output_dir/sha1-refs.git" update-ref \
+    "refs/heads/page/$(printf '%03d' "$ref_number")" "$refs_head"
+done
+tag_at "$output_dir/sha1-refs.git" '2001-08-01T00:00:00+0000' refs-base "$refs_head"
+tag_at "$output_dir/sha1-refs.git" '2001-08-01T00:01:00+0000' refs-chain refs-base
+git -C "$output_dir/sha1-refs.git" pack-refs --all
+
+# Recreate loose entries after packing: packed-only remains only packed;
+# loose-only remains only loose; both retains a packed old value shadowed by
+# its loose new value.
+git -C "$output_dir/sha1-refs.git" update-ref refs/heads/loose-only "$refs_parent"
+git -C "$output_dir/sha1-refs.git" update-ref refs/heads/both "$refs_parent"
+git -C "$output_dir/sha1-refs.git" symbolic-ref \
+  refs/heads/symbolic-main refs/heads/main
+raw_ref_name="$(printf 'refs/heads/raw-\377')"
+git check-ref-format "$raw_ref_name"
+# APFS cannot represent this otherwise-valid name as a loose-ref filename.
+# Keep it packed-only and preserve packed-refs byte ordering plus tag peel
+# records while inserting it before the first refs/tags entry.
+packed_refs="$output_dir/sha1-refs.git/packed-refs"
+packed_refs_tmp="$output_dir/sha1-refs.git/packed-refs.gitility-tmp"
+raw_ref_inserted=false
+: >"$packed_refs_tmp"
+while IFS= read -r packed_line; do
+  if ! $raw_ref_inserted && [[ "$packed_line" == *" refs/tags/"* ]]; then
+    printf '%s %s\n' "$refs_head" "$raw_ref_name" >>"$packed_refs_tmp"
+    raw_ref_inserted=true
+  fi
+  printf '%s\n' "$packed_line" >>"$packed_refs_tmp"
+done <"$packed_refs"
+if ! $raw_ref_inserted; then
+  printf '%s %s\n' "$refs_head" "$raw_ref_name" >>"$packed_refs_tmp"
+fi
+mv "$packed_refs_tmp" "$packed_refs"
+
+cp -R "$output_dir/sha1-refs.git" "$output_dir/sha1-refs-detached.git"
+git -C "$output_dir/sha1-refs-detached.git" update-ref --no-deref HEAD "$refs_parent"
+test "$(git -C "$output_dir/sha1-refs.git" rev-parse refs/heads/both)" = "$refs_parent"
+test "$(git -C "$output_dir/sha1-refs.git" rev-parse refs-chain^{commit})" = "$refs_head"
+test "$(git -C "$output_dir/sha1-refs.git" symbolic-ref refs/heads/symbolic-main)" = \
+  refs/heads/main
+test "$(git -C "$output_dir/sha1-refs-detached.git" rev-parse HEAD)" = "$refs_parent"
+
 # Fully packed and deliberately mixed object layouts.
 cp -R "$output_dir/sha1-basic.git" "$output_dir/sha1-basic-packed.git"
 git -C "$output_dir/sha1-basic-packed.git" -c gc.writeCommitGraph=false \
@@ -1228,6 +1281,10 @@ submodules_malformed="$(git -C "$output_dir/sha1-submodules.git" rev-parse fixtu
   printf 'sha1_diff_head=%s\n' "$diff_head"
   printf 'sha1_submodules_head=%s\n' "$submodules_head"
   printf 'sha1_submodules_malformed=%s\n' "$submodules_malformed"
+  printf 'sha1_refs_head=%s\n' "$refs_head"
+  printf 'sha1_refs_parent=%s\n' "$refs_parent"
+  printf 'sha1_refs_chain_tag=%s\n' \
+    "$(git -C "$output_dir/sha1-refs.git" rev-parse refs/tags/refs-chain)"
   printf 'sha1_nested_root_txt=%s\n' \
     "$(git -C "$output_dir/sha1-nested.git" rev-parse HEAD:root.txt)"
   printf 'sha1_nested_deep_txt=%s\n' \

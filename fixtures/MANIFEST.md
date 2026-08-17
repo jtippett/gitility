@@ -46,6 +46,12 @@ The corpus contains:
 - `sha1-basic-packed.git`, `sha1-basic-mixed.git`, and
   `sha1-history-midx.git`: fully packed, mixed loose/packed, and two-pack
   multi-pack-index layouts.
+- `sha1-refs.git`: a read-only ref-store corpus with packed-only and
+  loose-only refs, a loose ref shadowing a different packed target, a
+  symbolic ref beyond `HEAD`, deeply nested and component-edge names, a
+  non-UTF-8 ref name, an annotated tag-to-tag-to-commit chain, and 64
+  pagination refs. `sha1-refs-detached.git` is the same corpus with detached
+  `HEAD`.
 - `sha1-alternate.git`, `sha1-missing.git`, `sha1-history-shallow.git`, and
   `sha1-history-replace.git`: relative alternate storage, an intentionally
   absent blob, a shallow/graft-like boundary, and a replace-ref edge case.

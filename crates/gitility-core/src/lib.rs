@@ -32,6 +32,7 @@ pub mod packfetch;
 pub mod path_history;
 pub mod pathspec;
 pub mod provider_odb;
+pub mod provider_refs;
 pub mod refs;
 mod rewrite;
 pub mod runtime;
@@ -76,7 +77,14 @@ pub use provider_odb::{
     ProviderPayload, ProviderReplyValue, ProviderRequest, ProviderTransport, ReplySlot,
     PROVIDER_HEADER_SIZE_CEILING,
 };
-pub use refs::{RefDb, RefPage, RefQuery, RefTarget};
+pub use provider_refs::{
+    ProviderRefDb, RefPendingTable, RefProviderKind, RefProviderOptions, RefProviderPayload,
+    RefProviderRequest, RefProviderTransport, RefReplySlot,
+};
+pub use refs::{
+    resolve_symbolic, validate_full_ref_name, LocalRefDb, RefDb, RefPage, RefQuery, RefTarget,
+    MAX_SYMBOLIC_REF_HOPS,
+};
 pub use runtime::{
     BusyReason, Job, JobObserver, JobOutput, JobSpec, JobState, JobTask, OwnerKey, ReadManyOutput,
     Runtime, RuntimeConfig, RuntimeCounters, SubmitError, TestObserver,
@@ -85,7 +93,9 @@ pub use search::{
     search, SearchBinaryMode, SearchMatch, SearchMode, SearchOptions, SearchPage, SearchSubmatch,
     MAX_CONTEXT_LINES,
 };
-pub use snapshot::{open as open_snapshot, peel, PeelTarget, Snapshot};
+pub use snapshot::{
+    open as open_snapshot, open_direct as open_direct_snapshot, peel, PeelTarget, Snapshot,
+};
 pub use static_odb::StaticOdb;
 pub use submodules::{submodules, Submodule, SubmoduleStatus};
 pub use tree::{list_tree, QueryStats, TreeItem, TreeItemKind, TreeOptions, TreePage, TypeFilter};

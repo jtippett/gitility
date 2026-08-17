@@ -473,7 +473,7 @@ fn checksum_collision(code: ErrorCode) -> Error {
     Error::new(code, message)
 }
 
-fn locate_git_dir(path: &Path) -> Result<(PathBuf, Option<bool>), Error> {
+pub(crate) fn locate_git_dir(path: &Path) -> Result<(PathBuf, Option<bool>), Error> {
     if !path.is_dir() {
         return Err(Error::new(
             ErrorCode::InvalidArgument,
@@ -532,7 +532,7 @@ fn locate_git_dir(path: &Path) -> Result<(PathBuf, Option<bool>), Error> {
     ))
 }
 
-fn load_config(git_dir: &Path) -> Result<gix_config::File, Error> {
+pub(crate) fn load_config(git_dir: &Path) -> Result<gix_config::File, Error> {
     let config_path = git_dir.join("config");
     let metadata = gix_config::file::Metadata::from(gix_config::Source::Local).at(config_path);
     let options = gix_config::file::init::Options {
@@ -617,7 +617,7 @@ fn ensure_hash(expected: HashKind, oid: &Oid) -> Result<(), Error> {
     Ok(())
 }
 
-fn to_gix_hash(kind: HashKind) -> gix_hash::Kind {
+pub(crate) fn to_gix_hash(kind: HashKind) -> gix_hash::Kind {
     match kind {
         HashKind::Sha1 => gix_hash::Kind::Sha1,
         HashKind::Sha256 => gix_hash::Kind::Sha256,

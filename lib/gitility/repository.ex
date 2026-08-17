@@ -17,12 +17,11 @@ defmodule Gitility.Repository do
       {:tag, "v1.2.0"}         # expands to refs/tags/…, peels annotated tags
       :head
 
-  `{:revspec, string}` is an opt-in advanced selector (arbitrary revision
-  expressions) and is unavailable when the configured stores cannot support
-  the operations it requires.
+  `{:revspec, string}` is reserved for a future opt-in advanced selector.
+  Gitility 0.x always rejects it with `:unsupported_operation`.
   """
 
-  alias Gitility.{Error, Native, NativeSupport, NotImplementedError, ODB, OID, RefDB, Snapshot}
+  alias Gitility.{Error, Native, NativeSupport, ODB, OID, RefDB, RefTarget, Snapshot}
 
   @typedoc "A repository handle: object store plus optional ref store."
   @type t :: %__MODULE__{odb: ODB.t(), refs: RefDB.t() | nil}
@@ -83,9 +82,10 @@ defmodule Gitility.Repository do
              require_bare: require_bare,
              verify_pack_checksums: verify_pack_checksums
            }) do
-        {:ok, {resource, hash}} ->
+        {:ok, {resource, ref_resource, hash}} ->
           odb = %ODB{kind: :local, ref: resource, hash: hash, runtime: runtime}
-          {:ok, %__MODULE__{odb: odb, refs: nil}}
+          refs = %RefDB{kind: :local, ref: ref_resource, runtime: runtime}
+          {:ok, %__MODULE__{odb: odb, refs: refs}}
 
         {:error, error} ->
           {:error, NativeSupport.nif_error(error, :repository_open)}
@@ -105,8 +105,29 @@ defmodule Gitility.Repository do
   """
   @spec from_stores(keyword()) :: {:ok, t()} | {:error, Error.t()}
   def from_stores(stores) do
-    _ = stores
-    NotImplementedError.stub!(:"Repository.from_stores/1", "Milestone 4")
+    stores = Keyword.validate!(stores, odb: nil, refs: nil)
+
+    case {stores[:odb], stores[:refs]} do
+      {%ODB{} = odb, nil} ->
+        {:ok, %__MODULE__{odb: odb, refs: nil}}
+
+      {%ODB{} = odb, %RefDB{} = refs} when odb.runtime == refs.runtime ->
+        {:ok, %__MODULE__{odb: odb, refs: refs}}
+
+      {%ODB{}, %RefDB{}} ->
+        {:error,
+         Error.new(:runtime_mismatch, "object and reference stores use different runtimes",
+           operation: :repository_from_stores
+         )}
+
+      {nil, _refs} ->
+        NativeSupport.invalid_argument(":odb is required")
+
+      {_odb, _refs} ->
+        NativeSupport.invalid_argument(
+          ":odb must be a Gitility.ODB and :refs must be a Gitility.RefDB or nil"
+        )
+    end
   end
 
   @doc """
@@ -124,8 +145,85 @@ defmodule Gitility.Repository do
     Snapshot.open(odb, oid, opts)
   end
 
+  def snapshot(%__MODULE__{} = repo, {:ref, name}, opts) when is_binary(name) do
+    snapshot_from_ref(repo, name, :direct, opts)
+  end
+
+  def snapshot(%__MODULE__{} = repo, {:branch, name}, opts) when is_binary(name) do
+    snapshot_from_ref(repo, <<"refs/heads/", name::binary>>, :direct, opts)
+  end
+
+  def snapshot(%__MODULE__{} = repo, {:tag, name}, opts) when is_binary(name) do
+    snapshot_from_ref(repo, <<"refs/tags/", name::binary>>, :peel, opts)
+  end
+
+  def snapshot(%__MODULE__{} = repo, :head, opts) do
+    snapshot_from_ref(repo, "HEAD", :direct, opts)
+  end
+
+  def snapshot(%__MODULE__{}, {:revspec, revspec}, opts) when is_binary(revspec) do
+    _opts = Keyword.validate!(opts, limits: nil)
+
+    {:error,
+     Error.new(
+       :unsupported_operation,
+       "advanced revspec selectors are unavailable in Gitility 0.x",
+       operation: :repository_snapshot,
+       details: %{capability: :revspec}
+     )}
+  end
+
   def snapshot(%__MODULE__{}, _selector, opts) do
     _opts = Keyword.validate!(opts, limits: nil)
-    NativeSupport.unsupported_selector()
+    NativeSupport.invalid_argument("selector is not a supported safe selector")
+  end
+
+  defp snapshot_from_ref(%__MODULE__{refs: nil}, _name, _mode, opts) do
+    _opts = Keyword.validate!(opts, limits: nil)
+
+    {:error,
+     Error.new(:unsupported_operation, "repository has no reference store",
+       operation: :repository_snapshot,
+       details: %{capability: :refs}
+     )}
+  end
+
+  defp snapshot_from_ref(%__MODULE__{odb: odb, refs: refs}, name, mode, opts) do
+    opts = Keyword.validate!(opts, limits: nil)
+
+    case RefDB.resolve(refs, name, opts) do
+      {:ok, :not_found} ->
+        {:error,
+         Error.new(:ref_not_found, "reference was not found",
+           operation: :repository_snapshot,
+           details: %{ref: name}
+         )}
+
+      {:ok, %RefTarget{kind: :direct} = target} ->
+        oid = if mode == :peel, do: target.peeled || target.oid, else: target.oid
+
+        if oid.algorithm != odb.hash do
+          {:error,
+           Error.new(:hash_mismatch, "reference target hash does not match the object store",
+             operation: :repository_snapshot,
+             details: %{ref: name, ref_hash: oid.algorithm, odb_hash: odb.hash}
+           )}
+        else
+          if mode == :peel do
+            Snapshot.open(odb, oid, opts)
+          else
+            Snapshot.open_direct(odb, oid, opts)
+          end
+        end
+
+      {:ok, %RefTarget{kind: :symbolic}} ->
+        {:error,
+         Error.new(:provider_protocol_error, "reference resolution returned an unfollowed target",
+           operation: :repository_snapshot
+         )}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
   end
 end

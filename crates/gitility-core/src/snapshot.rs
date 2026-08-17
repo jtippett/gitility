@@ -28,6 +28,13 @@ pub fn open(store: &dyn ObjectDb, oid: Oid, budget: &Budget) -> Result<Snapshot,
     Snapshot::open(store, oid, budget)
 }
 
+/// Opens `oid` only when it is itself a commit. Unlike [`open`], this never
+/// peels an annotated tag and is used by `:ref`, `:branch`, and `:head`
+/// selectors, whose safe semantics forbid implicit tag peeling.
+pub fn open_direct(store: &dyn ObjectDb, oid: Oid, budget: &Budget) -> Result<Snapshot, Error> {
+    Snapshot::open_direct(store, oid, budget)
+}
+
 /// Peels an object through at most 16 annotated tags to a supported target.
 ///
 /// Tree peeling also accepts a commit and returns its pinned root tree. Blob
@@ -65,6 +72,26 @@ impl Snapshot {
         let commit = decode_commit(&payload, store.hash_kind())?;
         Ok(Self {
             commit_oid,
+            tree_oid: commit.tree_oid,
+        })
+    }
+
+    /// Opens a direct commit without tag peeling.
+    pub fn open_direct(store: &dyn ObjectDb, oid: Oid, budget: &Budget) -> Result<Self, Error> {
+        ensure_compatible(store, oid, "snapshot")?;
+        let mut payload = Vec::new();
+        let kind = store
+            .try_find(&oid, &mut payload, budget)?
+            .ok_or_else(|| missing(oid))?;
+        if kind != ObjectKind::Commit {
+            return Err(Error::new(
+                ErrorCode::NotACommit,
+                "snapshot target is not a direct commit",
+            ));
+        }
+        let commit = decode_commit(&payload, store.hash_kind())?;
+        Ok(Self {
+            commit_oid: oid,
             tree_oid: commit.tree_oid,
         })
     }
@@ -160,6 +187,12 @@ mod tests {
         let tag = read_ref_oid(&repo, "refs/tags/v1.0.0");
         let peeled = Snapshot::open(&store, tag, &Budget::unlimited()).expect("tag peels");
         assert_eq!(peeled, direct);
+        assert_eq!(
+            Snapshot::open_direct(&store, tag, &Budget::unlimited())
+                .expect_err("direct ref selectors never peel tags")
+                .code,
+            ErrorCode::NotACommit
+        );
     }
 
     #[test]

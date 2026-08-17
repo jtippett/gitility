@@ -15,14 +15,17 @@ use gitility_core::{
     BusyReason, ByteRange as CoreByteRange, CacheOptions, CacheStats, CallbackRangeTransport,
     DiffFormat, DiffLineOrigin, DiffOptions, DiffStatus, DiffWarningCode, Error, ErrorCode,
     FileKind, FileOptions, HashKind, HistoryOptions, HydrationStats, Job as CoreJob, JobObserver,
-    JobOutput, JobSpec, JobState, LayeredOdb, LocalOdb, LocalOdbOptions, LogIdentity, LogOptions,
-    LogOrder, ObjectDb, ObjectHeader, ObjectKind, ObjectReadResult, Oid, PackDescriptor,
-    PackFetchOdb, PackFetchOptions, PackManifest, PeelTarget, PendingTable, ProviderCacheOptions,
-    ProviderKind, ProviderOdb, ProviderOptions, ProviderPayload, ProviderReplyValue,
-    ProviderRequest, ProviderTransport, QueryStats, RangePayload, RangePendingTable, RangeRequest,
-    RangeRequestKind, RangeRequestSender, ReadManyBudget, RenameTracking, Runtime as CoreRuntime,
-    RuntimeConfig, SearchBinaryMode, SearchMode, SearchOptions, Snapshot, StaticOdb, SubmitError,
-    SubmoduleStatus, TreeItemKind, TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
+    JobOutput, JobSpec, JobState, LayeredOdb, LocalOdb, LocalOdbOptions, LocalRefDb, LogIdentity,
+    LogOptions, LogOrder, ObjectDb, ObjectHeader, ObjectKind, ObjectReadResult, Oid,
+    PackDescriptor, PackFetchOdb, PackFetchOptions, PackManifest, PeelTarget, PendingTable,
+    ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions, ProviderPayload,
+    ProviderRefDb, ProviderReplyValue, ProviderRequest, ProviderTransport, QueryStats,
+    RangePayload, RangePendingTable, RangeRequest, RangeRequestKind, RangeRequestSender,
+    ReadManyBudget, RefDb, RefPage, RefPendingTable, RefProviderKind, RefProviderOptions,
+    RefProviderPayload, RefProviderRequest, RefProviderTransport, RefQuery as CoreRefQuery,
+    RefTarget as CoreRefTarget, RenameTracking, Runtime as CoreRuntime, RuntimeConfig,
+    SearchBinaryMode, SearchMode, SearchOptions, Snapshot, StaticOdb, SubmitError, SubmoduleStatus,
+    TreeItemKind, TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
 };
 use rustler::{
     types::{map::MapIterator, tuple::get_tuple},
@@ -40,7 +43,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 enum StoreImpl {
-    Local(LocalOdb),
+    Local(Arc<LocalOdb>),
     Static(StaticStore),
     Provider(Box<ProviderOdb<NifProviderTransport>>),
     PackFetch(Box<NifPackFetch>),
@@ -114,6 +117,70 @@ struct RequestResource {
 
 #[rustler::resource_impl]
 impl Resource for RequestResource {}
+
+#[derive(Clone)]
+struct NifRefProviderTransport {
+    provider: LocalPid,
+    pending: Weak<RefPendingTable>,
+}
+
+impl RefProviderTransport for NifRefProviderTransport {
+    fn request(&self, request: RefProviderRequest) -> Result<(), Error> {
+        if rustler::thread::is_scheduler_thread() {
+            return Err(Error::new(
+                ErrorCode::BackendError,
+                "ref provider request from a scheduler thread — Gitility bug",
+            ));
+        }
+        let request_resource = ResourceArc::new(RefRequestResource {
+            id: request.id,
+            pending: self.pending.clone(),
+            kind: request.kind,
+            expected_limit: request.query.as_ref().map_or(1, |query| query.limit),
+            expected_prefix: request
+                .query
+                .as_ref()
+                .and_then(|query| query.prefix.clone()),
+            max_reply_bytes: request.max_reply_bytes,
+        });
+        let provider = self.provider;
+        let kind = ref_provider_kind_atom(request.kind);
+        let name = request.name;
+        let query = request.query;
+        let mut env = OwnedEnv::new();
+        env.send_and_clear(&provider, move |send_env| {
+            let payload = match (name, query) {
+                (Some(name), None) => RefRequestPayload::Name(binary(send_env, &name)),
+                (None, Some(query)) => RefRequestPayload::Query(RefQueryMap {
+                    prefix: query.prefix.map(|prefix| binary(send_env, &prefix)),
+                    limit: query.limit as u64,
+                    cursor: query.cursor.map(|cursor| binary(send_env, &cursor)),
+                }),
+                _ => RefRequestPayload::Invalid,
+            };
+            (
+                atoms::gitility_ref_request(),
+                request_resource,
+                kind,
+                payload,
+            )
+                .encode(send_env)
+        })
+        .map_err(|_| Error::retryable(ErrorCode::ProviderDown, "ref provider process is down"))
+    }
+}
+
+struct RefRequestResource {
+    id: u64,
+    pending: Weak<RefPendingTable>,
+    kind: RefProviderKind,
+    expected_limit: usize,
+    expected_prefix: Option<Vec<u8>>,
+    max_reply_bytes: u64,
+}
+
+#[rustler::resource_impl]
+impl Resource for RefRequestResource {}
 
 #[derive(Clone)]
 struct NifRangeRequestSender {
@@ -218,7 +285,7 @@ impl ObjectDb for StaticStore {
 impl StoreImpl {
     fn as_dyn(&self) -> &dyn ObjectDb {
         match self {
-            Self::Local(store) => store,
+            Self::Local(store) => store.as_ref(),
             Self::Static(store) => store,
             Self::Provider(store) => store.as_ref(),
             Self::PackFetch(store) => store.as_ref(),
@@ -249,6 +316,32 @@ struct StoreResource(StoreImpl);
 
 #[rustler::resource_impl]
 impl Resource for StoreResource {}
+
+enum RefStoreImpl {
+    Local(LocalRefDb),
+    Provider(Box<ProviderRefDb<NifRefProviderTransport>>),
+}
+
+impl RefStoreImpl {
+    fn as_dyn(&self) -> &dyn RefDb {
+        match self {
+            Self::Local(store) => store,
+            Self::Provider(store) => store.as_ref(),
+        }
+    }
+
+    fn as_provider(&self) -> Option<&ProviderRefDb<NifRefProviderTransport>> {
+        match self {
+            Self::Provider(store) => Some(store.as_ref()),
+            Self::Local(_) => None,
+        }
+    }
+}
+
+struct RefStoreResource(RefStoreImpl);
+
+#[rustler::resource_impl]
+impl Resource for RefStoreResource {}
 
 /// Keeps an existing resource alive while presenting it through the core's
 /// shared `ObjectDb` composition seam. Providers and caches therefore remain
@@ -599,6 +692,11 @@ struct ProviderStoreOptions {
     negative_ttl_ms: u64,
 }
 
+#[derive(Clone, Copy, NifMap)]
+struct RefProviderStoreOptions {
+    request_timeout_ms: u64,
+}
+
 #[derive(NifMap)]
 struct PackFetchStoreOptions<'a> {
     request_timeout_ms: u64,
@@ -641,6 +739,13 @@ struct ListTreeOptions<'a> {
     types: Vec<Atom>,
     pathspecs: Vec<Binary<'a>>,
     include_size: bool,
+    limit: u64,
+    cursor: Option<Binary<'a>>,
+}
+
+#[derive(NifMap)]
+struct RefQueryMap<'a> {
+    prefix: Option<Binary<'a>>,
     limit: u64,
     cursor: Option<Binary<'a>>,
 }
@@ -890,6 +995,34 @@ struct TreePageMap<'a> {
 }
 
 #[derive(NifMap)]
+struct OidMap<'a> {
+    algorithm: Atom,
+    bytes: Binary<'a>,
+}
+
+#[derive(NifMap)]
+struct RefTargetMap<'a> {
+    kind: Atom,
+    oid: Option<OidMap<'a>>,
+    symbolic_target: Option<Binary<'a>>,
+    peeled: Option<OidMap<'a>>,
+}
+
+#[derive(NifMap)]
+struct RefEntryMap<'a> {
+    name: Binary<'a>,
+    target: RefTargetMap<'a>,
+}
+
+#[derive(NifMap)]
+struct RefPageMap<'a> {
+    refs: Vec<RefEntryMap<'a>>,
+    next_cursor: Option<Binary<'a>>,
+    truncated: bool,
+    stats: StatsMap,
+}
+
+#[derive(NifMap)]
 struct LogPageMap<'a> {
     commits: Vec<CommitMap<'a>>,
     next_cursor: Option<Binary<'a>>,
@@ -974,6 +1107,22 @@ struct SubmodulesMap<'a> {
 enum ObjectOrNotFound<'a> {
     Object(ObjectMap<'a>),
     NotFound,
+}
+
+enum RefRequestPayload<'a> {
+    Name(Binary<'a>),
+    Query(RefQueryMap<'a>),
+    Invalid,
+}
+
+impl Encoder for RefRequestPayload<'_> {
+    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+        match self {
+            Self::Name(name) => name.encode(env),
+            Self::Query(query) => query.encode(env),
+            Self::Invalid => atoms::nil().encode(env),
+        }
+    }
 }
 
 impl Encoder for ObjectOrNotFound<'_> {
@@ -1145,11 +1294,18 @@ fn open_local<'a>(env: Env<'a>, path: Binary<'a>, opts: OpenLocalOptions) -> Nif
     });
 
     match result {
-        Ok((store, hash)) => Ok(Result::<_, ErrorMap>::Ok((
-            ResourceArc::new(StoreResource(StoreImpl::Local(store))),
-            hash_atom(hash),
-        ))
-        .encode(env)),
+        Ok((store, hash)) => {
+            let store = Arc::new(store);
+            match LocalRefDb::open(path, Arc::clone(&store)) {
+                Ok(refs) => Ok(Result::<_, ErrorMap>::Ok((
+                    ResourceArc::new(StoreResource(StoreImpl::Local(store))),
+                    ResourceArc::new(RefStoreResource(RefStoreImpl::Local(refs))),
+                    hash_atom(hash),
+                ))
+                .encode(env)),
+                Err(error) => Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+            }
+        }
         Err(error) => Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
     }
 }
@@ -1256,6 +1412,28 @@ fn provider_store_new<'a>(
         hash_atom(hash),
     ))
     .encode(env))
+}
+
+#[rustler::nif]
+fn ref_provider_store_new<'a>(env: Env<'a>, opts: RefProviderStoreOptions) -> NifResult<Term<'a>> {
+    let pending = Arc::new(RefPendingTable::default());
+    let transport = NifRefProviderTransport {
+        provider: env.pid(),
+        pending: Arc::downgrade(&pending),
+    };
+    let provider = ProviderRefDb::new_with_pending(
+        RefProviderOptions {
+            request_timeout: Duration::from_millis(opts.request_timeout_ms),
+        },
+        transport,
+        pending,
+    );
+    Ok(
+        Result::<_, ErrorMap>::Ok(ResourceArc::new(RefStoreResource(RefStoreImpl::Provider(
+            Box::new(provider),
+        ))))
+        .encode(env),
+    )
 }
 
 #[rustler::nif]
@@ -1382,6 +1560,23 @@ fn provider_reply(request: ResourceArc<RequestResource>, reply: Term<'_>) -> Ato
     atoms::ok()
 }
 
+/// Validates and copies a reference-provider reply on a dirty CPU scheduler.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn ref_provider_reply(request: ResourceArc<RefRequestResource>, reply: Term<'_>) -> Atom {
+    let Some(pending) = request.pending.upgrade() else {
+        return atoms::ok();
+    };
+    match decode_ref_provider_reply(&request, reply) {
+        Ok(payload) => {
+            pending.reply(request.id, payload);
+        }
+        Err(error) => {
+            pending.reply_error(request.id, error);
+        }
+    }
+    atoms::ok()
+}
+
 /// Copies range replies on a dirty CPU scheduler after exact byte-count
 /// preflight. The ordered vector handed to core follows request order even
 /// though the public backend contract returns a map.
@@ -1407,6 +1602,14 @@ fn provider_failed(store: ResourceArc<StoreResource>) -> Atom {
         provider.provider_down();
     } else if let Some(packfetch) = store.0.as_packfetch() {
         packfetch.provider_down();
+    }
+    atoms::ok()
+}
+
+#[rustler::nif]
+fn ref_provider_failed(store: ResourceArc<RefStoreResource>) -> Atom {
+    if let Some(provider) = store.0.as_provider() {
+        provider.provider_down();
     }
     atoms::ok()
 }
@@ -1438,6 +1641,265 @@ fn packfetch_stats<'a>(env: Env<'a>, store: ResourceArc<StoreResource>) -> NifRe
         return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
     };
     Ok(Result::<_, ErrorMap>::Ok(hydration_stats_map(packfetch.stats())).encode(env))
+}
+
+fn decode_ref_provider_reply(
+    request: &RefRequestResource,
+    reply: Term<'_>,
+) -> Result<RefProviderPayload, Error> {
+    let tuple = get_tuple(reply).map_err(|_| ref_protocol_error("invalid reply envelope"))?;
+    if tuple.len() != 2 {
+        return Err(ref_protocol_error("invalid reply envelope"));
+    }
+    let tag = tuple[0]
+        .decode::<Atom>()
+        .map_err(|_| ref_protocol_error("invalid reply envelope"))?;
+    if tag == atoms::error() {
+        return Ok(
+            if tuple[1]
+                .decode::<Atom>()
+                .is_ok_and(|reason| reason == atoms::unsupported_operation())
+            {
+                RefProviderPayload::UnsupportedOperation
+            } else {
+                RefProviderPayload::BackendError
+            },
+        );
+    }
+    if tag != atoms::ok() {
+        return Err(ref_protocol_error("invalid reply envelope"));
+    }
+
+    match request.kind {
+        RefProviderKind::Resolve => {
+            if tuple[1]
+                .decode::<Atom>()
+                .is_ok_and(|value| value == atoms::not_found())
+            {
+                Ok(RefProviderPayload::Resolve(None))
+            } else {
+                let target = decode_ref_target(tuple[1])?;
+                if ref_target_bytes(&target) > request.max_reply_bytes {
+                    return Err(ref_reply_too_large());
+                }
+                Ok(RefProviderPayload::Resolve(Some(target)))
+            }
+        }
+        RefProviderKind::List => decode_ref_page(request, tuple[1]).map(RefProviderPayload::List),
+    }
+}
+
+fn decode_ref_page(request: &RefRequestResource, term: Term<'_>) -> Result<RefPage, Error> {
+    let items_term = term
+        .map_get(atoms::items())
+        .map_err(|_| ref_protocol_error("ref provider page items are missing"))?;
+    let count = items_term
+        .list_length()
+        .map_err(|_| ref_protocol_error("ref provider page items must be a list"))?;
+    if count > request.expected_limit {
+        return Err(ref_protocol_error(
+            "ref provider returned more references than the requested limit",
+        ));
+    }
+    let next_cursor = decode_optional_binary_field(term, atoms::next_cursor(), "next_cursor")?;
+    if next_cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.len() > gitility_core::cursor::MAX_CURSOR_BYTES)
+    {
+        return Err(ref_protocol_error("ref provider cursor exceeds 4096 bytes"));
+    }
+    let truncated = term
+        .map_get(atoms::truncated())
+        .and_then(bool::decode)
+        .map_err(|_| ref_protocol_error("ref provider page truncated flag is invalid"))?;
+    let item_terms = Vec::<Term<'_>>::decode(items_term)
+        .map_err(|_| ref_protocol_error("ref provider page items must be a list"))?;
+    let mut refs = Vec::with_capacity(item_terms.len());
+    let mut total = next_cursor
+        .as_ref()
+        .map_or(0u64, |cursor| cursor.len() as u64);
+    for item in item_terms {
+        let name = decode_ref_name_field(item, atoms::name(), "ref name")?;
+        if request
+            .expected_prefix
+            .as_deref()
+            .is_some_and(|prefix| !name.starts_with(prefix))
+        {
+            return Err(ref_protocol_error(
+                "ref provider returned a name outside the requested prefix",
+            ));
+        }
+        let target_term = item
+            .map_get(atoms::target())
+            .map_err(|_| ref_protocol_error("ref provider item target is missing"))?;
+        let target = decode_ref_target(target_term)?;
+        total = total
+            .saturating_add(name.len() as u64)
+            .saturating_add(ref_target_bytes(&target));
+        if total > request.max_reply_bytes {
+            return Err(ref_reply_too_large());
+        }
+        refs.push((name, target));
+    }
+    Ok(RefPage {
+        refs,
+        next_cursor,
+        truncated,
+    })
+}
+
+fn decode_ref_target(term: Term<'_>) -> Result<CoreRefTarget, Error> {
+    let kind = term
+        .map_get(atoms::kind())
+        .and_then(Atom::decode)
+        .map_err(|_| ref_protocol_error("ref provider target kind is invalid"))?;
+    if kind == atoms::direct() {
+        let oid_term = term
+            .map_get(atoms::oid())
+            .map_err(|_| ref_protocol_error("direct ref provider target has no object ID"))?;
+        let oid = decode_ref_oid(oid_term)?;
+        let peeled = decode_optional_oid_field(term, atoms::peeled(), "peeled")?;
+        if peeled.is_some_and(|peeled| peeled.kind() != oid.kind()) {
+            return Err(ref_protocol_error(
+                "direct and peeled ref provider IDs use different hash algorithms",
+            ));
+        }
+        let symbolic = term
+            .map_get(atoms::symbolic_target())
+            .map_err(|_| ref_protocol_error("direct ref provider target shape is incomplete"))?;
+        if !is_nil(symbolic) {
+            return Err(ref_protocol_error(
+                "direct ref provider target has a symbolic target",
+            ));
+        }
+        Ok(CoreRefTarget::Direct { oid, peeled })
+    } else if kind == atoms::symbolic() {
+        for field in [atoms::oid(), atoms::peeled()] {
+            let value = term.map_get(field).map_err(|_| {
+                ref_protocol_error("symbolic ref provider target shape is incomplete")
+            })?;
+            if !is_nil(value) {
+                return Err(ref_protocol_error(
+                    "symbolic ref provider target contains an object ID",
+                ));
+            }
+        }
+        let target = decode_ref_name_field(term, atoms::symbolic_target(), "symbolic target")?;
+        Ok(CoreRefTarget::Symbolic(target))
+    } else {
+        Err(ref_protocol_error("ref provider target kind is unknown"))
+    }
+}
+
+fn decode_ref_oid(term: Term<'_>) -> Result<Oid, Error> {
+    let algorithm = term
+        .map_get(atoms::algorithm())
+        .and_then(Atom::decode)
+        .map_err(|_| ref_protocol_error("ref provider object ID algorithm is invalid"))?;
+    let hash = if algorithm == atoms::sha1() {
+        HashKind::Sha1
+    } else if algorithm == atoms::sha256() {
+        HashKind::Sha256
+    } else {
+        return Err(ref_protocol_error(
+            "ref provider object ID algorithm is unknown",
+        ));
+    };
+    let bytes = term
+        .map_get(atoms::bytes())
+        .and_then(Binary::decode)
+        .map_err(|_| ref_protocol_error("ref provider object ID bytes are invalid"))?;
+    Oid::new(hash, bytes.as_slice())
+        .map_err(|_| ref_protocol_error("ref provider object ID length is invalid"))
+}
+
+fn decode_optional_oid_field(
+    term: Term<'_>,
+    key: Atom,
+    name: &'static str,
+) -> Result<Option<Oid>, Error> {
+    let value = term
+        .map_get(key)
+        .map_err(|_| ref_protocol_error("ref provider target is missing a field"))?;
+    if is_nil(value) {
+        Ok(None)
+    } else {
+        decode_ref_oid(value).map(Some).map_err(|_| {
+            Error::new(
+                ErrorCode::ProviderProtocolError,
+                format!("ref provider {name} object ID is invalid"),
+            )
+        })
+    }
+}
+
+fn decode_ref_name_field(term: Term<'_>, key: Atom, name: &'static str) -> Result<Vec<u8>, Error> {
+    let bytes = term
+        .map_get(key)
+        .and_then(Binary::decode)
+        .map_err(|_| ref_protocol_error("ref provider name field is not a binary"))?;
+    if bytes.len() > gitility_core::cursor::MAX_CURSOR_BYTES {
+        return Err(ref_protocol_error(
+            "ref provider name exceeds the 4096-byte protocol ceiling",
+        ));
+    }
+    gitility_core::validate_full_ref_name(bytes.as_slice()).map_err(|_| {
+        Error::new(
+            ErrorCode::ProviderProtocolError,
+            format!("ref provider {name} is not a valid full ref name"),
+        )
+    })?;
+    Ok(bytes.as_slice().to_vec())
+}
+
+fn decode_optional_binary_field(
+    term: Term<'_>,
+    key: Atom,
+    name: &'static str,
+) -> Result<Option<Vec<u8>>, Error> {
+    let value = term
+        .map_get(key)
+        .map_err(|_| ref_protocol_error("ref provider page is missing a field"))?;
+    if is_nil(value) {
+        Ok(None)
+    } else {
+        Binary::decode(value)
+            .map(|binary| Some(binary.as_slice().to_vec()))
+            .map_err(|_| {
+                Error::new(
+                    ErrorCode::ProviderProtocolError,
+                    format!("ref provider {name} must be a binary or nil"),
+                )
+            })
+    }
+}
+
+fn is_nil(term: Term<'_>) -> bool {
+    term.decode::<Atom>().is_ok_and(|atom| atom == atoms::nil())
+}
+
+fn ref_target_bytes(target: &CoreRefTarget) -> u64 {
+    match target {
+        CoreRefTarget::Symbolic(name) => name.len() as u64,
+        CoreRefTarget::Direct { oid, peeled } => {
+            oid.as_bytes().len() as u64
+                + peeled
+                    .as_ref()
+                    .map_or(0, |peeled| peeled.as_bytes().len() as u64)
+        }
+    }
+}
+
+fn ref_reply_too_large() -> Error {
+    Error::new(
+        ErrorCode::BudgetExceeded,
+        "ref provider reply exceeds max_provider_bytes",
+    )
+    .with_limit("max_provider_bytes")
+}
+
+fn ref_protocol_error(message: &'static str) -> Error {
+    Error::new(ErrorCode::ProviderProtocolError, message)
 }
 
 fn decode_range_reply(
@@ -2106,6 +2568,120 @@ fn job_submit_snapshot_open<'a>(
         limits,
         budget_limits(limits),
         JobResultKind::Other,
+        task,
+    )
+}
+
+#[rustler::nif]
+fn job_submit_snapshot_open_direct<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    store: ResourceArc<StoreResource>,
+    raw_oid: Binary<'a>,
+    limits: LimitsMap,
+) -> NifResult<Term<'a>> {
+    let oid = match oid_for_store(&store, raw_oid.as_slice()) {
+        Ok(oid) => oid,
+        Err(error) => return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env)),
+    };
+    let task_store = store.clone();
+    let task = Box::new(move |budget: &Budget| {
+        Snapshot::open_direct(task_store.0.as_dyn(), oid, budget).map(JobOutput::Snapshot)
+    });
+    submit_job(
+        env,
+        runtime,
+        false,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Other,
+        task,
+    )
+}
+
+#[rustler::nif]
+fn job_submit_ref_resolve<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    refs: ResourceArc<RefStoreResource>,
+    name: Binary<'a>,
+    limits: LimitsMap,
+) -> NifResult<Term<'a>> {
+    if let Err(error) = gitility_core::validate_full_ref_name(name.as_slice()) {
+        return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+    }
+    let name = name.as_slice().to_vec();
+    let task_refs = refs.clone();
+    let task = Box::new(move |budget: &Budget| {
+        task_refs
+            .0
+            .as_dyn()
+            .resolve_following(&name, budget)
+            .map(JobOutput::RefTarget)
+    });
+    submit_job(
+        env,
+        runtime,
+        false,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Other,
+        task,
+    )
+}
+
+#[rustler::nif]
+#[allow(clippy::too_many_arguments)]
+fn job_submit_ref_list<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    refs: ResourceArc<RefStoreResource>,
+    prefix: Option<Binary<'a>>,
+    limit: u64,
+    cursor: Option<Binary<'a>>,
+    limits: LimitsMap,
+) -> NifResult<Term<'a>> {
+    if limit == 0 {
+        let error = Error::new(
+            ErrorCode::InvalidArgument,
+            "reference page limit must be positive",
+        );
+        return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+    }
+    let stopped_by_max_results = limits.max_results < limit;
+    let effective_limit = limit.min(limits.max_results);
+    let limit = match usize::try_from(effective_limit) {
+        Ok(limit) => limit,
+        Err(_) => {
+            let error = Error::new(
+                ErrorCode::InvalidArgument,
+                "reference page limit is too large",
+            );
+            return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+        }
+    };
+    let query = CoreRefQuery {
+        prefix: prefix.map(|prefix| prefix.as_slice().to_vec()),
+        limit,
+        cursor: cursor.map(|cursor| cursor.as_slice().to_vec()),
+    };
+    let task_refs = refs.clone();
+    let task = Box::new(move |budget: &Budget| {
+        task_refs
+            .0
+            .as_dyn()
+            .list(query, budget)
+            .map(JobOutput::Refs)
+    });
+    submit_job(
+        env,
+        runtime,
+        false,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Page {
+            stopped_by_max_results,
+        },
         task,
     )
 }
@@ -3123,6 +3699,40 @@ fn encode_job_output<'a>(
             stats: stats_map(file.stats, elapsed_ms, atoms::limit(), provider_spend),
         }
         .encode(env),
+        JobOutput::RefTarget(Some(target)) => ref_target_map(env, target).encode(env),
+        JobOutput::RefTarget(None) => atoms::not_found().encode(env),
+        JobOutput::Refs(page) => {
+            let stopped_by = match result_kind {
+                JobResultKind::Page {
+                    stopped_by_max_results: true,
+                } => atoms::max_results(),
+                JobResultKind::Page {
+                    stopped_by_max_results: false,
+                }
+                | JobResultKind::Other => atoms::limit(),
+            };
+            let mut stats = QueryStats {
+                entries_emitted: page.refs.len() as u64,
+                ..QueryStats::default()
+            };
+            if page.truncated {
+                stats.stopped_by = Some("limit");
+            }
+            RefPageMap {
+                refs: page
+                    .refs
+                    .into_iter()
+                    .map(|(name, target)| RefEntryMap {
+                        name: binary(env, &name),
+                        target: ref_target_map(env, target),
+                    })
+                    .collect(),
+                next_cursor: page.next_cursor.map(|cursor| binary(env, &cursor)),
+                truncated: page.truncated,
+                stats: stats_map(stats, elapsed_ms, stopped_by, provider_spend),
+            }
+            .encode(env)
+        }
         JobOutput::Submodules(submodules) => SubmodulesMap {
             submodules: submodules
                 .into_iter()
@@ -3301,6 +3911,15 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
                     .map(|pointer| length(pointer.oid.as_bytes()))
                     .unwrap_or(0),
             ),
+        JobOutput::RefTarget(target) => target.as_ref().map_or(0, ref_target_size),
+        JobOutput::Refs(page) => page.refs.iter().fold(
+            page.next_cursor.as_deref().map(length).unwrap_or(0),
+            |total, (name, target)| {
+                total
+                    .saturating_add(length(name))
+                    .saturating_add(ref_target_size(target))
+            },
+        ),
         JobOutput::Submodules(submodules) => submodules.iter().fold(0, |total, submodule| {
             total
                 .saturating_add(submodule.name.as_deref().map(length).unwrap_or(0))
@@ -3331,6 +3950,22 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
         JobOutput::Snapshot(snapshot) => length(snapshot.commit_oid.as_bytes())
             .saturating_add(length(snapshot.tree_oid.as_bytes())),
         JobOutput::Hydration(stats) => length(stats.generation.as_bytes()).saturating_add(96),
+    }
+}
+
+fn ref_target_size(target: &CoreRefTarget) -> u64 {
+    fn length(bytes: &[u8]) -> u64 {
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+    }
+
+    match target {
+        CoreRefTarget::Symbolic(name) => length(name),
+        CoreRefTarget::Direct { oid, peeled } => length(oid.as_bytes()).saturating_add(
+            peeled
+                .as_ref()
+                .map(|peeled| length(peeled.as_bytes()))
+                .unwrap_or(0),
+        ),
     }
 }
 
@@ -3408,6 +4043,30 @@ fn object_map<'a>(env: Env<'a>, kind: ObjectKind, data: &[u8]) -> ObjectMap<'a> 
         kind: object_kind_atom(kind),
         size: data.len() as u64,
         data: binary(env, data),
+    }
+}
+
+fn ref_target_map<'a>(env: Env<'a>, target: CoreRefTarget) -> RefTargetMap<'a> {
+    match target {
+        CoreRefTarget::Direct { oid, peeled } => RefTargetMap {
+            kind: atoms::direct(),
+            oid: Some(oid_map(env, oid)),
+            symbolic_target: None,
+            peeled: peeled.map(|peeled| oid_map(env, peeled)),
+        },
+        CoreRefTarget::Symbolic(target) => RefTargetMap {
+            kind: atoms::symbolic(),
+            oid: None,
+            symbolic_target: Some(binary(env, &target)),
+            peeled: None,
+        },
+    }
+}
+
+fn oid_map(env: Env<'_>, oid: Oid) -> OidMap<'_> {
+    OidMap {
+        algorithm: hash_atom(oid.kind()),
+        bytes: binary(env, oid.as_bytes()),
     }
 }
 
@@ -3614,6 +4273,13 @@ fn provider_kind_atom(kind: ProviderKind) -> Atom {
     }
 }
 
+fn ref_provider_kind_atom(kind: RefProviderKind) -> Atom {
+    match kind {
+        RefProviderKind::Resolve => atoms::resolve(),
+        RefProviderKind::List => atoms::list(),
+    }
+}
+
 fn object_kind_atom(kind: ObjectKind) -> Atom {
     match kind {
         ObjectKind::Commit => atoms::commit(),
@@ -3777,8 +4443,10 @@ mod atoms {
         queue_full,
         owner_ceiling,
         not_found,
+        unsupported_operation,
         gitility_provider_request,
         gitility_range_request,
+        gitility_ref_request,
         sha1,
         sha256,
         commit,
@@ -3815,6 +4483,10 @@ mod atoms {
         header,
         object,
         prefetch,
+        resolve,
+        list,
+        direct,
+        symbolic,
         manifest,
         read_ranges,
         version,
@@ -3835,6 +4507,13 @@ mod atoms {
         algorithm,
         bytes,
         oid,
+        name,
+        kind,
+        target,
+        symbolic_target,
+        peeled,
+        items,
+        next_cursor,
         data,
         size,
         type_atom = "type",

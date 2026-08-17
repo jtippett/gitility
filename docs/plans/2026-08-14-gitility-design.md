@@ -426,9 +426,10 @@ that cannot make progress.
 ### Composing refs with an ODB
 
 ```elixir
-{:ok, refs} =
+{:ok, ref_provider} =
   Gitility.RefDB.start_link(backend: {MyCompany.GitRefBackend, backend_options})
 
+{:ok, refs} = Gitility.RefDB.handle(ref_provider)
 {:ok, repo} = Gitility.Repository.from_stores(odb: odb, refs: refs)
 
 {:ok, snapshot} = Gitility.Repository.snapshot(repo, {:ref, "refs/pull/481/head"})
@@ -444,8 +445,9 @@ Safe selectors are:
 :head
 ```
 
-`{:revspec, string}` is an opt-in advanced selector and is unavailable when
-the configured stores cannot support its required operations.
+`{:revspec, string}` is reserved for a future opt-in advanced selector.
+Gitility 0.x always rejects it as `:unsupported_operation`; no 0.x store
+advertises the advanced selector capability.
 
 ### Tree traversal
 
@@ -804,7 +806,7 @@ defmodule Gitility.RefDB.Backend do
               | {:error, term()}
 
   @callback list(Gitility.RefQuery.t(), state()) ::
-              {:ok, Gitility.RefPage.t()} | {:error, term()}
+              {:ok, Gitility.Page.t(Gitility.Ref.t())} | {:error, term()}
 
   @callback refresh(state()) :: :ok | {:error, term()}
 
@@ -813,6 +815,10 @@ defmodule Gitility.RefDB.Backend do
   @optional_callbacks list: 2, refresh: 1, terminate: 2
 end
 ```
+
+Elixir API deviation recorded at M0: refs reuse the one public
+`Gitility.Page` type used by every large collection. `RefPage` remains an
+internal Rust DTO only; there is no `Gitility.RefPage` module.
 
 Full reference names are raw binaries. Convenience branch and tag selectors
 are expanded by Gitility before calling the backend. Symbolic refs are followed
@@ -1246,7 +1252,14 @@ offset  size  field
                                       rest of a file's matches at a
                                       mid-file page boundary);
                                       log/history: last emitted commit
-                                      digest)
+                                      digest; refs: the raw full ref name of
+                                      the last emitted ref, resumed at names
+                                      strictly greater in byte order (amended
+                                      2026-08-17, before any ref cursor
+                                      existed; refs have no snapshot commit,
+                                      so the digest field is the all-zero
+                                      digest of the ref store's hash kind and
+                                      generation is empty))
 …       4     CRC32 (IEEE) of every preceding byte (LE)
 ```
 

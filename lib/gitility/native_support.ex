@@ -13,6 +13,8 @@ defmodule Gitility.NativeSupport do
     ODB,
     OID,
     Page,
+    Ref,
+    RefTarget,
     Repository,
     Runtime,
     SearchMatch,
@@ -207,6 +209,26 @@ defmodule Gitility.NativeSupport do
     }
   end
 
+  def job_payload(%{refs: refs, next_cursor: cursor, stats: stats} = page) do
+    items =
+      Enum.map(refs, fn ref ->
+        %Ref{name: ref.name, target: ref_target_payload(ref.target)}
+      end)
+
+    %Page{
+      items: items,
+      next_cursor: if(cursor, do: Base.url_encode64(cursor, padding: false)),
+      truncated: page.truncated,
+      stats: struct!(Stats, Map.to_list(stats)),
+      warnings: page_warnings(page.truncated, stats.stopped_by)
+    }
+  end
+
+  def job_payload(%{kind: kind, oid: _oid, symbolic_target: _target, peeled: _peeled} = target)
+      when kind in [:direct, :symbolic] do
+    ref_target_payload(target)
+  end
+
   def job_payload(%{path: path, hunks: hunks, stats: stats, warnings: warnings}) do
     %Blame{
       path: path,
@@ -339,6 +361,22 @@ defmodule Gitility.NativeSupport do
 
   defp job_oid(bytes) when byte_size(bytes) == 20, do: oid_from_bytes(:sha1, bytes)
   defp job_oid(bytes) when byte_size(bytes) == 32, do: oid_from_bytes(:sha256, bytes)
+
+  defp ref_target_payload(%{kind: :direct, oid: oid, symbolic_target: nil, peeled: peeled}) do
+    %RefTarget{
+      kind: :direct,
+      oid: ref_oid_payload(oid),
+      symbolic_target: nil,
+      peeled: if(peeled, do: ref_oid_payload(peeled))
+    }
+  end
+
+  defp ref_target_payload(%{kind: :symbolic, oid: nil, symbolic_target: target, peeled: nil}) do
+    %RefTarget{kind: :symbolic, oid: nil, symbolic_target: target, peeled: nil}
+  end
+
+  defp ref_oid_payload(%{algorithm: algorithm, bytes: bytes}),
+    do: oid_from_bytes(algorithm, bytes)
 
   defp identity_payload(identity) do
     %Identity{

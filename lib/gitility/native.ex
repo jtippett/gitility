@@ -22,17 +22,29 @@ defmodule Gitility.Native do
   def open_local(_path, _opts), do: :erlang.nif_error(:nif_not_loaded)
   def static_from_objects(_objects, _hash), do: :erlang.nif_error(:nif_not_loaded)
   def provider_store_new(_hash, _opts), do: :erlang.nif_error(:nif_not_loaded)
+  def ref_provider_store_new(_opts), do: :erlang.nif_error(:nif_not_loaded)
   def packfetch_store_new(_hash, _opts), do: :erlang.nif_error(:nif_not_loaded)
   def layered_store_new(_stores, _cache, _cache_index), do: :erlang.nif_error(:nif_not_loaded)
   def provider_reply(_request, _reply), do: :erlang.nif_error(:nif_not_loaded)
+  def ref_provider_reply(_request, _reply), do: :erlang.nif_error(:nif_not_loaded)
   def range_reply(_request, _reply), do: :erlang.nif_error(:nif_not_loaded)
   def provider_failed(_store), do: :erlang.nif_error(:nif_not_loaded)
+  def ref_provider_failed(_store), do: :erlang.nif_error(:nif_not_loaded)
   def provider_refresh(_store), do: :erlang.nif_error(:nif_not_loaded)
   def packfetch_stats(_store), do: :erlang.nif_error(:nif_not_loaded)
   def packfetch_hydrate(_runtime, _store, _limits), do: :erlang.nif_error(:nif_not_loaded)
   def packfetch_refresh(_runtime, _store, _limits), do: :erlang.nif_error(:nif_not_loaded)
 
   def job_submit_snapshot_open(_runtime, _resource, _oid, _limits),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def job_submit_snapshot_open_direct(_runtime, _resource, _oid, _limits),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def job_submit_ref_resolve(_runtime, _resource, _name, _limits),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def job_submit_ref_list(_runtime, _resource, _prefix, _limit, _cursor, _limits),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def job_submit_odb_header(_runtime, _resource, _oid, _limits),

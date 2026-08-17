@@ -117,7 +117,8 @@ defmodule Gitility.Milestone3eMetadataTest do
   end
 
   test "a snapshot with neither metadata nor gitlinks returns an empty list", context do
-    assert {:ok, repository} = Repository.open(fixture("sha1-nested.git"), runtime: context.runtime)
+    assert {:ok, repository} =
+             Repository.open(fixture("sha1-nested.git"), runtime: context.runtime)
 
     assert {:ok, snapshot} =
              Repository.snapshot(repository, {:oid, fixture_oid(:sha1_nested_head)})
@@ -136,7 +137,7 @@ defmodule Gitility.Milestone3eMetadataTest do
             %Error{
               code: :malformed_object,
               operation: :submodules,
-              details: %{file: ".gitmodules", reason: "git_config_parse_error"}
+              details: %{file: ".gitmodules", reason: "git_config_parse_error", line: 1}
             }} = Gitility.submodules(malformed)
 
     assert {:error,
@@ -158,15 +159,11 @@ defmodule Gitility.Milestone3eMetadataTest do
              size: 12_345
            }
 
-    assert {:ok, extension} =
-             Gitility.read_file(context.snapshot, "lfs/unknown-key.bin")
-
-    assert extension.lfs_pointer == %{
-             oid: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-             size: 54_321
-           }
-
-    for path <- ["lfs/almost-pointer.bin", "lfs/over-1024.bin"] do
+    for path <- [
+          "lfs/not-a-pointer.bin",
+          "lfs/almost-pointer.bin",
+          "lfs/over-1024.bin"
+        ] do
       assert {:ok, file} = Gitility.read_file(context.snapshot, path)
       assert file.lfs_pointer == nil
     end

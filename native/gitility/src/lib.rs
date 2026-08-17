@@ -707,6 +707,7 @@ struct ErrorMap<'a> {
     file: Option<String>,
     reason: Option<String>,
     line_count: Option<u32>,
+    line: Option<u32>,
 }
 
 #[derive(NifMap)]
@@ -3689,6 +3690,7 @@ fn missing_object(oid: Oid) -> Error {
 
 fn error_map<'a>(env: Env<'a>, error: Error) -> NifResult<ErrorMap<'a>> {
     let line_count = error.line_count();
+    let line = error.line();
     Ok(ErrorMap {
         code: Atom::from_str(env, error.code.as_str())?,
         message: error.message,
@@ -3702,6 +3704,7 @@ fn error_map<'a>(env: Env<'a>, error: Error) -> NifResult<ErrorMap<'a>> {
             .reason
             .map(|reason| truncate_utf8(reason.into(), 1_024)),
         line_count,
+        line,
     })
 }
 

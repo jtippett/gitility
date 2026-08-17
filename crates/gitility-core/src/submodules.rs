@@ -1,23 +1,23 @@
 //! Bounded `.gitmodules` parsing and gitlink correlation.
 //!
 //! The query reads only the snapshot's root `.gitmodules` blob and tree
-//! objects needed to enumerate gitlinks. URLs remain inert metadata, and a
-//! gitlink's commit object is never opened or traversed.
+//! objects needed to enumerate gitlinks. Declaration paths and URLs remain
+//! inert correlation bytes: they are never resolved against a filesystem or
+//! network. A gitlink's commit object is never opened or traversed.
 
 use crate::budget::Budget;
 use crate::error::{Error, ErrorCode, ErrorFile};
+use crate::git_config;
 use crate::object::{ObjectKind, Oid};
 use crate::odb::ObjectDb;
 use crate::snapshot::Snapshot;
 use crate::tree::{
-    ensure_query_compatible, join_path, read_tree_entries_for_walk, validate_path, OwnedTreeEntry,
-    TreeItemKind,
+    ensure_query_compatible, join_path, read_tree_entries_for_walk, OwnedTreeEntry, TreeItemKind,
 };
-use bstr::ByteSlice;
 use std::collections::BTreeMap;
 
 const GITMODULES_PATH: &[u8] = b".gitmodules";
-const CONFIG_KEYS: [&str; 5] = ["path", "url", "branch", "update", "shallow"];
+const MAX_GITMODULES_BYTES: usize = 1024 * 1024;
 
 /// Correlation state between a `.gitmodules` declaration and the snapshot
 /// tree.
@@ -42,24 +42,35 @@ pub struct Submodule {
     pub status: SubmoduleStatus,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Declaration {
     name: Vec<u8>,
+    path: Vec<u8>,
+    url: Option<Vec<u8>>,
+    branch: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Default)]
+struct PendingDeclaration {
     path: Option<Vec<u8>>,
     url: Option<Vec<u8>>,
     branch: Option<Vec<u8>>,
-    #[allow(dead_code)]
-    update: Option<Vec<u8>>,
-    #[allow(dead_code)]
-    shallow: Option<Vec<u8>>,
 }
 
 /// Returns the snapshot's declared and actual submodules in ascending raw-path
 /// order.
 ///
-/// `.gitmodules` is parsed with `gix-config`'s Git-compatible byte grammar.
-/// Includes are deliberately not followed: a blob has no filesystem context,
-/// and the API never performs external I/O or URL resolution.
+/// `.gitmodules` is parsed with the byte grammar of Git 2.55.0's config blob
+/// reader. Includes are deliberately not followed. Declarations with no
+/// valued `path` are ignored; all valued paths, including empty, absolute,
+/// parent-relative, and trailing-slash forms, remain inert bytes. A non-blob
+/// root `.gitmodules` entry is treated as absent. (Git separately refuses a
+/// symlinked `.gitmodules` in a working tree after CVE-2018-11235.)
+///
+/// Correlation walks the full snapshot without pagination and is bounded by
+/// the caller's object/tree-entry limits. When names collide on a path, raw
+/// name order decides ownership: the first name claims the gitlink and later
+/// declarations are orphaned. Empty paths sort before non-empty paths.
 pub fn submodules(
     store: &dyn ObjectDb,
     snapshot: &Snapshot,
@@ -72,9 +83,7 @@ pub fn submodules(
 
     let mut rows = Vec::with_capacity(declarations.len().saturating_add(gitlinks.len()));
     for declaration in declarations {
-        let path = declaration
-            .path
-            .expect("validated declarations always carry paths");
+        let path = declaration.path;
         let commit_oid = gitlinks.remove(&path);
         rows.push(Submodule {
             name: Some(declaration.name),
@@ -113,90 +122,80 @@ fn read_declarations(
         return Ok(Vec::new());
     };
     if entry.kind != TreeItemKind::Blob {
-        return Err(malformed_gitmodules(
-            "snapshot .gitmodules entry is not a regular blob",
-        ));
+        return Ok(Vec::new());
+    }
+
+    let header = store
+        .try_header(&entry.oid, budget)
+        .map_err(name_gitmodules_error)?
+        .ok_or_else(|| missing_gitmodules(entry.oid))?;
+    if header.kind != ObjectKind::Blob {
+        return Ok(Vec::new());
+    }
+    if header.size > MAX_GITMODULES_BYTES as u64 {
+        return Err(gitmodules_too_large());
     }
 
     let mut payload = Vec::new();
     let kind = store
         .try_find(&entry.oid, &mut payload, budget)
         .map_err(name_gitmodules_error)?
-        .ok_or_else(|| {
-            Error::retryable(
-                ErrorCode::MissingObject,
-                format!(
-                    ".gitmodules blob {} is missing from the object store",
-                    entry.oid
-                ),
-            )
-            .with_oid(entry.oid)
-        })?;
+        .ok_or_else(|| missing_gitmodules(entry.oid))?;
     if kind != ObjectKind::Blob {
-        return Err(malformed_gitmodules(
-            "snapshot .gitmodules object is not a blob",
-        ));
+        return Ok(Vec::new());
+    }
+    if payload.len() > MAX_GITMODULES_BYTES {
+        return Err(gitmodules_too_large());
     }
     parse_declarations(&payload)
 }
 
-fn parse_config(payload: &[u8]) -> Result<gix_config::File, Error> {
-    gix_config::File::try_from(payload.as_bstr()).map_err(|_| {
+fn parse_declarations(payload: &[u8]) -> Result<Vec<Declaration>, Error> {
+    let mut declarations = BTreeMap::<Vec<u8>, PendingDeclaration>::new();
+    git_config::parse(payload, |key, value| {
+        let Some((name, field)) = submodule_key(key) else {
+            return;
+        };
+        let declaration = declarations.entry(name.to_vec()).or_default();
+        let value = value.map(<[u8]>::to_vec);
+        match field {
+            b"path" => declaration.path = value,
+            b"url" => declaration.url = value,
+            b"branch" => declaration.branch = value,
+            _ => unreachable!("submodule_key returns only retained fields"),
+        }
+    })
+    .map_err(|error| {
         malformed_gitmodules("snapshot .gitmodules is malformed")
             .with_reason("git_config_parse_error")
-    })
+            .with_line(error.line)
+    })?;
+
+    Ok(declarations
+        .into_iter()
+        .filter_map(|(name, declaration)| {
+            declaration.path.map(|path| Declaration {
+                name,
+                path,
+                url: declaration.url,
+                branch: declaration.branch,
+            })
+        })
+        .collect())
 }
 
-fn parse_declarations(payload: &[u8]) -> Result<Vec<Declaration>, Error> {
-    let config = parse_config(payload)?;
-    let mut declarations = BTreeMap::<Vec<u8>, Declaration>::new();
-    for section in config.sections() {
-        let header = section.header();
-        if !header.name().eq_ignore_ascii_case(b"submodule") {
-            continue;
-        }
-        let Some(name) = header.subsection_name() else {
-            continue;
-        };
-        let declaration = declarations
-            .entry(name.to_vec())
-            .or_insert_with(|| Declaration {
-                name: name.to_vec(),
-                ..Declaration::default()
-            });
-        for key in CONFIG_KEYS {
-            let Some(value) = section.value_implicit(key) else {
-                continue;
-            };
-            // Git config's implicit value is the boolean string "true".
-            let value = value.map_or_else(|| b"true".to_vec(), |value| value.to_vec());
-            match key {
-                "path" => declaration.path = Some(value),
-                "url" => declaration.url = Some(value),
-                "branch" => declaration.branch = Some(value),
-                "update" => declaration.update = Some(value),
-                "shallow" => declaration.shallow = Some(value),
-                _ => unreachable!("CONFIG_KEYS contains only supported keys"),
-            }
+fn submodule_key(key: &[u8]) -> Option<(&[u8], &[u8])> {
+    let rest = key.strip_prefix(b"submodule.")?;
+    for field in [b"path".as_slice(), b"url", b"branch"] {
+        let suffix_len = field.len().checked_add(1)?;
+        if rest.len() >= suffix_len
+            && rest[rest.len() - suffix_len] == b'.'
+            && &rest[rest.len() - field.len()..] == field
+        {
+            return Some((&rest[..rest.len() - suffix_len], field));
         }
     }
-
-    declarations
-        .into_values()
-        .map(|declaration| {
-            let Some(path) = declaration.path.as_deref() else {
-                return Err(
-                    malformed_gitmodules("submodule declaration is missing its path")
-                        .with_reason("submodule_path_missing"),
-                );
-            };
-            validate_path(path).map_err(|_| {
-                malformed_gitmodules("submodule declaration path is malformed")
-                    .with_reason("submodule_path_invalid")
-            })?;
-            Ok(declaration)
-        })
-        .collect()
+    None
 }
 
 fn collect_gitlinks(
@@ -259,17 +258,34 @@ fn malformed_gitmodules(message: &str) -> Error {
     Error::new(ErrorCode::MalformedObject, message).with_file(ErrorFile::Gitmodules)
 }
 
+fn missing_gitmodules(oid: Oid) -> Error {
+    Error::retryable(
+        ErrorCode::MissingObject,
+        format!(".gitmodules blob {oid} is missing from the object store"),
+    )
+    .with_oid(oid)
+}
+
+fn gitmodules_too_large() -> Error {
+    Error::new(
+        ErrorCode::ObjectTooLarge,
+        "snapshot .gitmodules exceeds the dedicated 1 MiB config limit",
+    )
+    .with_limit("max_gitmodules_bytes")
+    .with_file(ErrorFile::Gitmodules)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::budget::BudgetLimits;
     use crate::local_odb::LocalOdb;
+    use crate::object::HashKind;
+    use crate::static_odb::StaticOdb;
     use crate::test_support::{fixture_oid, fixture_repo};
-    use std::process::Command;
+    use crate::verify::object_id;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-
-    type ConfigEntry = (Vec<u8>, Vec<u8>);
 
     fn fixture(name: &str, oid_name: &str) -> (LocalOdb, Snapshot) {
         let (store, _) =
@@ -335,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_handles_case_comments_quotes_continuations_and_all_supported_keys() {
+    fn parser_handles_case_comments_quotes_continuations_and_retained_keys() {
         let payload = br#"
             ; comment
             [SuBmOdUlE "CaseSensitive"]
@@ -343,6 +359,7 @@ mod tests {
               URL = "ssh://host/a\\b#kept" # comment
               BrAnCh = feature/\
 v2
+              ; update and shallow are valid config but intentionally dead
               UPDATE = rebase
               shallow = true
         "#;
@@ -350,10 +367,7 @@ v2
         assert_eq!(declarations.len(), 1);
         let declaration = &declarations[0];
         assert_eq!(declaration.name, b"CaseSensitive");
-        assert_eq!(
-            declaration.path.as_deref(),
-            Some(b"sub/space path".as_slice())
-        );
+        assert_eq!(declaration.path, b"sub/space path");
         assert_eq!(
             declaration.url.as_deref(),
             Some(b"ssh://host/a\\b#kept".as_slice())
@@ -362,8 +376,148 @@ v2
             declaration.branch.as_deref(),
             Some(b"feature/v2".as_slice())
         );
-        assert_eq!(declaration.update.as_deref(), Some(b"rebase".as_slice()));
-        assert_eq!(declaration.shallow.as_deref(), Some(b"true".as_slice()));
+    }
+
+    #[test]
+    fn declarations_degrade_independently_and_paths_are_inert_bytes() {
+        let payload = br#"
+            [submodule "missing"]
+              url = ignored-without-path
+            [submodule "valueless"]
+              path
+            [submodule "cleared"]
+              path = first
+              path
+            [submodule "empty"]
+              path = ""
+            [submodule "parent"]
+              path = ../evil
+            [submodule "absolute"]
+              path = /etc/passwd
+            [submodule "slash"]
+              path = trailing/
+        "#;
+        let declarations = parse_declarations(payload).expect("Git config accepts inert paths");
+        assert_eq!(
+            declarations
+                .iter()
+                .map(|declaration| (declaration.name.as_slice(), declaration.path.as_slice()))
+                .collect::<Vec<_>>(),
+            [
+                (b"absolute".as_slice(), b"/etc/passwd".as_slice()),
+                (b"empty".as_slice(), b"".as_slice()),
+                (b"parent".as_slice(), b"../evil".as_slice()),
+                (b"slash".as_slice(), b"trailing/".as_slice()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_matches_dotted_case_nul_and_last_wins_semantics() {
+        // The oracle's `--null` framing cannot carry NUL-bearing values
+        // unambiguously, so these cases are asserted only through our API.
+        let payload = b"[submodule.Name]\npath=first\n\
+            [submodule \"name\"]\npath=second\nurl=old\nurl=new\n\
+            [submodule \"Name\"]\npath=upper\n\
+            [submodule \"nul-name\0ignored\"]\npath=gone\n\
+            [submodule \"nul-value\"]\npath=kept\0ignored\n";
+        let declarations = parse_declarations(payload).expect("NUL-bearing config parses");
+        assert_eq!(declarations.len(), 3);
+        assert_eq!(declarations[0].name, b"Name");
+        assert_eq!(declarations[0].path, b"upper");
+        assert_eq!(declarations[1].name, b"name");
+        assert_eq!(declarations[1].path, b"second");
+        assert_eq!(declarations[1].url.as_deref(), Some(b"new".as_slice()));
+        assert_eq!(declarations[2].name, b"nul-value");
+        assert_eq!(declarations[2].path, b"kept");
+    }
+
+    #[test]
+    fn malformed_config_reports_gits_one_based_line() {
+        let error = parse_declarations(b"[core]\nkey=value\nnot a value\n")
+            .expect_err("bad config line fails");
+        assert_eq!(error.code, ErrorCode::MalformedObject);
+        assert_eq!(error.file, Some(ErrorFile::Gitmodules));
+        assert_eq!(error.line(), Some(3));
+    }
+
+    #[test]
+    fn include_directives_are_ignored_without_external_io() {
+        // Never send this fixture to `git config --blob`: that command follows
+        // includes, unlike Git's real `.gitmodules` machinery and this API.
+        let payload = b"[include]\npath=/definitely/not/read\n\
+            [submodule \"safe\"]\npath=module\n";
+        let declarations = parse_declarations(payload).expect("include syntax is valid config");
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, b"safe");
+        assert_eq!(declarations[0].path, b"module");
+    }
+
+    #[test]
+    fn name_collision_uses_raw_name_order_to_claim_the_gitlink() {
+        let config = b"[submodule \"zeta\"]\npath=module\n\
+            [submodule \"alpha\"]\npath=module\n";
+        let gitlink = Oid::new(HashKind::Sha1, &[7; 20]).expect("gitlink oid");
+        let (store, snapshot) = snapshot_store(config, &[(0o160000, b"module", gitlink)]);
+        let rows = submodules(&store, &snapshot, &Budget::unlimited()).expect("correlation works");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name.as_deref(), Some(b"alpha".as_slice()));
+        assert_eq!(rows[0].status, SubmoduleStatus::Active);
+        assert_eq!(rows[0].commit_oid, Some(gitlink));
+        assert_eq!(rows[1].name.as_deref(), Some(b"zeta".as_slice()));
+        assert_eq!(rows[1].status, SubmoduleStatus::Orphaned);
+        assert_eq!(rows[1].commit_oid, None);
+    }
+
+    #[test]
+    fn empty_path_is_an_orphan_sorted_before_undeclared_gitlinks() {
+        let config = b"[submodule \"empty\"]\npath=\n";
+        let gitlink = Oid::new(HashKind::Sha1, &[8; 20]).expect("gitlink oid");
+        let (store, snapshot) = snapshot_store(config, &[(0o160000, b"module", gitlink)]);
+        let rows = submodules(&store, &snapshot, &Budget::unlimited()).expect("correlation works");
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].path.is_empty());
+        assert_eq!(rows[0].status, SubmoduleStatus::Orphaned);
+        assert_eq!(rows[1].path, b"module");
+        assert_eq!(rows[1].status, SubmoduleStatus::Undeclared);
+    }
+
+    #[test]
+    fn non_blob_gitmodules_entries_and_objects_are_absent() {
+        let oid = object_id(HashKind::Sha1, ObjectKind::Blob, b"target").expect("blob hashes");
+        let store =
+            StaticOdb::from_objects(HashKind::Sha1, [(ObjectKind::Blob, b"target".to_vec())])
+                .expect("store loads");
+        for kind in [
+            TreeItemKind::Tree,
+            TreeItemKind::Symlink,
+            TreeItemKind::Gitlink,
+        ] {
+            let root = [OwnedTreeEntry {
+                mode: 0,
+                name: GITMODULES_PATH.to_vec(),
+                oid,
+                kind,
+            }];
+            assert_eq!(
+                read_declarations(&store, &root, &Budget::unlimited()).unwrap(),
+                []
+            );
+        }
+
+        let tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, b"").expect("tree hashes");
+        let store = StaticOdb::from_objects(HashKind::Sha1, [(ObjectKind::Tree, Vec::new())])
+            .expect("tree store loads");
+        let root = [OwnedTreeEntry {
+            mode: 0o100644,
+            name: GITMODULES_PATH.to_vec(),
+            oid: tree_oid,
+            kind: TreeItemKind::Blob,
+        }];
+        assert_eq!(
+            read_declarations(&store, &root, &Budget::unlimited()).unwrap(),
+            []
+        );
     }
 
     #[test]
@@ -374,6 +528,7 @@ v2
             .expect_err("malformed config fails");
         assert_eq!(malformed.code, ErrorCode::MalformedObject);
         assert_eq!(malformed.file, Some(ErrorFile::Gitmodules));
+        assert_eq!(malformed.line(), Some(1));
 
         let (_, snapshot) = fixture("sha1-submodules.git", "sha1_submodules_head");
         let budget = Budget::new(
@@ -389,6 +544,25 @@ v2
         assert_eq!(oversized.code, ErrorCode::ObjectTooLarge);
         assert_eq!(oversized.limit, Some("max_object_bytes"));
         assert_eq!(oversized.file, Some(ErrorFile::Gitmodules));
+    }
+
+    #[test]
+    fn dedicated_gitmodules_cap_is_independent_of_the_object_budget() {
+        let payload = vec![b'#'; MAX_GITMODULES_BYTES + 1];
+        let oid = object_id(HashKind::Sha1, ObjectKind::Blob, &payload).expect("blob hashes");
+        let store = StaticOdb::from_objects(HashKind::Sha1, [(ObjectKind::Blob, payload)])
+            .expect("store loads");
+        let root = [OwnedTreeEntry {
+            mode: 0o100644,
+            name: GITMODULES_PATH.to_vec(),
+            oid,
+            kind: TreeItemKind::Blob,
+        }];
+        let error = read_declarations(&store, &root, &Budget::unlimited())
+            .expect_err("dedicated cap rejects hostile config");
+        assert_eq!(error.code, ErrorCode::ObjectTooLarge);
+        assert_eq!(error.limit, Some("max_gitmodules_bytes"));
+        assert_eq!(error.file, Some(ErrorFile::Gitmodules));
     }
 
     #[test]
@@ -430,144 +604,39 @@ v2
         );
     }
 
-    #[test]
-    fn fixture_parser_matches_git_config_blob_null_oracle() {
-        let repository = fixture_repo("sha1-submodules.git");
-        let (store, snapshot) = fixture("sha1-submodules.git", "sha1_submodules_head");
-        let root =
-            read_tree_entries_for_walk(&store, snapshot.tree_oid, &Budget::unlimited(), false)
-                .unwrap();
-        let entry = root
-            .iter()
-            .find(|entry| entry.name == GITMODULES_PATH)
-            .expect("fixture has .gitmodules");
-        let mut payload = Vec::new();
-        assert_eq!(
-            store
-                .try_find(&entry.oid, &mut payload, &Budget::unlimited())
-                .unwrap(),
-            Some(ObjectKind::Blob)
-        );
-
-        let mut actual = config_entries(&payload).expect("our parser accepts fixture");
-        let output = Command::new("git")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("LC_ALL", "C")
-            .args([
-                "-C",
-                repository.to_str().expect("fixture path is UTF-8"),
-                "config",
-                "--blob",
-                &entry.oid.to_hex(),
-                "--list",
-                "--null",
-            ])
-            .output()
-            .expect("git config oracle runs");
-        assert!(
-            output.status.success(),
-            "git config failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let mut oracle = output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|record| !record.is_empty())
-            .map(|record| {
-                let separator = record
-                    .iter()
-                    .position(|byte| *byte == b'\n')
-                    .expect("--null --list record separates key and value");
-                (
-                    record[..separator].to_vec(),
-                    record[separator + 1..].to_vec(),
-                )
-            })
-            .collect::<Vec<_>>();
-        actual.sort();
-        oracle.sort();
-        assert_eq!(actual, oracle);
-    }
-
-    #[test]
-    fn malformed_fixture_matches_git_config_blob_rejection() {
-        let repository = fixture_repo("sha1-submodules.git");
-        let (store, snapshot) = fixture("sha1-submodules.git", "sha1_submodules_malformed");
-        let root =
-            read_tree_entries_for_walk(&store, snapshot.tree_oid, &Budget::unlimited(), false)
-                .unwrap();
-        let entry = root
-            .iter()
-            .find(|entry| entry.name == GITMODULES_PATH)
-            .expect("fixture has .gitmodules");
-        let mut payload = Vec::new();
-        assert_eq!(
-            store
-                .try_find(&entry.oid, &mut payload, &Budget::unlimited())
-                .unwrap(),
-            Some(ObjectKind::Blob)
-        );
-        assert_eq!(
-            parse_config(&payload)
-                .expect_err("our parser rejects fixture")
-                .code,
-            ErrorCode::MalformedObject
-        );
-
-        let output = Command::new("git")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("LC_ALL", "C")
-            .args([
-                "-C",
-                repository.to_str().expect("fixture path is UTF-8"),
-                "config",
-                "--blob",
-                &entry.oid.to_hex(),
-                "--list",
-                "--null",
-            ])
-            .output()
-            .expect("git config oracle runs");
-        assert!(
-            !output.status.success(),
-            "Git unexpectedly accepted fixture"
-        );
-        assert!(
-            output
-                .stderr
-                .starts_with(b"error: bad config line 1 in blob "),
-            "unexpected Git error: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn config_entries(payload: &[u8]) -> Result<Vec<ConfigEntry>, Error> {
-        let config = parse_config(payload)?;
-        let mut entries = Vec::new();
-        for section in config.sections() {
-            let header = section.header();
-            if !header.name().eq_ignore_ascii_case(b"submodule") {
-                continue;
+    fn snapshot_store(config: &[u8], extra_entries: &[(u32, &[u8], Oid)]) -> (StaticOdb, Snapshot) {
+        fn tree_payload(entries: &[(u32, &[u8], Oid)]) -> Vec<u8> {
+            let mut payload = Vec::new();
+            for (mode, name, oid) in entries {
+                payload.extend_from_slice(format!("{mode:o} ").as_bytes());
+                payload.extend_from_slice(name);
+                payload.push(0);
+                payload.extend_from_slice(oid.as_bytes());
             }
-            let Some(name) = header.subsection_name() else {
-                continue;
-            };
-            for key in CONFIG_KEYS {
-                let Some(value) = section.value_implicit(key) else {
-                    continue;
-                };
-                let mut full_key = b"submodule.".to_vec();
-                full_key.extend_from_slice(name);
-                full_key.push(b'.');
-                full_key.extend_from_slice(key.as_bytes());
-                entries.push((
-                    full_key,
-                    value.map_or_else(|| b"true".to_vec(), |value| value.to_vec()),
-                ));
-            }
+            payload
         }
-        Ok(entries)
+
+        let config_oid =
+            object_id(HashKind::Sha1, ObjectKind::Blob, config).expect("config hashes");
+        let mut entries = vec![(0o100644, GITMODULES_PATH, config_oid)];
+        entries.extend_from_slice(extra_entries);
+        entries.sort_by(|left, right| left.1.cmp(right.1));
+        let tree = tree_payload(&entries);
+        let tree_oid = object_id(HashKind::Sha1, ObjectKind::Tree, &tree).expect("tree hashes");
+        let store = StaticOdb::from_objects(
+            HashKind::Sha1,
+            [
+                (ObjectKind::Blob, config.to_vec()),
+                (ObjectKind::Tree, tree),
+            ],
+        )
+        .expect("snapshot store loads");
+        (
+            store,
+            Snapshot {
+                commit_oid: tree_oid,
+                tree_oid,
+            },
+        )
     }
 }

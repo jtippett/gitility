@@ -21,6 +21,7 @@ pub mod decode;
 pub mod diff;
 pub mod error;
 pub mod file;
+mod git_config;
 pub mod layered_odb;
 pub mod local_odb;
 pub mod log;

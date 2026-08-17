@@ -20,6 +20,19 @@ record in `allowlist.exs` pass with a visible allowlist record. Entries for
 ordered history results also pin the exact Git and Gitility commit sequences,
 so a different mismatch in the same context still fails.
 
+The Rust `.gitmodules` parser has its own Git 2.55.0 blob-oracle tests. The
+checked-in curated corpus and 512-case deterministic mutation test run under
+normal `cargo test`. Its 3,456-case value sweep is intentionally opt-in:
+
+```sh
+GITILITY_EXHAUSTIVE_ORACLE=1 cargo test -p gitility-core \
+  exhaustive_3456_value_sweep_matches_git_2_55_blob_reader -- --nocapture
+```
+
+That harness creates temporary bare repositories and never sends an
+include-bearing blob to `git config --blob`, because that command follows
+include paths while Git's `.gitmodules` consumer does not.
+
 Content-search parity uses `git grep -F` for literal byte patterns, `-i` only
 for the certified ASCII folding cases, `-I` for the default binary policy, and
 `-a` for `binary: :text`. Regex search is intentionally Rust-unit-tested rather

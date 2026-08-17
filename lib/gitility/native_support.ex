@@ -110,6 +110,7 @@ defmodule Gitility.NativeSupport do
       |> maybe_put(:retry_after_ms, Map.get(error, :retry_after_ms))
       |> maybe_put(:reason, Map.get(error, :reason))
       |> maybe_put(:line_count, Map.get(error, :line_count))
+      |> maybe_put(:line, Map.get(error, :line))
 
     Error.new(code, message, retryable: retryable, operation: operation, details: details)
   end

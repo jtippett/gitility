@@ -2,10 +2,11 @@ defmodule Gitility.Submodule do
   @moduledoc """
   Metadata correlating one snapshot gitlink with its `.gitmodules` declaration.
 
-  Paths, names, URLs, and branches remain raw bytes. Gitility never resolves
-  `url`, never opens `commit_oid`, and never traverses into a submodule. An
-  `:undeclared` row has no declaration metadata; an `:orphaned` row has no
-  pinned gitlink commit.
+  Paths, names, URLs, and branches remain raw bytes. Declaration paths are inert
+  correlation values and are never used for filesystem access. Gitility never
+  resolves `url`, follows config includes, opens `commit_oid`, or traverses into
+  a submodule. An `:undeclared` row has no declaration metadata; an `:orphaned`
+  row has no pinned gitlink commit.
   """
 
   @enforce_keys [:path, :status]

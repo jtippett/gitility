@@ -135,11 +135,24 @@ defmodule Gitility do
 
   Results are ordered by raw path bytes. `:active` rows have both a declaration
   and gitlink, `:undeclared` rows are gitlinks missing from `.gitmodules`, and
-  `:orphaned` rows are declarations with no tree entry.
+  `:orphaned` rows are declarations with no tree entry. Empty paths sort first.
 
-  The only option is `:limits`. URLs are returned as inert bytes: Gitility
-  never resolves them, never opens the pinned gitlink commits, and never
-  traverses into submodules.
+  A declaration without a valued `path` is ignored. Path values are inert
+  correlation bytes, so Git-accepted values such as `../name`, absolute paths,
+  trailing slashes, and the empty path are not rejected or used for filesystem
+  access. A root `.gitmodules` entry that is not a blob is treated as absent.
+  Git itself separately refuses symlinked `.gitmodules` files in a working tree
+  after CVE-2018-11235; this API reads a bare snapshot. If multiple names
+  declare one path, the name that sorts first by raw bytes claims its gitlink
+  and later names are orphaned.
+
+  The only option is `:limits`. The operation performs a full, unpaginated
+  correlation walk bounded by `limits.max_objects` and the other tree limits;
+  there is no cursor, so use limits to constrain work when needed. `.gitmodules`
+  has an additional fixed 1 MiB hostile-config cap. SHA-256 object stores are
+  unsupported by the existing snapshot compatibility check. URLs are inert:
+  Gitility never resolves them, follows config includes, opens pinned gitlink
+  commits, or traverses into submodules.
   """
   @spec submodules(Snapshot.t(), keyword()) ::
           {:ok, [Gitility.Submodule.t()]} | {:error, Error.t()}

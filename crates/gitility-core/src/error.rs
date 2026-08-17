@@ -147,6 +147,12 @@ pub enum ErrorFile {
     Gitmodules,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ErrorLine {
+    Count(u32),
+    Source(u32),
+}
+
 impl ErrorFile {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -177,8 +183,8 @@ pub struct Error {
     /// engine provides useful diagnostics (for example safe-regex compilation
     /// or an upstream defect class behind an unsupported operation).
     pub reason: Option<Box<str>>,
-    /// File line count associated with a range-validation failure.
-    pub line_count: Option<u32>,
+    /// Compactly stores either a range-validation line count or a parse line.
+    line: Option<ErrorLine>,
 }
 
 impl Error {
@@ -193,7 +199,7 @@ impl Error {
             order: None,
             file: None,
             reason: None,
-            line_count: None,
+            line: None,
         }
     }
 
@@ -208,7 +214,7 @@ impl Error {
             order: None,
             file: None,
             reason: None,
-            line_count: None,
+            line: None,
         }
     }
 
@@ -258,13 +264,30 @@ impl Error {
 
     /// Associates the blamed file's total line count with a range failure.
     pub fn with_line_count(mut self, line_count: u32) -> Self {
-        self.line_count = Some(line_count);
+        self.line = Some(ErrorLine::Count(line_count));
         self
     }
 
     /// Returns the blamed file's total line count for a range failure.
     pub fn line_count(&self) -> Option<u32> {
-        self.line_count
+        match self.line {
+            Some(ErrorLine::Count(line_count)) => Some(line_count),
+            Some(ErrorLine::Source(_)) | None => None,
+        }
+    }
+
+    /// Associates a one-based source line with a parse failure.
+    pub fn with_line(mut self, line: u32) -> Self {
+        self.line = Some(ErrorLine::Source(line));
+        self
+    }
+
+    /// Returns the one-based source line associated with a parse failure.
+    pub fn line(&self) -> Option<u32> {
+        match self.line {
+            Some(ErrorLine::Source(line)) => Some(line),
+            Some(ErrorLine::Count(_)) | None => None,
+        }
     }
 }
 

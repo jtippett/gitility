@@ -683,6 +683,10 @@ make_submodules() {
     '[submodule "orphaned"]' \
     '  path = orphaned' \
     '  url = "https://example.invalid/orphaned.git"' \
+    '' \
+    '# Git submodule ignores includes in .gitmodules. This path must never be read.' \
+    '[include]' \
+    '  path = /definitely/not-read-by-gitility' \
     >"$work_repository/.gitmodules"
 
   printf '%s\n%s\n%s\n' \
@@ -691,10 +695,10 @@ make_submodules() {
     'size 12345' >"$work_repository/lfs/valid.bin"
   printf '%s\n%s\n%s\n%s\n' \
     'version https://git-lfs.github.com/spec/v1' \
-    'x-extra forward-compatible' \
+    'x-extra rejected-by-git-lfs-reader' \
     'size 54321' \
     'oid sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789' \
-    >"$work_repository/lfs/unknown-key.bin"
+    >"$work_repository/lfs/not-a-pointer.bin"
   printf '%s\n%s\n%s\n' \
     'version https://git-lfs.github.com/spec/v1' \
     'oid sha256:not-a-64-byte-lowercase-hex-digest' \

@@ -168,8 +168,8 @@ for s in "${STAGES[@]}"; do
     # Failure blocks must survive the log: keep every ExUnit failure section
     # plus the tail summary (a bare tail -15 once swallowed the only failure
     # of a run — 2026-08-17).
-    mix)  run_stage mix "mix local.hex --force >/dev/null && mix local.rebar --force >/dev/null && mix deps.get >/dev/null && out=\$(mix test 2>&1); echo \"\$out\" | grep -B 2 -A 25 '^  *[0-9][0-9]*) test' ; echo \"\$out\" | tail -15" ;;
-    soak) run_stage soak "out=\$(mix test --only soak 2>&1); echo \"\$out\" | grep -B 2 -A 25 '^  *[0-9][0-9]*) test' ; echo \"\$out\" | tail -15" ;;
+    mix)  run_stage mix "mix local.hex --force >/dev/null && mix local.rebar --force >/dev/null && mix deps.get >/dev/null && status=0; out=\$(mix test 2>&1) || status=\$?; echo \"\$out\" | grep -B 2 -A 25 \"^  *[0-9][0-9]*[)] test\" || true; echo \"\$out\" | tail -15; exit \$status" ;;
+    soak) run_stage soak "status=0; out=\$(mix test --only soak 2>&1) || status=\$?; echo \"\$out\" | grep -B 2 -A 25 \"^  *[0-9][0-9]*[)] test\" || true; echo \"\$out\" | tail -15; exit \$status" ;;
     *) echo "unknown stage: $s" >&2; exit 2 ;;
   esac
 done

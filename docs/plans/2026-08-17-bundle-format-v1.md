@@ -155,6 +155,18 @@ Optional keys (v1 readers ignore unknown keys — minor-version space):
 - `publisher` — free-form tool identity.
 - `head_symref` — see above.
 
+RESERVED key (a feature gate, not ignorable):
+
+- `shallow_roots` — reserved for future shallow-repository support.
+  v1 writers MUST refuse shallow sources (`$GIT_DIR/shallow` present)
+  with `:unsupported_operation` — a bundle without the boundary would
+  silently answer history queries wrongly (walk past the boundary on
+  partial-shallow sources) or abort with `:missing_object` (true
+  depth-N clones). v1 readers MUST refuse any bundle carrying this key
+  with `:unsupported_operation` naming it. Because old readers refuse
+  loudly instead of misreading, a future writer+reader pair can
+  introduce shallow bundles as a MINOR bump.
+
 ### Trailer (final 64 bytes; ends exactly at EOF)
 
 | bytes | field      | value                                  |
@@ -187,12 +199,17 @@ Bounds: `16 <= toc_offset`, `toc_offset + toc_len + 64 == file size`.
   IDENTICAL file. Ordering is normative: file pairs sorted ascending by
   pack name (idx after its pack), metadata sorted by key, refs sorted by
   name bytes; `created_at` omitted by default. Tests MAY compare file
-  hashes.
+  hashes. Implementation note: loose-object packing must pin
+  `git pack-objects --threads=1` — multi-threaded delta search is not
+  byte-stable, and the loose pack's content-derived NAME feeds the TOC.
 - `generation` increases by at least 1 over the file being replaced
-  (fresh bundles start at 1). A reader's `refresh()` reopens the path
-  and re-pins; a generation move is an explicit, caller-visible event —
-  snapshots already taken keep their pinned commits, per the global
-  invariant.
+  (fresh bundles start at 1). A bundle open is pinned to ONE generation
+  for its lifetime: the stores' `refresh()` callbacks are no-ops, and a
+  replaced file makes in-flight reads fail loudly (the pinned-identity
+  check) rather than serve mixed generations. Moving to the new
+  generation = open the bundle again; an open holding the old inode
+  keeps a coherent old repository meanwhile. Snapshots already taken
+  keep their pinned commits, per the global invariant.
 - Fetch packs arrive thin; pipelines complete them (`index-pack
   --fix-thin`) before they reach the bundle — unchanged from the design
   doc.

@@ -38,7 +38,7 @@ defmodule Gitility.ODB.Watchdog do
   @impl GenServer
   def handle_info(:rewatch, state) do
     case fetch_handle(state.provider) do
-      {:ok, {store, _hash, pid, _runtime, _request_timeout, _callback_kind, _limits, _bundle}} ->
+      {:ok, {store, _hash, pid, _runtime, _request_timeout, _callback_kind, _limits}} ->
         monitor = Process.monitor(pid)
 
         if Process.alive?(pid) do

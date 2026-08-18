@@ -19,7 +19,7 @@ defmodule Gitility.M4c.CountingRangeBackend do
 
   @impl true
   def terminate(reason, config) do
-    if function_exported?(config.delegate, :terminate, 2) do
+    if Code.ensure_loaded?(config.delegate) and function_exported?(config.delegate, :terminate, 2) do
       config.delegate.terminate(reason, config.state)
     else
       :ok
@@ -78,6 +78,8 @@ defmodule Gitility.M4c.BundleDestinationTest do
 
     assert File.regular?(path)
     assert File.dir?(scratch)
+    assert {:ok, %{mode: mode}} = File.stat(scratch)
+    assert Bitwise.band(mode, 0o777) == 0o700
     assert :ok = Bundle.verify(path)
 
     assert {:ok, info} = Bundle.info(path)
@@ -128,7 +130,7 @@ defmodule Gitility.M4c.BundleDestinationTest do
     path = Path.join(context.directory, "partial.bundle")
     assert {:ok, first, _odb} = start_bundle(published, path)
     stop(first)
-    add_one_pair(published, context.directory)
+    add_one_pair(published)
     {:ok, counter} = Agent.start_link(fn -> 0 end)
 
     assert {:ok, second, odb} =
@@ -186,6 +188,47 @@ defmodule Gitility.M4c.BundleDestinationTest do
     assert File.read!(path) == "leave me alone"
   end
 
+  test "a warm bundle with a different hash family is refused unchanged", context do
+    published = publish("sha1-basic-packed.git", "hash-family")
+    path = Path.join(context.directory, "sha256.bundle")
+    write_empty_bundle(path, hash: :sha256)
+    before = File.read!(path)
+
+    assert {:error, %Error{code: :invalid_argument, message: message}} =
+             PackFetch.start_link(
+               backend: {LocalDirectory, published},
+               into: {:bundle, path},
+               limits: generous_limits()
+             )
+
+    assert message =~ "sha256"
+    assert message =~ "sha1"
+    assert File.read!(path) == before
+  end
+
+  test "a full-repository bundle with refs is refused unchanged", context do
+    published = publish("sha1-basic-packed.git", "foreign-refs")
+    path = Path.join(context.directory, "full-repository.bundle")
+
+    assert {:ok, _receipt} =
+             Bundle.write(path, source: {:repository, fixture("sha1-basic-packed.git")})
+
+    assert {:ok, %{ref_count: ref_count}} = Bundle.info(path)
+    assert ref_count > 0
+    before = File.read!(path)
+
+    assert {:error, %Error{code: :invalid_argument, message: message}} =
+             PackFetch.start_link(
+               backend: {LocalDirectory, published},
+               into: {:bundle, path},
+               limits: generous_limits()
+             )
+
+    assert message =~ Integer.to_string(ref_count)
+    assert message =~ "Gitility.Bundle.write/2"
+    assert File.read!(path) == before
+  end
+
   test "cold outputs are deterministic and honor source identity", context do
     published = publish("sha1-basic-packed.git", "deterministic")
     first_path = Path.join(context.directory, "first.bundle")
@@ -203,6 +246,41 @@ defmodule Gitility.M4c.BundleDestinationTest do
 
     stop(override)
     assert {:ok, %{source_identity: "m4c:override"}} = Bundle.info(override_path)
+  end
+
+  test "a metadata-only source identity change advances generation", context do
+    published = publish("sha1-basic-packed.git", "metadata-rewrite")
+    path = Path.join(context.directory, "metadata-rewrite.bundle")
+
+    assert {:ok, first, _odb} =
+             start_bundle(published, path, bundle_source_identity: "m4c:first")
+
+    stop(first)
+    first_bytes = File.read!(path)
+
+    assert {:ok, second, _odb} =
+             start_bundle(published, path, bundle_source_identity: "m4c:second")
+
+    stop(second)
+    refute File.read!(path) == first_bytes
+
+    assert {:ok, %{generation: 2, source_identity: "m4c:second"}} = Bundle.info(path)
+  end
+
+  test "bundle scratch cleanup is stable by path across anonymous restarts", context do
+    published = publish("sha1-basic-packed.git", "scratch-recovery")
+    path = Path.join(context.directory, "scratch-recovery.bundle")
+
+    stale =
+      Path.join(System.tmp_dir!(), "gitility-packfetch-bundle-#{bundle_scratch_key(path)}-stale")
+
+    File.mkdir!(stale)
+    File.write!(Path.join(stale, "orphaned-pack-copy"), "stale")
+    on_exit(fn -> File.rm_rf(stale) end)
+
+    assert {:ok, supervisor, _odb} = start_bundle(published, path)
+    refute File.exists?(stale)
+    stop(supervisor)
   end
 
   test "hydration bundle composes through Bundle.open with OID-only selectors", context do
@@ -236,7 +314,55 @@ defmodule Gitility.M4c.BundleDestinationTest do
     stop(supervisor)
   end
 
-  test "successful refresh rewrites the bundle to the refreshed manifest", context do
+  test "reserved shallow_roots destinations propagate unsupported errors unchanged", context do
+    published = publish("sha1-basic-packed.git", "reserved-shallow-roots")
+    write_path = Path.join(context.directory, "write-reserved.bundle")
+    packfetch_path = Path.join(context.directory, "packfetch-reserved.bundle")
+
+    for path <- [write_path, packfetch_path] do
+      write_empty_bundle(path,
+        metadata: %{"source_identity" => "m4c:test", "shallow_roots" => "deadbeef"}
+      )
+    end
+
+    write_before = File.read!(write_path)
+
+    assert {:error, %Error{code: :unsupported_operation, message: write_message}} =
+             Bundle.write(write_path,
+               source: {:repository, fixture("sha1-basic-packed.git")}
+             )
+
+    assert write_message =~ "shallow_roots"
+    assert File.read!(write_path) == write_before
+    packfetch_before = File.read!(packfetch_path)
+
+    assert {:error, %Error{code: :unsupported_operation, message: packfetch_message}} =
+             PackFetch.start_link(
+               backend: {LocalDirectory, published},
+               into: {:bundle, packfetch_path},
+               limits: generous_limits()
+             )
+
+    assert packfetch_message =~ "shallow_roots"
+    assert File.read!(packfetch_path) == packfetch_before
+  end
+
+  test "bundle source identity is rejected for a directory destination", context do
+    published = publish("sha1-basic-packed.git", "source-identity-dir")
+
+    assert {:error, %Error{code: :invalid_argument, message: message}} =
+             PackFetch.start_link(
+               backend: {LocalDirectory, published},
+               into: {:dir, Path.join(context.directory, "dir-destination")},
+               bundle_source_identity: "ignored-without-this-check",
+               limits: generous_limits()
+             )
+
+    assert message =~ ":bundle_source_identity"
+    assert message =~ "{:bundle, path}"
+  end
+
+  test "refresh serves growth without rewriting until restart", context do
     published = publish("sha1-basic-packed.git", "refresh")
     path = Path.join(context.directory, "refresh.bundle")
     {:ok, counter} = Agent.start_link(fn -> 0 end)
@@ -248,18 +374,27 @@ defmodule Gitility.M4c.BundleDestinationTest do
              )
 
     assert {:ok, %{generation: 1, file_count: 2}} = Bundle.info(path)
-    add_one_pair(published, context.directory)
+    bundle_before = File.read!(path)
+    new_oid = add_one_pair(published)
     reads_before = Agent.get(counter, & &1)
     assert :ok = ODB.refresh(odb)
     assert Agent.get(counter, & &1) > reads_before
+    assert {:ok, _object} = ODB.read(odb, new_oid)
+    assert :ok = Bundle.verify(path)
+    assert File.read!(path) == bundle_before
+    assert {:ok, %{generation: 1, file_count: 2}} = Bundle.info(path)
+    stop(supervisor)
+
+    assert {:ok, restarted, restarted_odb} =
+             start_bundle(
+               {Gitility.M4c.CountingRangeBackend, {LocalDirectory, published, counter}},
+               path
+             )
+
+    assert {:ok, _object} = ODB.read(restarted_odb, new_oid)
     assert :ok = Bundle.verify(path)
     assert {:ok, %{generation: 2, file_count: 4}} = Bundle.info(path)
-
-    refreshed_bytes = File.read!(path)
-    assert :ok = ODB.refresh(odb)
-    assert File.read!(path) == refreshed_bytes
-    assert {:ok, %{generation: 2}} = Bundle.info(path)
-    stop(supervisor)
+    stop(restarted)
     Agent.stop(counter)
   end
 
@@ -288,7 +423,7 @@ defmodule Gitility.M4c.BundleDestinationTest do
     published
   end
 
-  defp add_one_pair(published, _directory) do
+  defp add_one_pair(published) do
     extra = Gitility.RangeTestSupport.publish("sha1-history-midx.git", "m4c-growth")
 
     try do
@@ -298,6 +433,7 @@ defmodule Gitility.M4c.BundleDestinationTest do
       {:ok, extra_manifest} = LocalDirectory.manifest(extra_state)
       original_ids = MapSet.new(original.packs, & &1.id)
       descriptor = Enum.find(extra_manifest.packs, &(not MapSet.member?(original_ids, &1.id)))
+      oid = first_pair_oid(Path.join(extra, descriptor.index_key))
       File.cp!(Path.join(extra, descriptor.pack_key), Path.join(published, descriptor.pack_key))
       File.cp!(Path.join(extra, descriptor.index_key), Path.join(published, descriptor.index_key))
 
@@ -306,6 +442,8 @@ defmodule Gitility.M4c.BundleDestinationTest do
         | generation: "m4c-grown",
           packs: original.packs ++ [descriptor]
       })
+
+      oid
     after
       File.rm_rf(extra)
     end
@@ -329,6 +467,50 @@ defmodule Gitility.M4c.BundleDestinationTest do
       })
 
     File.write!(Path.join(directory, "manifest.json"), bytes)
+  end
+
+  defp write_empty_bundle(path, opts) do
+    hash = Keyword.get(opts, :hash, :sha1)
+    metadata = Keyword.get(opts, :metadata, %{"source_identity" => "m4c:test"})
+
+    toc =
+      Format.encode_toc(%{
+        hash_algorithm: hash,
+        generation: 1,
+        metadata: metadata,
+        files: [],
+        refs: []
+      })
+
+    File.write!(
+      path,
+      Format.encode_header() <>
+        toc <>
+        Format.encode_trailer(16, byte_size(toc), :crypto.hash(:sha256, toc))
+    )
+  end
+
+  defp first_pair_oid(index_path) do
+    {output, 0} = System.cmd("git", ["verify-pack", "-v", index_path])
+
+    hex =
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.find_value(fn line ->
+        case String.split(line) do
+          [oid, type | _rest] when type in ["commit", "tree", "blob", "tag"] -> oid
+          _other -> nil
+        end
+      end)
+
+    Gitility.OID.parse!(hex)
+  end
+
+  defp bundle_scratch_key(path) do
+    :sha256
+    |> :crypto.hash(Path.expand(path))
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, 16)
   end
 
   defp corrupt_byte(path, offset) do

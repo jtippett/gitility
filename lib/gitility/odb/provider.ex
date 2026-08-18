@@ -40,7 +40,6 @@ defmodule Gitility.ODB.Provider do
           store: store,
           callback_kind: callback_kind,
           packfetch_limits: Keyword.get(opts, :packfetch_limits),
-          packfetch_bundle: Keyword.get(opts, :packfetch_bundle),
           packfetch_cleanup_destination: Keyword.get(opts, :packfetch_cleanup_destination),
           packfetch_manifest: nil,
           queue: :queue.new(),
@@ -67,7 +66,7 @@ defmodule Gitility.ODB.Provider do
     {:reply,
      {:ok,
       {state.store, state.hash, self(), state.runtime, state.request_timeout, state.callback_kind,
-       Map.get(state, :packfetch_limits), Map.get(state, :packfetch_bundle)}}, state}
+       Map.get(state, :packfetch_limits)}}, state}
   end
 
   def handle_call({:record_packfetch_manifest, manifest}, _from, state)
@@ -248,7 +247,7 @@ defmodule Gitility.ODB.Provider do
 
       {:error, reason, failed_path} ->
         Logger.error(
-          "Gitility could not clean private PackFetch destination #{inspect(failed_path)}: #{inspect(reason)}"
+          "Gitility could not clean memory PackFetch destination #{inspect(failed_path)}: #{inspect(reason)}"
         )
     end
   end

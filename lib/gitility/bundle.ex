@@ -63,6 +63,35 @@ defmodule Gitility.Bundle do
          operation: :bundle_write
        )}
 
+  @doc false
+  @spec classify_destination(Path.t(), atom()) ::
+          :missing | {:ok, Format.toc()} | {:error, Error.t()}
+  def classify_destination(path, operation) when is_binary(path) and is_atom(operation) do
+    case File.lstat(path) do
+      {:error, :enoent} ->
+        :missing
+
+      {:ok, _stat} ->
+        case Format.parse(path) do
+          {:ok, toc} ->
+            {:ok, toc}
+
+          {:error, %Error{code: code}} when code in [:invalid_argument, :malformed_object] ->
+            {:error,
+             Error.new(:invalid_argument, "refusing to overwrite an existing non-bundle file",
+               operation: operation,
+               details: %{path: path, parse_code: code}
+             )}
+
+          {:error, %Error{} = error} ->
+            {:error, error}
+        end
+
+      {:error, reason} ->
+        destination_io_error("could not inspect the bundle destination", path, reason, operation)
+    end
+  end
+
   defp write_validated(path, opts) do
     path = Path.expand(path)
 
@@ -521,29 +550,15 @@ defmodule Gitility.Bundle do
     do: invalid_argument(":path is required and must be a non-empty binary", :bundle_start_link)
 
   defp next_generation(path) do
-    case File.lstat(path) do
-      {:error, :enoent} ->
+    case classify_destination(path, :bundle_write) do
+      :missing ->
         {:ok, 1}
 
-      {:ok, _stat} ->
-        case Format.parse(path) do
-          {:ok, toc} ->
-            {:ok, toc.generation + 1}
+      {:ok, toc} ->
+        {:ok, toc.generation + 1}
 
-          {:error, %Error{} = error} ->
-            {:error,
-             Error.new(:invalid_argument, "refusing to overwrite an existing non-bundle file",
-               operation: :bundle_write,
-               details: %{path: path, parse_code: error.code}
-             )}
-        end
-
-      {:error, reason} ->
-        {:error,
-         Error.new(:invalid_argument, "could not inspect the bundle destination",
-           operation: :bundle_write,
-           details: %{path: path, reason: reason}
-         )}
+      {:error, %Error{} = error} ->
+        {:error, error}
     end
   end
 
@@ -637,6 +652,15 @@ defmodule Gitility.Bundle do
   end
 
   defp warning(message), do: %{code: :malformed_ref, message: message}
+
+  defp destination_io_error(message, path, reason, operation) do
+    {:error,
+     Error.new(:backend_error, message,
+       retryable: reason in [:eagain, :eintr, :eio, :emfile, :enfile, :estale],
+       operation: operation,
+       details: %{path: path, reason: reason}
+     )}
+  end
 
   defp write_error(reason) do
     {:error,

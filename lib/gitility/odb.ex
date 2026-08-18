@@ -68,7 +68,6 @@ defmodule Gitility.ODB do
     :provider,
     :supervisor,
     :limits,
-    :packfetch_bundle,
     providers: [],
     contains_cache: false
   ]
@@ -187,8 +186,7 @@ defmodule Gitility.ODB do
   def handle(pid_or_name) do
     with {:ok, supervisor} <- resolve_provider_supervisor(pid_or_name),
          {:ok,
-          {resource, hash, provider, runtime, _request_timeout, callback_kind, packfetch_limits,
-           packfetch_bundle}} <-
+          {resource, hash, provider, runtime, _request_timeout, callback_kind, packfetch_limits}} <-
            provider_handle(supervisor) do
       kind = if callback_kind == :range, do: :pack_fetch, else: :provider
 
@@ -201,7 +199,6 @@ defmodule Gitility.ODB do
          provider: provider,
          supervisor: supervisor,
          limits: packfetch_limits,
-         packfetch_bundle: packfetch_bundle,
          providers: [provider]
        }}
     else
@@ -358,14 +355,7 @@ defmodule Gitility.ODB do
   Local and static handles return `:unsupported_operation` in this milestone.
   """
   @spec refresh(t()) :: :ok | {:error, Error.t()}
-  def refresh(
-        %__MODULE__{
-          kind: :pack_fetch,
-          ref: resource,
-          runtime: runtime,
-          limits: limits
-        } = odb
-      ) do
+  def refresh(%__MODULE__{kind: :pack_fetch, ref: resource, runtime: runtime, limits: limits}) do
     limits = limits || Limits.new()
     limits_map = NativeSupport.limits_map!(limits)
 
@@ -378,7 +368,7 @@ defmodule Gitility.ODB do
            limits.timeout_ms,
            :packfetch_refresh
          ) do
-      {:ok, _stats} -> Gitility.ODB.PackFetch.persist_bundle(odb)
+      {:ok, _stats} -> :ok
       {:error, %Error{} = error} -> {:error, error}
     end
   end

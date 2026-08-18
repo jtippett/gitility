@@ -61,11 +61,7 @@ defmodule Gitility.Bundle.Format do
         end
 
       {:error, reason} ->
-        {:error,
-         Error.new(:invalid_argument, "could not open gitility bundle",
-           operation: :bundle_parse,
-           details: %{reason: reason}
-         )}
+        io_error("could not open gitility bundle", reason)
     end
   rescue
     exception -> malformed("bundle parser crashed safely", Exception.message(exception))
@@ -160,7 +156,7 @@ defmodule Gitility.Bundle.Format do
     case :file.pread(file, 0, length) do
       {:ok, bytes} -> {:ok, bytes}
       :eof -> {:ok, <<>>}
-      {:error, reason} -> malformed("could not read bundle header", inspect(reason))
+      {:error, reason} -> io_error("could not read bundle header", reason)
     end
   end
 
@@ -445,14 +441,14 @@ defmodule Gitility.Bundle.Format do
       {:ok, bytes} when byte_size(bytes) == length -> {:ok, bytes}
       {:ok, _bytes} -> malformed("short read while reading #{label}")
       :eof -> malformed("unexpected EOF while reading #{label}")
-      {:error, reason} -> malformed("could not read #{label}", inspect(reason))
+      {:error, reason} -> io_error("could not read #{label}", reason)
     end
   end
 
   defp file_size(file) do
     case :file.position(file, :eof) do
       {:ok, size} -> {:ok, size}
-      {:error, reason} -> malformed("could not determine bundle size", inspect(reason))
+      {:error, reason} -> io_error("could not determine bundle size", reason)
     end
   end
 
@@ -512,6 +508,15 @@ defmodule Gitility.Bundle.Format do
      Error.new(:malformed_object, message,
        operation: :bundle_parse,
        cause: cause
+     )}
+  end
+
+  defp io_error(message, reason) do
+    {:error,
+     Error.new(:backend_error, message,
+       retryable: reason in [:eagain, :eintr, :eio, :emfile, :enfile, :estale],
+       operation: :bundle_parse,
+       details: %{reason: reason}
      )}
   end
 end

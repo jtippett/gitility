@@ -45,14 +45,23 @@ defmodule Gitility.ODB.PackFetch do
   directory before hydration, so warm starts reuse its verified pairs without
   remote reads; corrupt sections are omitted and fetched again. The scratch
   directory is always removed during orderly provider shutdown, while the
-  bundle is never cleaned up by the provider.
+  bundle is never cleaned up by the provider. An abnormal death can leave the
+  scratch directory, including full pack copies, on real disk; the next
+  `start_link/1` for the same expanded bundle path sweeps it before starting.
 
   Hydration bundles contain the current manifest's pack/index pairs and zero
   reference rows: they are ODB-only snapshots. Use `Gitility.Bundle.write/2`
   for a full repository bundle with refs. The file is atomically replaced only
-  when the pair set changes, and a successful `Gitility.ODB.refresh/1` updates
-  it to the refreshed manifest. A non-bundle file at `path` is never clobbered;
-  remove it explicitly before starting PackFetch.
+  when the would-be snapshot changes. It records the manifest from the last
+  completed `start_link/1` hydration. `Gitility.ODB.refresh/1` serves new packs
+  from the scratch store without rewriting the bundle; restarting re-publishes
+  the latest manifest. Packs removed from that manifest remain in scratch for
+  the process lifetime, but the rewritten bundle omits them, so the grace
+  period does not survive a bundle-destination restart. Exactly one store may
+  own a bundle path at a time; concurrent writers to one path are outside the
+  contract. Correct concurrent refresh publication requires a future
+  single-owner publisher design. A non-bundle file at `path` is never
+  clobbered; remove it explicitly before starting PackFetch.
 
   ## Options
 
@@ -86,7 +95,7 @@ defmodule Gitility.ODB.PackFetch do
       `"packfetch:generation:" <> manifest.generation`.
   """
 
-  alias Gitility.{Bundle.Format, Bundle.Writer, Error, Limits, Native, NativeSupport, ODB}
+  alias Gitility.{Bundle, Bundle.Writer, Error, Limits, Native, NativeSupport, ODB}
   alias Gitility.PackManifest
 
   @default_chunk_bytes 8 * 1024 * 1024
@@ -124,7 +133,8 @@ defmodule Gitility.ODB.PackFetch do
          {:ok, request_timeout} <- positive(opts[:request_timeout], :request_timeout),
          {:ok, max_hydration_bytes} <-
            positive(opts[:max_hydration_bytes], :max_hydration_bytes),
-         :ok <- validate_bundle_source_identity(opts[:bundle_source_identity]),
+         :ok <-
+           validate_bundle_source_identity(opts[:into], opts[:bundle_source_identity]),
          {:ok, limits} <- hydration_limits(opts[:limits], max_hydration_bytes),
          {:ok, runtime, _runtime_resource} <- NativeSupport.runtime_and_resource(opts[:runtime]),
          {:ok, destination} <-
@@ -132,7 +142,8 @@ defmodule Gitility.ODB.PackFetch do
              opts[:into],
              opts[:max_bytes],
              name,
-             opts[:bundle_source_identity]
+             opts[:bundle_source_identity],
+             opts[:hash]
            ) do
       start_provider(
         opts,
@@ -179,15 +190,6 @@ defmodule Gitility.ODB.PackFetch do
   @spec memory_supported?() :: boolean()
   def memory_supported?, do: :os.type() == {:unix, :linux} and File.dir?("/dev/shm")
 
-  @doc false
-  @spec persist_bundle(ODB.t()) :: :ok | {:error, Error.t()}
-  def persist_bundle(%ODB{kind: :pack_fetch, packfetch_bundle: nil}), do: :ok
-
-  def persist_bundle(%ODB{kind: :pack_fetch, packfetch_bundle: context} = odb)
-      when is_map(context) do
-    persist_bundle(odb, false)
-  end
-
   defp start_provider(
          opts,
          name,
@@ -209,7 +211,6 @@ defmodule Gitility.ODB.PackFetch do
         request_timeout: request_timeout,
         runtime: runtime,
         packfetch_limits: limits,
-        packfetch_bundle: destination.bundle,
         packfetch_cleanup_destination: if(destination.cleanup?, do: destination.path),
         packfetch_options: %{
           request_timeout_ms: request_timeout,
@@ -223,7 +224,7 @@ defmodule Gitility.ODB.PackFetch do
 
     case result do
       {:ok, supervisor} ->
-        case hydrate_and_persist(supervisor, limits, destination.damaged?) do
+        case hydrate_and_persist(supervisor, limits, destination) do
           :ok ->
             {:ok, supervisor}
 
@@ -239,10 +240,22 @@ defmodule Gitility.ODB.PackFetch do
     end
   end
 
-  defp hydrate_and_persist(supervisor, limits, force_rewrite?) do
+  defp hydrate_and_persist(supervisor, limits, %{bundle: nil}) do
+    with {:ok, odb} <- ODB.handle(supervisor),
+         {:ok, _stats} <- hydrate(odb, limits) do
+      :ok
+    end
+  end
+
+  defp hydrate_and_persist(
+         supervisor,
+         limits,
+         %{bundle: context, damaged?: force_rewrite?}
+       )
+       when is_map(context) do
     with {:ok, odb} <- ODB.handle(supervisor),
          {:ok, _stats} <- hydrate(odb, limits),
-         :ok <- persist_bundle(odb, force_rewrite?) do
+         :ok <- persist_bundle(odb, context, force_rewrite?) do
       :ok
     end
   end
@@ -264,13 +277,13 @@ defmodule Gitility.ODB.PackFetch do
     end
   end
 
-  defp destination({:dir, path}, _max_bytes, _name, _source_identity)
+  defp destination({:dir, path}, _max_bytes, _name, _source_identity, _hash)
        when is_binary(path) and byte_size(path) > 0 do
     {:ok,
      %{path: Path.expand(path), cleanup?: false, max_bytes: nil, bundle: nil, damaged?: false}}
   end
 
-  defp destination(:memory, max_bytes, name, _source_identity)
+  defp destination(:memory, max_bytes, name, _source_identity, _hash)
        when is_integer(max_bytes) and max_bytes > 0 do
     if memory_supported?() do
       key = memory_destination_key(name)
@@ -297,21 +310,22 @@ defmodule Gitility.ODB.PackFetch do
     end
   end
 
-  defp destination(:memory, _max_bytes, _name, _source_identity),
+  defp destination(:memory, _max_bytes, _name, _source_identity, _hash),
     do: NativeSupport.invalid_argument(":max_bytes must be a positive integer for into: :memory")
 
-  defp destination({:bundle, path}, _max_bytes, name, source_identity)
+  defp destination({:bundle, path}, _max_bytes, name, source_identity, hash)
        when is_binary(path) and byte_size(path) > 0 do
-    prepare_bundle_destination(Path.expand(path), name, source_identity)
+    prepare_bundle_destination(Path.expand(path), name, source_identity, hash)
   end
 
-  defp destination(_into, _max_bytes, _name, _source_identity) do
+  defp destination(_into, _max_bytes, _name, _source_identity, _hash) do
     NativeSupport.invalid_argument(":into must be :memory, {:dir, path}, or {:bundle, path}")
   end
 
-  defp prepare_bundle_destination(path, name, source_identity) do
+  defp prepare_bundle_destination(path, name, source_identity, hash) do
     with {:ok, toc} <- existing_bundle(path),
-         {:ok, scratch} <- create_bundle_scratch(name) do
+         :ok <- validate_existing_bundle(toc, hash, path),
+         {:ok, scratch} <- create_bundle_scratch(path, name) do
       case extract_bundle(toc, path, scratch) do
         {:ok, damaged?} ->
           {:ok,
@@ -331,35 +345,43 @@ defmodule Gitility.ODB.PackFetch do
   end
 
   defp existing_bundle(path) do
-    case File.lstat(path) do
-      {:error, :enoent} ->
-        {:ok, nil}
-
-      {:ok, _stat} ->
-        case Format.parse(path) do
-          {:ok, toc} -> {:ok, toc}
-          {:error, %Error{} = error} -> bundle_refusal(path, error)
-        end
-
-      {:error, reason} ->
-        {:error,
-         Error.new(:invalid_argument, "could not inspect the bundle destination",
-           operation: :packfetch_start_link,
-           details: %{path: path, reason: reason}
-         )}
+    case Bundle.classify_destination(path, :packfetch_start_link) do
+      :missing -> {:ok, nil}
+      {:ok, toc} -> {:ok, toc}
+      {:error, %Error{} = error} -> {:error, error}
     end
   end
 
-  defp bundle_refusal(path, error) do
+  defp validate_existing_bundle(nil, _hash, _path), do: :ok
+
+  defp validate_existing_bundle(%{hash_algorithm: hash, refs: refs}, hash, path) do
+    validate_existing_bundle_refs(path, length(refs))
+  end
+
+  defp validate_existing_bundle(%{hash_algorithm: actual}, expected, path) do
     {:error,
-     Error.new(:invalid_argument, "refusing to overwrite an existing non-bundle file",
+     Error.new(
+       :invalid_argument,
+       "bundle destination hash algorithm #{actual} does not match configured PackFetch hash #{expected}",
        operation: :packfetch_start_link,
-       details: %{path: path, parse_code: error.code}
+       details: %{path: path, bundle_hash: actual, configured_hash: expected}
      )}
   end
 
-  defp create_bundle_scratch(name) do
-    key = memory_destination_key(name)
+  defp validate_existing_bundle_refs(path, ref_count) when ref_count > 0 do
+    {:error,
+     Error.new(
+       :invalid_argument,
+       "bundle destination contains #{ref_count} refs; hydration bundles are ODB-only; use Gitility.Bundle.write/2 for full repository bundles",
+       operation: :packfetch_start_link,
+       details: %{path: path, ref_count: ref_count}
+     )}
+  end
+
+  defp validate_existing_bundle_refs(_path, 0), do: :ok
+
+  defp create_bundle_scratch(path, name) do
+    key = bundle_destination_key(path)
     root = System.tmp_dir!()
     prefix = "gitility-packfetch-bundle-#{key}"
 
@@ -368,9 +390,20 @@ defmodule Gitility.ODB.PackFetch do
       scratch = Path.join(root, "#{prefix}-#{unique}")
 
       case File.mkdir(scratch) do
-        :ok -> {:ok, scratch}
+        :ok -> set_bundle_scratch_mode(scratch)
         {:error, reason} -> bundle_io_error("could not create bundle scratch directory", reason)
       end
+    end
+  end
+
+  defp set_bundle_scratch_mode(scratch) do
+    case File.chmod(scratch, 0o700) do
+      :ok ->
+        {:ok, scratch}
+
+      {:error, reason} ->
+        File.rmdir(scratch)
+        bundle_io_error("could not make bundle scratch directory private", reason)
     end
   end
 
@@ -512,13 +545,14 @@ defmodule Gitility.ODB.PackFetch do
     end
   end
 
-  defp persist_bundle(%ODB{packfetch_bundle: context, provider: provider, hash: hash}, force?) do
+  defp persist_bundle(%ODB{provider: provider, hash: hash}, context, force?) do
     with {:ok, manifest} <- current_manifest(provider),
          :ok <- validate_snapshot_manifest(manifest, hash),
+         {:ok, metadata} <- snapshot_metadata(context, manifest),
          {:ok, pairs} <- snapshot_pairs(manifest, context.destination),
          {:ok, toc} <- existing_bundle(context.path),
-         {:ok, changed?} <- snapshot_changed?(toc, pairs, force?),
-         :ok <- maybe_write_snapshot(context, manifest, pairs, toc, changed?) do
+         {:ok, changed?} <- snapshot_changed?(toc, pairs, metadata, force?),
+         :ok <- maybe_write_snapshot(context, manifest, metadata, pairs, toc, changed?) do
       :ok
     end
   end
@@ -544,6 +578,7 @@ defmodule Gitility.ODB.PackFetch do
        )}
   end
 
+  # Native hydration already rejects non-empty loose; this is a belt-and-braces invariant.
   defp validate_snapshot_manifest(
          %PackManifest{hash: hash, generation: generation, packs: packs, loose: []},
          hash
@@ -561,6 +596,15 @@ defmodule Gitility.ODB.PackFetch do
       "PackFetch manifest cannot be represented as a hydration bundle",
       :manifest
     )
+  end
+
+  defp snapshot_metadata(context, manifest) do
+    source_identity =
+      context.source_identity || "packfetch:generation:" <> manifest.generation
+
+    with :ok <- validate_snapshot_source_identity(source_identity) do
+      {:ok, %{"source_identity" => source_identity}}
+    end
   end
 
   defp snapshot_pairs(%PackManifest{packs: descriptors}, destination) do
@@ -631,19 +675,23 @@ defmodule Gitility.ODB.PackFetch do
     end
   end
 
-  defp snapshot_changed?(nil, _pairs, _force?), do: {:ok, true}
-  defp snapshot_changed?(_toc, _pairs, true), do: {:ok, true}
+  defp snapshot_changed?(nil, _pairs, _metadata, _force?), do: {:ok, true}
+  defp snapshot_changed?(_toc, _pairs, _metadata, true), do: {:ok, true}
 
-  defp snapshot_changed?(toc, pairs, false) do
-    recorded = Enum.map(toc.files, &{&1.name, &1.length})
+  defp snapshot_changed?(toc, pairs, metadata, false) do
+    if toc.metadata == metadata do
+      recorded = Enum.map(toc.files, &{&1.name, &1.length})
 
-    expected =
-      Enum.flat_map(pairs, fn pair ->
-        [{pair.pack_name, pair.pack_length}, {pair.index_name, pair.index_length}]
-      end)
+      expected =
+        Enum.flat_map(pairs, fn pair ->
+          [{pair.pack_name, pair.pack_length}, {pair.index_name, pair.index_length}]
+        end)
 
-    if recorded == expected do
-      snapshot_hashes_changed?(toc.files, pairs)
+      if recorded == expected do
+        snapshot_hashes_changed?(toc.files, pairs)
+      else
+        {:ok, true}
+      end
     else
       {:ok, true}
     end
@@ -693,28 +741,22 @@ defmodule Gitility.ODB.PackFetch do
     end
   end
 
-  defp maybe_write_snapshot(_context, _manifest, _pairs, _toc, false), do: :ok
+  defp maybe_write_snapshot(_context, _manifest, _metadata, _pairs, _toc, false), do: :ok
 
-  defp maybe_write_snapshot(context, manifest, pairs, toc, true) do
+  defp maybe_write_snapshot(context, manifest, metadata, pairs, toc, true) do
     generation = if toc, do: toc.generation + 1, else: 1
-
-    source_identity =
-      context.source_identity || "packfetch:generation:" <> manifest.generation
-
     writer_pairs = Enum.map(pairs, &{&1.pack_path, &1.index_path})
 
-    with :ok <- validate_snapshot_source_identity(source_identity) do
-      case Writer.write(
-             context.path,
-             pairs: writer_pairs,
-             hash_algorithm: manifest.hash,
-             generation: generation,
-             metadata: %{"source_identity" => source_identity},
-             refs: []
-           ) do
-        {:ok, _receipt} -> :ok
-        {:error, reason} -> bundle_write_error("bundle snapshot publication failed", reason)
-      end
+    case Writer.write(
+           context.path,
+           pairs: writer_pairs,
+           hash_algorithm: manifest.hash,
+           generation: generation,
+           metadata: metadata,
+           refs: []
+         ) do
+      {:ok, _receipt} -> :ok
+      {:error, reason} -> bundle_write_error("bundle snapshot publication failed", reason)
     end
   end
 
@@ -765,6 +807,13 @@ defmodule Gitility.ODB.PackFetch do
     name
     |> :erlang.term_to_binary()
     |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, 16)
+  end
+
+  defp bundle_destination_key(path) do
+    :sha256
+    |> :crypto.hash(path)
     |> Base.encode16(case: :lower)
     |> binary_part(0, 16)
   end
@@ -821,9 +870,19 @@ defmodule Gitility.ODB.PackFetch do
   defp validate_verify(_verify),
     do: NativeSupport.invalid_argument("only verify: :always is supported")
 
-  defp validate_bundle_source_identity(nil), do: :ok
+  defp validate_bundle_source_identity(_into, nil), do: :ok
 
-  defp validate_bundle_source_identity(value)
+  defp validate_bundle_source_identity({:bundle, _path}, value) do
+    validate_bundle_source_identity_value(value)
+  end
+
+  defp validate_bundle_source_identity(_into, _value) do
+    NativeSupport.invalid_argument(
+      ":bundle_source_identity is only valid with into: {:bundle, path}"
+    )
+  end
+
+  defp validate_bundle_source_identity_value(value)
        when is_binary(value) and byte_size(value) <= 65_536 do
     if String.valid?(value) do
       :ok
@@ -832,7 +891,7 @@ defmodule Gitility.ODB.PackFetch do
     end
   end
 
-  defp validate_bundle_source_identity(_value) do
+  defp validate_bundle_source_identity_value(_value) do
     NativeSupport.invalid_argument(
       ":bundle_source_identity must be valid UTF-8 within the bundle metadata ceiling"
     )

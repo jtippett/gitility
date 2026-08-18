@@ -954,13 +954,14 @@ hydration and store open complete, so no unusable handle is exposed. Per F7,
 size-capped `/dev/shm` destination rather than a bytes-in-Rust gix store;
 `into: {:dir, path}` writes under the caller-supplied directory keyed by pack
 checksum, so a reused volume makes restarts near-free while a fresh container
-re-pays a few seconds. `into: {:bundle, path}` arrives with `Gitility.Bundle`
-(0.2, later milestone) and returns `:unsupported_operation` for now. Every
-active destination is declared by the caller — the no-implicit-materialization
-principle bans hidden disk writes, not an explicit directory or a documented
-RAM-backed tmpfs. `refresh/1` re-reads the manifest and fetches only packs it
-has not seen; packs removed from the manifest remain on disk during the 0.2
-publisher grace period and are never deleted by refresh.
+re-pays a few seconds. `into: {:bundle, path}` shipped in M4c as a durable,
+ODB-only hydration snapshot backed by a private scratch store; see the
+`Gitility.ODB.PackFetch` moduledoc for its startup-publication, refresh, and
+lifecycle semantics. Every active destination is declared by the caller — the
+no-implicit-materialization principle bans hidden disk writes, not an explicit
+directory or a documented RAM-backed tmpfs. `refresh/1` re-reads the manifest
+and fetches only packs it has not seen; packs removed from the manifest remain
+on disk during the 0.2 publisher grace period and are never deleted by refresh.
 
 Hydration has its own `max_hydration_bytes` ceiling (4 GiB by default),
 separate from `Gitility.Limits.max_provider_bytes` (the 256 MiB per-job

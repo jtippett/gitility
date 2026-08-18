@@ -57,14 +57,20 @@ defmodule Gitility.RefDB.Backend.Conformance do
     init_arg = Keyword.get(opts, :init_arg)
     concurrency = Keyword.get(opts, :concurrency, 4)
     expected_failure = Keyword.get(opts, :expected_failure)
+    moduletag = Keyword.get(opts, :moduletag)
 
     quote bind_quoted: [
             backend: backend,
             init_arg: init_arg,
             concurrency: concurrency,
-            expected_failure: expected_failure
+            expected_failure: expected_failure,
+            moduletag: moduletag
           ] do
       use ExUnit.Case, async: false
+
+      if moduletag do
+        @moduletag moduletag
+      end
 
       @conformance_backend backend
       @conformance_init_arg init_arg

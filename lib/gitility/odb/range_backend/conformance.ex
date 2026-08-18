@@ -27,31 +27,35 @@ defmodule Gitility.ODB.RangeBackend.Conformance do
 
   A deliberately broken backend can set `expected_failure: :short_read`; the
   generated exactness test then asserts that the conformance validator rejects
-  it. Cases are not async because backend state often owns a connection or
-  temporary directory.
+  it. An immutable backend whose fixture already contains
+  `synthetic_artifact/0` can set `prepublished_synthetic: true`. Cases are not
+  async because backend state often owns a connection or temporary directory.
   """
 
   defmacro __using__(opts) do
     backend = Keyword.fetch!(opts, :backend)
     concurrency = Keyword.get(opts, :concurrency, 4)
     expected_failure = Keyword.get(opts, :expected_failure)
+    prepublished_synthetic = Keyword.get(opts, :prepublished_synthetic, false)
 
     quote bind_quoted: [
             backend: backend,
             concurrency: concurrency,
-            expected_failure: expected_failure
+            expected_failure: expected_failure,
+            prepublished_synthetic: prepublished_synthetic
           ] do
       use ExUnit.Case, async: false
 
       @range_backend backend
       @range_concurrency concurrency
       @range_expected_failure expected_failure
+      @range_prepublished_synthetic prepublished_synthetic
 
       setup do
         {:ok, state} = @range_backend.init(backend_init_arg())
 
         artifacts =
-          if @range_expected_failure do
+          if @range_expected_failure or @range_prepublished_synthetic do
             backend_artifacts()
           else
             {key, bytes} = Gitility.ODB.RangeBackend.Conformance.synthetic_artifact()

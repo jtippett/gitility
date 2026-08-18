@@ -39,8 +39,9 @@ defmodule Gitility.ODB.PackFetch do
   (design finding F7). macOS and other platforms return
   `:unsupported_operation`; use an explicit directory there.
 
-  `into: {:bundle, path}` is reserved for `Gitility.Bundle` later in 0.2 and
-  currently returns `:unsupported_operation`.
+  `into: {:bundle, path}` remains reserved for the M4c hydration writer and
+  currently returns `:unsupported_operation`. Use `Gitility.Bundle.write/2`
+  to build a bundle from a local repository today.
 
   ## Options
 
@@ -222,7 +223,7 @@ defmodule Gitility.ODB.PackFetch do
     {:error,
      Error.new(
        :unsupported_operation,
-       "into: {:bundle, path} arrives with Gitility.Bundle later in 0.2",
+       "into: {:bundle, path} is not a hydration destination yet; use Gitility.Bundle.write/2",
        operation: :packfetch_start_link
      )}
   end

@@ -254,15 +254,15 @@ at EOF. That revision owns the crash-recovery discipline it implies
 (scan-back to the last valid trailer) and is therefore a MAJOR bump; v1
 readers require the trailer exactly at EOF and reject trailing bytes.
 
-## Open questions for James before freeze
+## Open questions — all RESOLVED (James delegated 2 and 3, 2026-08-18)
 
 1. RESOLVED twice over: first by the M4b spike (rowid table + rusqlite
    fallback), then mooted 2026-08-18 by dropping SQLite for this flat
    container (James's call). Chunking no longer exists; offset reads are
    native `pread`.
-2. Should refs carry per-ref annotated-tag TARGETS (kind=tag rows point
-   at the tag object; `peeled` gives the commit)? Current answer: yes,
-   both, so RefDB peeling needs no ODB read.
-3. `source_identity` semantics: free-form vs structured (url + tip
-   commit)? Current: free-form string; structure can arrive as new
-   optional metadata keys (minor).
+2. RESOLVED: yes — kind=tag rows point at the tag OBJECT and `peeled`
+   carries the fully-peeled commit (packed-refs `^{}` shape), so RefDB
+   peeling needs no ODB read. Cost is one oid per annotated tag.
+3. RESOLVED: `source_identity` stays a free-form string; structured
+   identity (url, tip commit, ...) can arrive later as new optional
+   metadata keys under the MINOR rule without reinterpreting this field.

@@ -730,11 +730,6 @@ defmodule Gitility.M4b.BundleTest do
     assert {:ok, supervisor} =
              RefDB.start_link(backend: {Bundle.RefBackend, path}, concurrency: 2)
 
-    on_exit(fn ->
-      Process.unlink(supervisor)
-      if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
-    end)
-
     assert {:ok, refs} = RefDB.handle(supervisor)
     assert {:ok, unlimited} = RefDB.list(refs, limit: 100)
     pages = collect_bundle_ref_pages(refs, nil, [])

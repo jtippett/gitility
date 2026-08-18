@@ -40,7 +40,9 @@ defmodule Gitility.ODB.Provider do
           store: store,
           callback_kind: callback_kind,
           packfetch_limits: Keyword.get(opts, :packfetch_limits),
+          packfetch_bundle: Keyword.get(opts, :packfetch_bundle),
           packfetch_cleanup_destination: Keyword.get(opts, :packfetch_cleanup_destination),
+          packfetch_manifest: nil,
           queue: :queue.new(),
           running: %{},
           refreshes: %{}
@@ -65,7 +67,19 @@ defmodule Gitility.ODB.Provider do
     {:reply,
      {:ok,
       {state.store, state.hash, self(), state.runtime, state.request_timeout, state.callback_kind,
-       Map.get(state, :packfetch_limits)}}, state}
+       Map.get(state, :packfetch_limits), Map.get(state, :packfetch_bundle)}}, state}
+  end
+
+  def handle_call({:record_packfetch_manifest, manifest}, _from, state)
+      when state.callback_kind == :range do
+    {:reply, :ok, %{state | packfetch_manifest: manifest}}
+  end
+
+  def handle_call(:packfetch_manifest, _from, state) when state.callback_kind == :range do
+    case state.packfetch_manifest do
+      nil -> {:reply, {:error, :manifest_unavailable}, state}
+      manifest -> {:reply, {:ok, manifest}, state}
+    end
   end
 
   def handle_call(:refresh, from, state) do
@@ -234,7 +248,7 @@ defmodule Gitility.ODB.Provider do
 
       {:error, reason, failed_path} ->
         Logger.error(
-          "Gitility could not clean memory PackFetch destination #{inspect(failed_path)}: #{inspect(reason)}"
+          "Gitility could not clean private PackFetch destination #{inspect(failed_path)}: #{inspect(reason)}"
         )
     end
   end
@@ -256,7 +270,7 @@ defmodule Gitility.ODB.Provider do
     case Task.Supervisor.start_child(
            state.task_supervisor,
            fn ->
-             execute_request(request, kind, payload, backend, backend_state)
+             execute_request(request, kind, payload, backend, backend_state, provider)
              send(provider, {:gitility_provider_task_done, token})
            end,
            shutdown: :brutal_kill
@@ -313,9 +327,10 @@ defmodule Gitility.ODB.Provider do
     end
   end
 
-  defp execute_request(request, kind, payload, backend, backend_state) do
+  defp execute_request(request, kind, payload, backend, backend_state, provider) do
     case invoke_callback(kind, payload, backend, backend_state) do
       {:reply, {:ok, results}} ->
+        record_packfetch_manifest(provider, kind, results)
         provider_reply(request, kind, {:ok, results})
 
       {:reply, {:error, reason}} ->
@@ -342,6 +357,12 @@ defmodule Gitility.ODB.Provider do
       unless kind == :prefetch,
         do: provider_reply(request, kind, {:error, :callback_crashed})
   end
+
+  defp record_packfetch_manifest(provider, :manifest, manifest) do
+    GenServer.call(provider, {:record_packfetch_manifest, manifest}, :infinity)
+  end
+
+  defp record_packfetch_manifest(_provider, _kind, _results), do: :ok
 
   defp invoke_callback(:object, oids, backend, state) do
     {:reply, backend.read_many(oids, state)}

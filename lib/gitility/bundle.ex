@@ -2,7 +2,9 @@ defmodule Gitility.Bundle do
   @moduledoc """
   Deterministic single-file, read-only Git repositories.
 
-  A bundle contains raw pack/index pairs plus a direct reference snapshot.
+  A full-repository bundle contains raw pack/index pairs plus a direct
+  reference snapshot. PackFetch hydration bundles are ODB-only artifacts with
+  zero reference rows; use `write/2` when the reference snapshot is required.
   Publishing writes a complete same-directory temporary file, syncs it, and
   atomically renames it over the destination. Erlang exposes no portable
   directory-fsync operation, so the artifact is always complete-or-absent but
@@ -15,7 +17,17 @@ defmodule Gitility.Bundle do
   opened read-only and no sidecar is created beside it.
   """
 
-  alias Gitility.{Bundle.Format, Bundle.Receipt, Error, ODB, OID, RefDB, Repository}
+  alias Gitility.{
+    Bundle.Format,
+    Bundle.Receipt,
+    Bundle.Writer,
+    Error,
+    ODB,
+    OID,
+    RefDB,
+    Repository
+  }
+
   alias Gitility.ODB.PackInventory
 
   @copy_chunk_bytes 8 * 1024 * 1024
@@ -192,7 +204,6 @@ defmodule Gitility.Bundle do
     directory = Path.dirname(path)
     suffix = System.unique_integer([:positive, :monotonic])
     staging = Path.join(directory, ".#{Path.basename(path)}.staging-#{suffix}")
-    temp = Path.join(directory, ".#{Path.basename(path)}.tmp-#{suffix}")
 
     try do
       with :ok <- mkdir_destination(directory),
@@ -205,15 +216,14 @@ defmodule Gitility.Bundle do
            :ok <- validate_inventory(pairs, repository.odb.hash),
            {:ok, refs, ref_metadata, warnings} <- snapshot_refs(repository, source, opts),
            {:ok, receipt} <-
-             write_file(
-               temp,
+             Writer.write(
                path,
-               pairs,
-               repository.odb.hash,
-               generation,
-               Map.merge(metadata, ref_metadata),
-               refs,
-               warnings
+               pairs: pairs,
+               hash_algorithm: repository.odb.hash,
+               generation: generation,
+               metadata: Map.merge(metadata, ref_metadata),
+               refs: refs,
+               warnings: warnings
              ) do
         {:ok, receipt}
       else
@@ -222,68 +232,6 @@ defmodule Gitility.Bundle do
       end
     after
       File.rm_rf(staging)
-      File.rm(temp)
-    end
-  end
-
-  defp write_file(temp, path, pairs, hash, generation, metadata, refs, warnings) do
-    case File.open(temp, [:write, :binary, :exclusive]) do
-      {:ok, output} ->
-        result =
-          try do
-            with :ok <- IO.binwrite(output, Format.encode_header()),
-                 {:ok, files, toc_offset} <- stream_pairs(pairs, output, 16, []),
-                 toc <-
-                   Format.encode_toc(%{
-                     hash_algorithm: hash,
-                     generation: generation,
-                     metadata: metadata,
-                     files: files,
-                     refs: refs
-                   }),
-                 toc_sha256 <-
-                   :sha256
-                   |> :crypto.hash_init()
-                   |> :crypto.hash_update(toc)
-                   |> :crypto.hash_final(),
-                 :ok <- IO.binwrite(output, toc),
-                 :ok <-
-                   IO.binwrite(
-                     output,
-                     Format.encode_trailer(toc_offset, byte_size(toc), toc_sha256)
-                   ),
-                 :ok <- :file.sync(output) do
-              bytes = toc_offset + byte_size(toc) + 64
-              {:ok, files, bytes}
-            end
-          after
-            File.close(output)
-          end
-
-        with {:ok, files, bytes} <- result,
-             :ok <- File.rename(temp, path) do
-          {:ok,
-           %Receipt{
-             path: path,
-             generation: generation,
-             bytes: bytes,
-             files: length(files),
-             refs: length(refs),
-             warnings: warnings
-           }}
-        end
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp stream_pairs([], _output, offset, files), do: {:ok, Enum.reverse(files), offset}
-
-  defp stream_pairs([{pack, index} | rest], output, offset, files) do
-    with {:ok, pack_entry, offset} <- stream_section(pack, :pack, output, offset),
-         {:ok, index_entry, offset} <- stream_section(index, :idx, output, offset) do
-      stream_pairs(rest, output, offset, [index_entry, pack_entry | files])
     end
   end
 
@@ -299,53 +247,6 @@ defmodule Gitility.Bundle do
       :ok
     else
       {:error, :invalid_pack_inventory}
-    end
-  end
-
-  defp stream_section(path, kind, output, offset) do
-    case :file.open(String.to_charlist(path), [:read, :raw, :binary]) do
-      {:ok, source} ->
-        try do
-          context = :crypto.hash_init(:sha256)
-
-          with {:ok, length, context} <- copy_chunks(source, output, 0, context),
-               true <- length > 0 || {:error, :empty_pack_artifact} do
-            entry = %{
-              kind: kind,
-              name: Path.basename(path),
-              offset: offset,
-              length: length,
-              sha256: :crypto.hash_final(context)
-            }
-
-            {:ok, entry, offset + length}
-          end
-        after
-          :file.close(source)
-        end
-
-      {:error, reason} ->
-        {:error, {:source_artifact_open_failed, reason}}
-    end
-  end
-
-  defp copy_chunks(source, output, length, context) do
-    case :file.read(source, @copy_chunk_bytes) do
-      {:ok, bytes} ->
-        with :ok <- IO.binwrite(output, bytes) do
-          copy_chunks(
-            source,
-            output,
-            length + byte_size(bytes),
-            :crypto.hash_update(context, bytes)
-          )
-        end
-
-      :eof ->
-        {:ok, length, context}
-
-      {:error, reason} ->
-        {:error, {:source_artifact_read_failed, reason}}
     end
   end
 

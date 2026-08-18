@@ -39,16 +39,27 @@ defmodule Gitility.ODB.PackFetch do
   (design finding F7). macOS and other platforms return
   `:unsupported_operation`; use an explicit directory there.
 
-  `into: {:bundle, path}` remains reserved for the M4c hydration writer and
-  currently returns `:unsupported_operation`. Use `Gitility.Bundle.write/2`
-  to build a bundle from a local repository today.
+  `into: {:bundle, path}` serves from a caller-invisible private scratch
+  directory below `System.tmp_dir!/0` while maintaining `path` as the durable
+  artifact. A valid existing bundle is checksum-extracted into that scratch
+  directory before hydration, so warm starts reuse its verified pairs without
+  remote reads; corrupt sections are omitted and fetched again. The scratch
+  directory is always removed during orderly provider shutdown, while the
+  bundle is never cleaned up by the provider.
+
+  Hydration bundles contain the current manifest's pack/index pairs and zero
+  reference rows: they are ODB-only snapshots. Use `Gitility.Bundle.write/2`
+  for a full repository bundle with refs. The file is atomically replaced only
+  when the pair set changes, and a successful `Gitility.ODB.refresh/1` updates
+  it to the refreshed manifest. A non-bundle file at `path` is never clobbered;
+  remove it explicitly before starting PackFetch.
 
   ## Options
 
     * `:backend` (required) — `{module, init_arg}` implementing
       `Gitility.ODB.RangeBackend`.
-    * `:into` — `{:dir, path}` or `:memory` (default `:memory`); bundle
-      destinations are reserved as described above.
+    * `:into` — `{:dir, path}`, `{:bundle, path}`, or `:memory` (default
+      `:memory`).
     * `:name` — supervisor registered name; omitted starts privately.
     * `:hash` — `:sha1` (default) or `:sha256`; must match the manifest.
     * `:concurrency` — maximum outstanding `read_ranges` callbacks per pack
@@ -62,19 +73,26 @@ defmodule Gitility.ODB.PackFetch do
       (default 4 GiB). This one-time bulk-load ceiling is distinct from
       query-time `Gitility.Limits.max_provider_bytes` (default 256 MiB).
       Existing pairs are verified before planning, so a warm volume is
-      charged only for manifest metadata plus missing or corrupt pairs.
+      charged only for manifest metadata plus missing or corrupt pairs. Local
+      pre-extraction from a bundle is never charged to this backend-read
+      budget.
     * `:limits` — the other hydration-job ceilings and timeout. Hydration
       always replaces this struct's `max_provider_bytes` with
       `max_hydration_bytes`; query-time limits are unchanged.
     * `:max_bytes` — RAM destination ceiling (default 256 MiB); used only by
       `into: :memory`.
+    * `:bundle_source_identity` — deterministic `source_identity` metadata for
+      `into: {:bundle, path}`. Defaults to
+      `"packfetch:generation:" <> manifest.generation`.
   """
 
-  alias Gitility.{Error, Limits, Native, NativeSupport, ODB}
+  alias Gitility.{Bundle.Format, Bundle.Writer, Error, Limits, Native, NativeSupport, ODB}
+  alias Gitility.PackManifest
 
   @default_chunk_bytes 8 * 1024 * 1024
   @default_memory_bytes 256 * 1024 * 1024
   @default_hydration_bytes 4 * 1024 * 1024 * 1024
+  @copy_chunk_bytes 8 * 1024 * 1024
 
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) do
@@ -91,7 +109,8 @@ defmodule Gitility.ODB.PackFetch do
         runtime: :default,
         limits: nil,
         max_hydration_bytes: @default_hydration_bytes,
-        max_bytes: @default_memory_bytes
+        max_bytes: @default_memory_bytes,
+        bundle_source_identity: nil
       )
 
     name = opts[:name] || {:global, {Gitility.ODB.PackFetch.Supervisor, make_ref()}}
@@ -105,37 +124,28 @@ defmodule Gitility.ODB.PackFetch do
          {:ok, request_timeout} <- positive(opts[:request_timeout], :request_timeout),
          {:ok, max_hydration_bytes} <-
            positive(opts[:max_hydration_bytes], :max_hydration_bytes),
-         {:ok, destination, cleanup?, max_bytes} <-
-           destination(opts[:into], opts[:max_bytes], name),
+         :ok <- validate_bundle_source_identity(opts[:bundle_source_identity]),
          {:ok, limits} <- hydration_limits(opts[:limits], max_hydration_bytes),
          {:ok, runtime, _runtime_resource} <- NativeSupport.runtime_and_resource(opts[:runtime]),
-         {:ok, supervisor} <-
-           Gitility.ODB.Provider.Supervisor.start_link(
-             backend: opts[:backend],
-             callback_kind: :range,
-             name: name,
-             hash: opts[:hash],
-             concurrency: concurrency,
-             request_timeout: request_timeout,
-             runtime: runtime,
-             packfetch_limits: limits,
-             packfetch_cleanup_destination: if(cleanup?, do: destination),
-             packfetch_options: %{
-               request_timeout_ms: request_timeout,
-               destination: destination,
-               chunk_bytes: chunk_bytes,
-               concurrency: concurrency,
-               max_hydration_bytes: max_hydration_bytes,
-               max_bytes: max_bytes
-             }
-           ),
-         {:ok, _stats} <- hydrate_supervisor(supervisor, limits) do
-      {:ok, supervisor}
+         {:ok, destination} <-
+           destination(
+             opts[:into],
+             opts[:max_bytes],
+             name,
+             opts[:bundle_source_identity]
+           ) do
+      start_provider(
+        opts,
+        name,
+        runtime,
+        limits,
+        destination,
+        concurrency,
+        chunk_bytes,
+        request_timeout,
+        max_hydration_bytes
+      )
     else
-      {:hydrate_error, supervisor, %Error{} = error} ->
-        stop_failed_start(supervisor)
-        {:error, error}
-
       {:error, %Error{} = error} ->
         {:error, error}
 
@@ -169,10 +179,71 @@ defmodule Gitility.ODB.PackFetch do
   @spec memory_supported?() :: boolean()
   def memory_supported?, do: :os.type() == {:unix, :linux} and File.dir?("/dev/shm")
 
-  defp hydrate_supervisor(supervisor, limits) do
-    case ODB.handle(supervisor) do
-      {:ok, odb} -> hydrate(odb, limits)
-      {:error, %Error{} = error} -> {:hydrate_error, supervisor, error}
+  @doc false
+  @spec persist_bundle(ODB.t()) :: :ok | {:error, Error.t()}
+  def persist_bundle(%ODB{kind: :pack_fetch, packfetch_bundle: nil}), do: :ok
+
+  def persist_bundle(%ODB{kind: :pack_fetch, packfetch_bundle: context} = odb)
+      when is_map(context) do
+    persist_bundle(odb, false)
+  end
+
+  defp start_provider(
+         opts,
+         name,
+         runtime,
+         limits,
+         destination,
+         concurrency,
+         chunk_bytes,
+         request_timeout,
+         max_hydration_bytes
+       ) do
+    result =
+      Gitility.ODB.Provider.Supervisor.start_link(
+        backend: opts[:backend],
+        callback_kind: :range,
+        name: name,
+        hash: opts[:hash],
+        concurrency: concurrency,
+        request_timeout: request_timeout,
+        runtime: runtime,
+        packfetch_limits: limits,
+        packfetch_bundle: destination.bundle,
+        packfetch_cleanup_destination: if(destination.cleanup?, do: destination.path),
+        packfetch_options: %{
+          request_timeout_ms: request_timeout,
+          destination: destination.path,
+          chunk_bytes: chunk_bytes,
+          concurrency: concurrency,
+          max_hydration_bytes: max_hydration_bytes,
+          max_bytes: destination.max_bytes
+        }
+      )
+
+    case result do
+      {:ok, supervisor} ->
+        case hydrate_and_persist(supervisor, limits, destination.damaged?) do
+          :ok ->
+            {:ok, supervisor}
+
+          {:error, %Error{} = error} ->
+            stop_failed_start(supervisor)
+            cleanup_destination(destination)
+            {:error, error}
+        end
+
+      {:error, reason} ->
+        cleanup_destination(destination)
+        normalize_provider_start_error(reason)
+    end
+  end
+
+  defp hydrate_and_persist(supervisor, limits, force_rewrite?) do
+    with {:ok, odb} <- ODB.handle(supervisor),
+         {:ok, _stats} <- hydrate(odb, limits),
+         :ok <- persist_bundle(odb, force_rewrite?) do
+      :ok
     end
   end
 
@@ -189,22 +260,32 @@ defmodule Gitility.ODB.PackFetch do
            :packfetch_hydrate
          ) do
       {:ok, stats} -> {:ok, stats}
-      {:error, %Error{} = error} -> {:hydrate_error, odb.supervisor, error}
+      {:error, %Error{} = error} -> {:error, error}
     end
   end
 
-  defp destination({:dir, path}, _max_bytes, _name)
+  defp destination({:dir, path}, _max_bytes, _name, _source_identity)
        when is_binary(path) and byte_size(path) > 0 do
-    {:ok, Path.expand(path), false, nil}
+    {:ok,
+     %{path: Path.expand(path), cleanup?: false, max_bytes: nil, bundle: nil, damaged?: false}}
   end
 
-  defp destination(:memory, max_bytes, name) when is_integer(max_bytes) and max_bytes > 0 do
+  defp destination(:memory, max_bytes, name, _source_identity)
+       when is_integer(max_bytes) and max_bytes > 0 do
     if memory_supported?() do
       key = memory_destination_key(name)
 
       with :ok <- sweep_memory_leftovers(name, key) do
         unique = System.unique_integer([:positive, :monotonic])
-        {:ok, "/dev/shm/gitility-packfetch-#{key}-#{unique}", true, max_bytes}
+
+        {:ok,
+         %{
+           path: "/dev/shm/gitility-packfetch-#{key}-#{unique}",
+           cleanup?: true,
+           max_bytes: max_bytes,
+           bundle: nil,
+           damaged?: false
+         }}
       end
     else
       {:error,
@@ -216,20 +297,455 @@ defmodule Gitility.ODB.PackFetch do
     end
   end
 
-  defp destination(:memory, _max_bytes, _name),
+  defp destination(:memory, _max_bytes, _name, _source_identity),
     do: NativeSupport.invalid_argument(":max_bytes must be a positive integer for into: :memory")
 
-  defp destination({:bundle, path}, _max_bytes, _name) when is_binary(path) do
+  defp destination({:bundle, path}, _max_bytes, name, source_identity)
+       when is_binary(path) and byte_size(path) > 0 do
+    prepare_bundle_destination(Path.expand(path), name, source_identity)
+  end
+
+  defp destination(_into, _max_bytes, _name, _source_identity) do
+    NativeSupport.invalid_argument(":into must be :memory, {:dir, path}, or {:bundle, path}")
+  end
+
+  defp prepare_bundle_destination(path, name, source_identity) do
+    with {:ok, toc} <- existing_bundle(path),
+         {:ok, scratch} <- create_bundle_scratch(name) do
+      case extract_bundle(toc, path, scratch) do
+        {:ok, damaged?} ->
+          {:ok,
+           %{
+             path: scratch,
+             cleanup?: true,
+             max_bytes: nil,
+             bundle: %{path: path, destination: scratch, source_identity: source_identity},
+             damaged?: damaged?
+           }}
+
+        {:error, %Error{} = error} ->
+          File.rm_rf(scratch)
+          {:error, error}
+      end
+    end
+  end
+
+  defp existing_bundle(path) do
+    case File.lstat(path) do
+      {:error, :enoent} ->
+        {:ok, nil}
+
+      {:ok, _stat} ->
+        case Format.parse(path) do
+          {:ok, toc} -> {:ok, toc}
+          {:error, %Error{} = error} -> bundle_refusal(path, error)
+        end
+
+      {:error, reason} ->
+        {:error,
+         Error.new(:invalid_argument, "could not inspect the bundle destination",
+           operation: :packfetch_start_link,
+           details: %{path: path, reason: reason}
+         )}
+    end
+  end
+
+  defp bundle_refusal(path, error) do
     {:error,
-     Error.new(
-       :unsupported_operation,
-       "into: {:bundle, path} is not a hydration destination yet; use Gitility.Bundle.write/2",
-       operation: :packfetch_start_link
+     Error.new(:invalid_argument, "refusing to overwrite an existing non-bundle file",
+       operation: :packfetch_start_link,
+       details: %{path: path, parse_code: error.code}
      )}
   end
 
-  defp destination(_into, _max_bytes, _name) do
-    NativeSupport.invalid_argument(":into must be :memory, {:dir, path}, or {:bundle, path}")
+  defp create_bundle_scratch(name) do
+    key = memory_destination_key(name)
+    root = System.tmp_dir!()
+    prefix = "gitility-packfetch-bundle-#{key}"
+
+    with :ok <- sweep_bundle_leftovers(name, root, prefix) do
+      unique = System.unique_integer([:positive, :monotonic])
+      scratch = Path.join(root, "#{prefix}-#{unique}")
+
+      case File.mkdir(scratch) do
+        :ok -> {:ok, scratch}
+        {:error, reason} -> bundle_io_error("could not create bundle scratch directory", reason)
+      end
+    end
+  end
+
+  defp sweep_bundle_leftovers(name, root, prefix) do
+    if registered?(name) do
+      :ok
+    else
+      root
+      |> Path.join("#{prefix}-*")
+      |> Path.wildcard()
+      |> Enum.reduce_while(:ok, fn path, :ok ->
+        case File.rm_rf(path) do
+          {:ok, _removed} ->
+            {:cont, :ok}
+
+          {:error, reason, failed} ->
+            {:halt, bundle_io_error("could not sweep bundle scratch directory #{failed}", reason)}
+        end
+      end)
+    end
+  end
+
+  defp extract_bundle(nil, _path, scratch) do
+    case File.mkdir_p(pack_directory(scratch)) do
+      :ok -> {:ok, false}
+      {:error, reason} -> bundle_io_error("could not create bundle extraction directory", reason)
+    end
+  end
+
+  defp extract_bundle(toc, path, scratch) do
+    pack_dir = pack_directory(scratch)
+
+    with :ok <- mkdir_pack_directory(pack_dir),
+         {:ok, source} <- open_bundle_source(path) do
+      try do
+        Enum.reduce_while(toc.files, {:ok, false}, fn entry, {:ok, damaged?} ->
+          case extract_section(source, entry, pack_dir) do
+            {:ok, section_damaged?} -> {:cont, {:ok, damaged? or section_damaged?}}
+            {:error, %Error{} = error} -> {:halt, {:error, error}}
+          end
+        end)
+      after
+        :file.close(source)
+      end
+    end
+  end
+
+  defp mkdir_pack_directory(path) do
+    case File.mkdir_p(path) do
+      :ok -> :ok
+      {:error, reason} -> bundle_io_error("could not create bundle extraction directory", reason)
+    end
+  end
+
+  defp open_bundle_source(path) do
+    case :file.open(String.to_charlist(path), [:read, :raw, :binary]) do
+      {:ok, source} -> {:ok, source}
+      {:error, reason} -> bundle_io_error("could not open bundle for extraction", reason)
+    end
+  end
+
+  defp extract_section(source, entry, pack_dir) do
+    destination = Path.join(pack_dir, entry.name)
+    unique = System.unique_integer([:positive, :monotonic])
+    temp = Path.join(pack_dir, ".#{entry.name}.extract-#{unique}")
+
+    try do
+      case :file.open(String.to_charlist(temp), [:write, :raw, :binary, :exclusive]) do
+        {:ok, output} ->
+          result =
+            try do
+              context = :crypto.hash_init(:sha256)
+
+              with {:ok, context} <-
+                     extract_chunks(
+                       source,
+                       output,
+                       entry.offset,
+                       entry.length,
+                       context,
+                       entry.name
+                     ) do
+                {:ok, :crypto.hash_final(context) == entry.sha256}
+              end
+            after
+              :file.close(output)
+            end
+
+          case result do
+            {:ok, true} ->
+              case File.rename(temp, destination) do
+                :ok -> {:ok, false}
+                {:error, reason} -> bundle_io_error("could not publish extracted section", reason)
+              end
+
+            {:ok, false} ->
+              {:ok, true}
+
+            {:error, %Error{} = error} ->
+              {:error, error}
+          end
+
+        {:error, reason} ->
+          bundle_io_error("could not create extracted section", reason)
+      end
+    after
+      File.rm(temp)
+    end
+  end
+
+  defp extract_chunks(_source, _output, _offset, 0, context, _name), do: {:ok, context}
+
+  defp extract_chunks(source, output, offset, remaining, context, name) do
+    length = min(remaining, @copy_chunk_bytes)
+
+    case :file.pread(source, offset, length) do
+      {:ok, bytes} when byte_size(bytes) == length ->
+        with :ok <- :file.write(output, bytes) do
+          extract_chunks(
+            source,
+            output,
+            offset + length,
+            remaining - length,
+            :crypto.hash_update(context, bytes),
+            name
+          )
+        else
+          {:error, reason} -> bundle_io_error("could not write extracted section #{name}", reason)
+        end
+
+      {:ok, _bytes} ->
+        bundle_io_error("short read while extracting section #{name}", :short_read)
+
+      :eof ->
+        bundle_io_error("unexpected EOF while extracting section #{name}", :eof)
+
+      {:error, reason} ->
+        bundle_io_error("could not read bundle section #{name}", reason)
+    end
+  end
+
+  defp persist_bundle(%ODB{packfetch_bundle: context, provider: provider, hash: hash}, force?) do
+    with {:ok, manifest} <- current_manifest(provider),
+         :ok <- validate_snapshot_manifest(manifest, hash),
+         {:ok, pairs} <- snapshot_pairs(manifest, context.destination),
+         {:ok, toc} <- existing_bundle(context.path),
+         {:ok, changed?} <- snapshot_changed?(toc, pairs, force?),
+         :ok <- maybe_write_snapshot(context, manifest, pairs, toc, changed?) do
+      :ok
+    end
+  end
+
+  defp current_manifest(provider) do
+    case GenServer.call(provider, :packfetch_manifest, :infinity) do
+      {:ok, %PackManifest{} = manifest} ->
+        {:ok, manifest}
+
+      {:error, reason} ->
+        bundle_write_error("current PackFetch manifest is unavailable", reason)
+
+      other ->
+        bundle_write_error("current PackFetch manifest is invalid", other)
+    end
+  catch
+    :exit, reason ->
+      {:error,
+       Error.new(:provider_down, "PackFetch provider stopped before bundle publication",
+         retryable: true,
+         operation: :packfetch_bundle_write,
+         details: %{reason: sanitize_reason(reason)}
+       )}
+  end
+
+  defp validate_snapshot_manifest(
+         %PackManifest{hash: hash, generation: generation, packs: packs, loose: []},
+         hash
+       )
+       when is_binary(generation) and is_list(packs) do
+    if String.valid?(generation) do
+      :ok
+    else
+      bundle_write_error("PackFetch manifest generation is not valid UTF-8", :invalid_generation)
+    end
+  end
+
+  defp validate_snapshot_manifest(_manifest, _hash) do
+    bundle_write_error(
+      "PackFetch manifest cannot be represented as a hydration bundle",
+      :manifest
+    )
+  end
+
+  defp snapshot_pairs(%PackManifest{packs: descriptors}, destination) do
+    descriptors
+    |> Enum.reduce_while({:ok, []}, fn descriptor, {:ok, pairs} ->
+      case snapshot_pair(descriptor, destination) do
+        {:ok, pair} -> {:cont, {:ok, [pair | pairs]}}
+        {:error, %Error{} = error} -> {:halt, {:error, error}}
+      end
+    end)
+    |> case do
+      {:ok, pairs} -> {:ok, Enum.sort_by(pairs, fn pair -> pair.pack_name end)}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp snapshot_pair(
+         %Gitility.PackDescriptor{
+           id: id,
+           pack_size: pack_size,
+           index_size: index_size
+         },
+         destination
+       )
+       when is_binary(id) and is_integer(pack_size) and pack_size > 0 and
+              is_integer(index_size) and index_size > 0 do
+    stem = "pack-#{String.downcase(id)}"
+    pack_name = stem <> ".pack"
+    index_name = stem <> ".idx"
+    pack_path = Path.join(pack_directory(destination), pack_name)
+    index_path = Path.join(pack_directory(destination), index_name)
+
+    with :ok <- validate_snapshot_artifact(pack_path, pack_size),
+         :ok <- validate_snapshot_artifact(index_path, index_size) do
+      {:ok,
+       %{
+         pack_path: pack_path,
+         pack_name: pack_name,
+         pack_length: pack_size,
+         index_path: index_path,
+         index_name: index_name,
+         index_length: index_size
+       }}
+    end
+  end
+
+  defp snapshot_pair(_descriptor, _destination) do
+    bundle_write_error("PackFetch manifest contains an invalid pair", :invalid_descriptor)
+  end
+
+  defp validate_snapshot_artifact(path, expected_size) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, size: ^expected_size}} ->
+        :ok
+
+      {:ok, %{type: :regular, size: actual_size}} ->
+        bundle_write_error("hydrated artifact size changed before bundle publication", %{
+          path: path,
+          expected_size: expected_size,
+          actual_size: actual_size
+        })
+
+      {:ok, _stat} ->
+        bundle_write_error("hydrated artifact is not a regular file", path)
+
+      {:error, reason} ->
+        bundle_write_error("could not inspect hydrated artifact", %{path: path, reason: reason})
+    end
+  end
+
+  defp snapshot_changed?(nil, _pairs, _force?), do: {:ok, true}
+  defp snapshot_changed?(_toc, _pairs, true), do: {:ok, true}
+
+  defp snapshot_changed?(toc, pairs, false) do
+    recorded = Enum.map(toc.files, &{&1.name, &1.length})
+
+    expected =
+      Enum.flat_map(pairs, fn pair ->
+        [{pair.pack_name, pair.pack_length}, {pair.index_name, pair.index_length}]
+      end)
+
+    if recorded == expected do
+      snapshot_hashes_changed?(toc.files, pairs)
+    else
+      {:ok, true}
+    end
+  end
+
+  defp snapshot_hashes_changed?(entries, pairs) do
+    paths = Enum.flat_map(pairs, fn pair -> [pair.pack_path, pair.index_path] end)
+
+    entries
+    |> Enum.zip(paths)
+    |> Enum.reduce_while({:ok, false}, fn {entry, path}, {:ok, false} ->
+      case hash_file(path) do
+        {:ok, hash} when hash == entry.sha256 -> {:cont, {:ok, false}}
+        {:ok, _hash} -> {:halt, {:ok, true}}
+        {:error, %Error{} = error} -> {:halt, {:error, error}}
+      end
+    end)
+  end
+
+  defp hash_file(path) do
+    case :file.open(String.to_charlist(path), [:read, :raw, :binary]) do
+      {:ok, file} ->
+        try do
+          hash_file_chunks(file, :crypto.hash_init(:sha256), path)
+        after
+          :file.close(file)
+        end
+
+      {:error, reason} ->
+        bundle_write_error("could not open hydrated artifact for hashing", %{
+          path: path,
+          reason: reason
+        })
+    end
+  end
+
+  defp hash_file_chunks(file, context, path) do
+    case :file.read(file, @copy_chunk_bytes) do
+      {:ok, bytes} ->
+        hash_file_chunks(file, :crypto.hash_update(context, bytes), path)
+
+      :eof ->
+        {:ok, :crypto.hash_final(context)}
+
+      {:error, reason} ->
+        bundle_write_error("could not hash hydrated artifact", %{path: path, reason: reason})
+    end
+  end
+
+  defp maybe_write_snapshot(_context, _manifest, _pairs, _toc, false), do: :ok
+
+  defp maybe_write_snapshot(context, manifest, pairs, toc, true) do
+    generation = if toc, do: toc.generation + 1, else: 1
+
+    source_identity =
+      context.source_identity || "packfetch:generation:" <> manifest.generation
+
+    writer_pairs = Enum.map(pairs, &{&1.pack_path, &1.index_path})
+
+    with :ok <- validate_snapshot_source_identity(source_identity) do
+      case Writer.write(
+             context.path,
+             pairs: writer_pairs,
+             hash_algorithm: manifest.hash,
+             generation: generation,
+             metadata: %{"source_identity" => source_identity},
+             refs: []
+           ) do
+        {:ok, _receipt} -> :ok
+        {:error, reason} -> bundle_write_error("bundle snapshot publication failed", reason)
+      end
+    end
+  end
+
+  defp validate_snapshot_source_identity(value)
+       when is_binary(value) and byte_size(value) <= 65_536 do
+    :ok
+  end
+
+  defp validate_snapshot_source_identity(_value) do
+    bundle_write_error(
+      "bundle source identity exceeds the format metadata ceiling",
+      :source_identity
+    )
+  end
+
+  defp pack_directory(destination), do: Path.join(destination, "objects/pack")
+
+  defp bundle_io_error(message, reason) do
+    {:error,
+     Error.new(:backend_error, message,
+       operation: :packfetch_bundle_extract,
+       details: %{reason: reason}
+     )}
+  end
+
+  defp bundle_write_error(message, reason) do
+    {:error,
+     Error.new(:backend_error, message,
+       operation: :packfetch_bundle_write,
+       details: %{reason: inspect(reason, limit: 20, printable_limit: 256)}
+     )}
   end
 
   defp hydration_limits(nil, max_hydration_bytes) do
@@ -305,6 +821,23 @@ defmodule Gitility.ODB.PackFetch do
   defp validate_verify(_verify),
     do: NativeSupport.invalid_argument("only verify: :always is supported")
 
+  defp validate_bundle_source_identity(nil), do: :ok
+
+  defp validate_bundle_source_identity(value)
+       when is_binary(value) and byte_size(value) <= 65_536 do
+    if String.valid?(value) do
+      :ok
+    else
+      NativeSupport.invalid_argument(":bundle_source_identity must be valid UTF-8")
+    end
+  end
+
+  defp validate_bundle_source_identity(_value) do
+    NativeSupport.invalid_argument(
+      ":bundle_source_identity must be valid UTF-8 within the bundle metadata ceiling"
+    )
+  end
+
   defp positive(value, _name) when is_integer(value) and value > 0, do: {:ok, value}
 
   defp positive(_value, name),
@@ -318,6 +851,29 @@ defmodule Gitility.ODB.PackFetch do
     catch
       :exit, _reason -> :ok
     end
+  end
+
+  defp cleanup_destination(%{cleanup?: true, path: path}) do
+    File.rm_rf(path)
+    :ok
+  end
+
+  defp cleanup_destination(_destination), do: :ok
+
+  defp normalize_provider_start_error({:backend_init, reason}), do: {:error, reason}
+
+  defp normalize_provider_start_error({:backend_init_raised, message}),
+    do: {:error, {:backend_init_raised, message}}
+
+  defp normalize_provider_start_error(%Error{} = error), do: {:error, error}
+
+  defp normalize_provider_start_error(reason) do
+    {:error,
+     Error.new(:backend_error, "PackFetch provider failed to start",
+       retryable: true,
+       operation: :packfetch_start_link,
+       details: %{reason: sanitize_reason(reason)}
+     )}
   end
 
   defp sanitize_reason(_reason), do: :packfetch_provider_start_failed

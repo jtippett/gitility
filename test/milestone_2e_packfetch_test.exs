@@ -655,19 +655,6 @@ defmodule Gitility.Milestone2ePackFetchTest do
     end
   end
 
-  test "bundle destination is reserved with a stable unsupported error" do
-    published = publish("sha1-basic.git", "bundle")
-    on_exit(fn -> File.rm_rf(published) end)
-
-    assert {:error, %Error{code: :unsupported_operation, message: message}} =
-             PackFetch.start_link(
-               backend: {LocalDirectory, published},
-               into: {:bundle, temp_dir("bundle")}
-             )
-
-    assert message =~ "Gitility.Bundle"
-  end
-
   test "PackFetch is a supervisor child and stops promptly under a tree" do
     published = publish("sha1-basic.git", "supervised")
     destination = temp_dir("supervised")

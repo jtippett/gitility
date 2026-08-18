@@ -986,7 +986,9 @@ readable while refresh builds and verifies the replacement local-store handle.
 > **Amended 2026-08-18 (F6 revision):** the mechanism below — SQLite
 > format via turso_core, chunked 1 MiB blob rows, in-place transactional
 > updates — is superseded. Format v1 is a flat container (header, raw
-> pack/idx byte sections, TOC, trailer) implemented with `std::fs` only;
+> pack/idx byte sections, TOC, trailer) read/written with plain file
+> I/O — v1 implements the store Elixir-side on the existing
+> `ODB.RangeBackend` + `RefDB.Backend` seams (no new native surface);
 > updates and repack are whole-file rewrite + atomic rename; output is
 > byte-deterministic. The product promises in this section (one file =
 > ODB + refs, packs stay packs, `PackFetch`/`RefDB.Backend`/`into:

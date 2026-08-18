@@ -38,8 +38,14 @@ the spike crate remains in-tree as evidence.
 - One file, no sidecars, ever: a read-only open MUST work on an
   immutable file (S3 download, chmod 444, ro mount) — no locks, no
   journals, no temp files created by opening.
-- No threads, no signal handlers: reader and writer use plain
-  synchronous `std::fs` I/O only (spawn guard applies as everywhere).
+- No threads, no signal handlers, no engine: reader and writer use plain
+  synchronous file I/O only. Implementation note (non-normative): v1
+  implements the store Elixir-side on the existing proven seams —
+  `Gitility.ODB.RangeBackend` (`:file.pread` over section ranges, hydrated
+  by the M2e PackFetch machinery like every range backend) plus
+  `Gitility.RefDB.Backend` (TOC parsed once at init) — adding NO new
+  native surface. A native fast path is post-1.0 headroom if profiling
+  ever demands it; the format is identical either way.
 
 ## File layout
 
@@ -197,10 +203,12 @@ Bounds: `16 <= toc_offset`, `toc_offset + toc_len + 64 == file size`.
   read TOC and verify `toc_sha256` (mismatch: `:malformed_object`) →
   parse strictly per the rules above → pin `generation`.
 - The store serves PackFetch from the section byte ranges via plain
-  `pread`; pack and idx sha256s are verified STREAMING during hydration,
-  unconditionally, exactly as the M2e backends do (the pack machinery
-  additionally verifies git's own trailing pack/idx hashes, as
-  everywhere).
+  `pread`. Hydration integrity is the M2e machinery's unconditional
+  pack/idx checksum verification (git's own trailing hashes), exactly as
+  for every range backend. The container's per-file sha256s are computed
+  by the writer and verified by `Gitility.Bundle.verify/1`, which streams
+  the whole file (structure + every checksum). The TOC sha256 is always
+  verified at open.
 - The refs table implements `RefDB.Backend`: resolve by binary search,
   list/prefix by contiguous scan, from the pinned snapshot. Per-hop
   atomicity is trivial — all rows are direct targets by construction.

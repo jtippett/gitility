@@ -840,7 +840,8 @@ defmodule Gitility.ODB.PackFetch do
   end
 
   defp validate_backend({module, _arg}) when is_atom(module) do
-    if function_exported?(module, :init, 1) and function_exported?(module, :manifest, 1) and
+    if Code.ensure_loaded?(module) and function_exported?(module, :init, 1) and
+         function_exported?(module, :manifest, 1) and
          function_exported?(module, :read_ranges, 2) do
       :ok
     else

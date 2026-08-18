@@ -513,6 +513,53 @@ defmodule Gitility.Milestone2ePackFetchTest do
     stop(copy_supervisor)
   end
 
+  test "LocalDirectory publishes alternate objects transitively and refuses broken alternates" do
+    published = publish("sha1-alternate.git", "alternate")
+    hydrated = temp_dir("alternate-hydrated")
+
+    on_exit(fn ->
+      File.rm_rf(published)
+      File.rm_rf(hydrated)
+    end)
+
+    {:ok, state} = LocalDirectory.init(published)
+    {:ok, manifest} = LocalDirectory.manifest(state)
+    assert manifest.packs != []
+
+    head = fixture_oid(:sha1_basic_head)
+    alternate = fixture("sha1-alternate.git")
+    oid = Gitility.OID.to_string(head)
+
+    primary_object =
+      Path.join([alternate, "objects", binary_part(oid, 0, 2), binary_part(oid, 2, 38)])
+
+    refute File.exists?(primary_object)
+
+    {:ok, direct} = Repository.open(alternate)
+    {:ok, supervisor, remote} = start_packfetch(published, {:dir, hydrated})
+    assert {:ok, %Gitility.Object{oid: ^head}} = ODB.read(remote, head)
+    parity!(direct, remote, head, @basic_paths)
+    stop(supervisor)
+
+    broken_source = temp_dir("broken-alternate.git")
+    broken_destination = temp_dir("broken-alternate-published")
+    missing_alternate = Path.join(broken_source, "missing-objects")
+    File.cp_r!(alternate, broken_source)
+
+    File.write!(
+      Path.join([broken_source, "objects", "info", "alternates"]),
+      missing_alternate <> "\n"
+    )
+
+    on_exit(fn ->
+      File.rm_rf(broken_source)
+      File.rm_rf(broken_destination)
+    end)
+
+    assert {:error, {:alternate_objects_directory_missing, ^missing_alternate}} =
+             LocalDirectory.publish(broken_source, broken_destination)
+  end
+
   test "loose-object publishing reports a read-only source clearly" do
     repository_copy = temp_dir("readonly-source.git")
     destination = temp_dir("readonly-published")

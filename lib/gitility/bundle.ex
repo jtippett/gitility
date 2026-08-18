@@ -9,7 +9,9 @@ defmodule Gitility.Bundle do
   rename durability across sudden power loss remains platform-dependent.
 
   Opening starts one supervision tree containing an eager PackFetch object
-  store and a pinned reference provider. The bundle itself is only ever
+  store and a pinned reference provider. Every open is pinned to one bundle
+  generation for its lifetime: refresh is a no-op, and moving to a replacement
+  generation requires opening the path again. The bundle itself is only ever
   opened read-only and no sidecar is created beside it.
   """
 
@@ -26,7 +28,7 @@ defmodule Gitility.Bundle do
   `:source` must be `{:repository, directory}`. Optional metadata is supplied
   with `:source_identity`, `:publisher`, and `:created_at`; timestamps are
   never synthesized. `:git_executable` selects the executable used to pack
-  loose objects and for the SHA-256 compatibility fallback.
+  loose objects and to peel SHA-256 tags while the engine cannot do so.
   """
   @spec write(Path.t(), keyword()) :: {:ok, Receipt.t()} | {:error, Error.t()}
   def write(path, opts) when is_binary(path) and is_list(opts) do
@@ -53,6 +55,7 @@ defmodule Gitility.Bundle do
     path = Path.expand(path)
 
     with {:ok, source} <- source_path(opts[:source]),
+         :ok <- refuse_shallow_source(source),
          {:ok, generation} <- next_generation(path),
          {:ok, metadata} <- metadata(source, opts),
          {:ok, repository} <- Repository.open(source) do
@@ -97,18 +100,14 @@ defmodule Gitility.Bundle do
 
       {:ok,
        %{
-         format_version: {toc.format_major, toc.format_minor},
-         format_major: toc.format_major,
-         format_minor: toc.format_minor,
+         format_version: "#{toc.format_major}.#{toc.format_minor}",
          hash_algorithm: toc.hash_algorithm,
          generation: toc.generation,
          source_identity: Map.fetch!(toc.metadata, "source_identity"),
          metadata: toc.metadata,
-         files: file_count,
-         refs: ref_count,
          file_count: file_count,
          ref_count: ref_count,
-         total_bytes: toc.file_size
+         bytes: toc.file_size
        }}
     end
   end
@@ -454,7 +453,7 @@ defmodule Gitility.Bundle do
   end
 
   defp ref_row(name, target, odb, source, git) do
-    case object_kind(odb, target.oid, source, git) do
+    case object_kind(odb, target.oid) do
       {:ok, header} ->
         {:ok,
          %{
@@ -475,7 +474,7 @@ defmodule Gitility.Bundle do
   defp peeled_commit(odb, target, :tag, source, git) do
     with nil <- existing_commit_peel(odb, target.peeled, source, git),
          {:ok, peeled} <- peel_to_commit(odb, target.oid, source, git),
-         {:ok, %{type: :commit}} <- object_kind(odb, peeled, source, git) do
+         {:ok, %{type: :commit}} <- object_kind(odb, peeled) do
       peeled
     else
       %Gitility.OID{} = peeled -> peeled
@@ -488,25 +487,14 @@ defmodule Gitility.Bundle do
 
   defp existing_commit_peel(_odb, nil, _source, _git), do: nil
 
-  defp existing_commit_peel(odb, peeled, source, git) do
-    case object_kind(odb, peeled, source, git) do
+  defp existing_commit_peel(odb, peeled, _source, _git) do
+    case object_kind(odb, peeled) do
       {:ok, %{type: :commit}} -> peeled
       _unavailable -> nil
     end
   end
 
-  defp object_kind(odb, oid, source, git) do
-    case ODB.header(odb, oid) do
-      {:ok, header} ->
-        {:ok, header}
-
-      {:error, %Error{code: :unsupported_hash}} ->
-        git_object_kind(source, git, oid)
-
-      {:error, %Error{} = error} ->
-        {:error, error}
-    end
-  end
+  defp object_kind(odb, oid), do: ODB.header(odb, oid)
 
   defp peel_to_commit(odb, oid, source, git) do
     case Gitility.peel(odb, oid) do
@@ -514,37 +502,13 @@ defmodule Gitility.Bundle do
         {:ok, peeled}
 
       {:error, %Error{code: :unsupported_hash}} ->
+        # Core peel still gates SHA-256 stores. Remove this Git fallback when
+        # the engine can peel SHA-256 tag objects itself.
         git_peel_to_commit(source, git, oid)
 
       {:error, %Error{} = error} ->
         {:error, error}
     end
-  end
-
-  defp git_object_kind(source, git, oid) do
-    case System.cmd(git, ["-C", source, "cat-file", "-t", to_string(oid)], stderr_to_stdout: true) do
-      {output, 0} ->
-        case String.trim(output) do
-          "commit" -> {:ok, %{type: :commit}}
-          "tag" -> {:ok, %{type: :tag}}
-          "tree" -> {:ok, %{type: :tree}}
-          "blob" -> {:ok, %{type: :blob}}
-          other -> git_error("Git returned unknown object kind #{inspect(other)}")
-        end
-
-      {output, _status} ->
-        if missing_git_object?(output) do
-          {:error,
-           Error.new(:missing_object, "object is missing from the source ODB",
-             operation: :bundle_write,
-             details: %{oid: to_string(oid)}
-           )}
-        else
-          git_error("Git could not inspect object kind: #{String.slice(output, 0, 512)}")
-        end
-    end
-  rescue
-    exception -> git_error("Git object-kind fallback failed: #{Exception.message(exception)}")
   end
 
   defp git_peel_to_commit(source, git, oid) do
@@ -558,18 +522,6 @@ defmodule Gitility.Bundle do
     end
   rescue
     _exception -> {:error, :peel_unavailable}
-  end
-
-  defp missing_git_object?(output) do
-    String.contains?(output, [
-      "could not get object info",
-      "Not a valid object name",
-      "bad object"
-    ])
-  end
-
-  defp git_error(message) do
-    {:error, Error.new(:backend_error, message, operation: :bundle_write)}
   end
 
   defp head_symref(source) do
@@ -634,6 +586,32 @@ defmodule Gitility.Bundle do
 
   defp source_path({:repository, source}) when is_binary(source), do: {:ok, Path.expand(source)}
   defp source_path(_source), do: invalid_write(":source must be {:repository, directory}")
+
+  defp refuse_shallow_source(source) do
+    with {:ok, git_directory} <- PackInventory.git_directory(source) do
+      shallow = Path.join(git_directory, "shallow")
+
+      case File.lstat(shallow) do
+        {:error, :enoent} ->
+          :ok
+
+        {:ok, _stat} ->
+          {:error,
+           Error.new(
+             :unsupported_operation,
+             "bundle format v1 cannot publish shallow repository boundary file #{shallow}",
+             operation: :bundle_write,
+             details: %{shallow_file: shallow, format_version: "1.0"}
+           )}
+
+        {:error, reason} ->
+          invalid_write("could not inspect shallow boundary file #{shallow}: #{inspect(reason)}")
+      end
+    else
+      {:error, reason} ->
+        invalid_write("could not resolve source git directory: #{inspect(reason)}")
+    end
+  end
 
   defp required_path(path) when is_binary(path) and byte_size(path) > 0,
     do: {:ok, Path.expand(path)}

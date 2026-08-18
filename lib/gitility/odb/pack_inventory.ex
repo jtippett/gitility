@@ -1,5 +1,12 @@
 defmodule Gitility.ODB.PackInventory do
-  @moduledoc false
+  @moduledoc """
+  Collects the complete packable object inventory of a local repository.
+
+  Collection follows `objects/info/alternates` transitively so callers do not
+  publish stores that omit borrowed objects. A referenced alternate objects
+  directory that is missing is returned as the loud
+  `{:alternate_objects_directory_missing, directory}` error.
+  """
 
   @type pair :: {Path.t(), Path.t()}
 
@@ -159,9 +166,9 @@ defmodule Gitility.ODB.PackInventory do
     git_args =
       if File.dir?(Path.join(repository, ".git")) or
            File.regular?(Path.join(repository, ".git")) do
-        ["-C", repository, "pack-objects", prefix]
+        ["-C", repository, "pack-objects", "--threads=1", prefix]
       else
-        ["--git-dir", repository, "pack-objects", prefix]
+        ["--git-dir", repository, "pack-objects", "--threads=1", prefix]
       end
 
     shell_command =

@@ -12,6 +12,9 @@ defmodule Gitility.ODB.RangeBackend.LocalDirectory do
   copied as-is. When loose objects exist, it feeds their complete object-ID
   list to the configured Git executable's `pack-objects` plumbing, adding
   that new pack beside the existing packs in the published manifest.
+  Publication follows `objects/info/alternates` transitively; a missing
+  alternate objects directory is a loud error rather than an incomplete
+  published store.
 
   Packing loose objects briefly stages a temporary directory below the
   source repository's `objects/` directory so Git can rename its output on

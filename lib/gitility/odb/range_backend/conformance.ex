@@ -55,7 +55,7 @@ defmodule Gitility.ODB.RangeBackend.Conformance do
         {:ok, state} = @range_backend.init(backend_init_arg())
 
         artifacts =
-          if @range_expected_failure or @range_prepublished_synthetic do
+          if @range_expected_failure || @range_prepublished_synthetic do
             backend_artifacts()
           else
             {key, bytes} = Gitility.ODB.RangeBackend.Conformance.synthetic_artifact()
@@ -126,7 +126,8 @@ defmodule Gitility.ODB.RangeBackend.Conformance do
           end)
         end
 
-        if function_exported?(@range_backend, :terminate, 2) do
+        if Code.ensure_loaded?(@range_backend) and
+             function_exported?(@range_backend, :terminate, 2) do
           test "terminate does not poison shared backend state", context do
             _result = apply(@range_backend, :terminate, [:shutdown, context.state])
             assert {:ok, %Gitility.PackManifest{}} = @range_backend.manifest(context.state)

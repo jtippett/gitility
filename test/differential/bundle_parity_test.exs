@@ -19,14 +19,13 @@ defmodule Gitility.Differential.BundleParityTest do
     %{directory: directory}
   end
 
-  test "packed, mixed, nested, alternate, shallow, and sha256 families publish and verify",
+  test "packed, mixed, nested, alternate, and sha256 families publish and verify",
        context do
     for fixture_name <- [
           "sha1-basic-packed.git",
           "sha1-basic-mixed.git",
           "sha1-nested.git",
           "sha1-alternate.git",
-          "sha1-history-shallow.git",
           "sha256-basic.git"
         ] do
       source = fixture(fixture_name)
@@ -54,7 +53,15 @@ defmodule Gitility.Differential.BundleParityTest do
       assert {:ok, ref_state} = Bundle.RefBackend.init(path)
       assert {:ok, head} = Bundle.RefBackend.resolve("HEAD", ref_state)
       assert head.oid.algorithm == expected_hash
-      Bundle.RefBackend.terminate(:normal, ref_state)
+
+      if expected_hash == :sha256 do
+        assert {:ok, toc} = Bundle.Format.parse(path)
+        tag = Enum.find(toc.refs, &(&1.name == "refs/tags/v1.0.0"))
+        assert tag.kind == :tag
+        assert is_binary(tag.peeled)
+        assert {:ok, expected_peeled} = Oracle.rev_parse(source, "v1.0.0^{commit}")
+        assert OID.to_string(OID.new!(:sha256, tag.peeled)) == expected_peeled
+      end
 
       hydration = Path.join(context.directory, fixture_name <> "-hydrated")
       assert {:ok, bundle_repository} = Bundle.open(path, into: {:dir, hydration})

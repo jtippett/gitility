@@ -3,8 +3,11 @@ defmodule Gitility.Bundle.Format do
   Pure encoder and strict positional parser for Gitility bundle format v1.
 
   Opening verifies the header, EOF trailer, TOC identity, bounds, section
-  tiling, pack/index pairing, and the complete metadata/ref grammar. Section
-  payload hashes are intentionally deferred to `Gitility.Bundle.verify/1`.
+  tiling, pack/index pairing, and the complete metadata/ref grammar. Unknown
+  metadata keys and FILE kinds remain minor-additive space, except for the
+  reserved `shallow_roots` feature gate, which v1 readers refuse rather than
+  silently misreading shallow history. Section payload hashes are
+  intentionally deferred to `Gitility.Bundle.verify/1`.
   """
 
   alias Gitility.{Error, OID}
@@ -227,13 +230,11 @@ defmodule Gitility.Bundle.Format do
          true <- generation >= 1 || malformed("bundle generation must be at least 1"),
          {:ok, metadata_count, rest} <- take_u32(rest, "metadata count"),
          {:ok, metadata, rest} <- parse_metadata(metadata_count, rest, nil, []),
-         true <-
-           Enum.any?(metadata, &(elem(&1, 0) == "source_identity")) ||
-             malformed("required metadata key source_identity is missing"),
+         :ok <- validate_metadata(metadata),
          {:ok, file_count, rest} <- take_u32(rest, "file count"),
          {:ok, sections, rest} <- parse_files(file_count, rest, MapSet.new(), []),
          :ok <- validate_tiling(sections, toc_offset),
-         :ok <- validate_pairs(sections, hash_algorithm),
+         :ok <- validate_pairs(Enum.filter(sections, &(&1.kind in [:pack, :idx])), hash_algorithm),
          {:ok, ref_count, rest} <- take_u32(rest, "ref count"),
          {:ok, refs, _minor_tail} <-
            parse_refs(ref_count, rest, hash_algorithm, nil, []) do
@@ -273,6 +274,25 @@ defmodule Gitility.Bundle.Format do
       do_parse_metadata(count - 1, rest, key, [{key, value} | entries])
     else
       {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp validate_metadata(metadata) do
+    cond do
+      Enum.any?(metadata, &(elem(&1, 0) == "shallow_roots")) ->
+        {:error,
+         Error.new(
+           :unsupported_operation,
+           "bundle metadata key shallow_roots is reserved and unsupported by format v1",
+           operation: :bundle_parse,
+           details: %{metadata_key: "shallow_roots"}
+         )}
+
+      Enum.any?(metadata, &(elem(&1, 0) == "source_identity")) ->
+        :ok
+
+      true ->
+        malformed("required metadata key source_identity is missing")
     end
   end
 
@@ -365,9 +385,6 @@ defmodule Gitility.Bundle.Format do
 
   defp validate_pairs([], _hash), do: :ok
 
-  defp validate_pairs([%{kind: {:unknown, _kind}} | rest], hash),
-    do: validate_pairs(rest, hash)
-
   defp validate_pairs([%{kind: :pack, name: pack}, %{kind: :idx, name: index} | rest], hash) do
     with {:ok, pack_stem} <- pack_stem(pack, ".pack", hash),
          {:ok, ^pack_stem} <- pack_stem(index, ".idx", hash) do
@@ -413,7 +430,7 @@ defmodule Gitility.Bundle.Format do
   defp take_u64(<<value::little-64, rest::binary>>, _label), do: {:ok, value, rest}
   defp take_u64(_bytes, label), do: malformed("TOC ended while reading #{label}")
 
-  defp take_bytes(bytes, length, label) when byte_size(bytes) >= length do
+  defp take_bytes(bytes, length, _label) when byte_size(bytes) >= length do
     <<value::binary-size(length), rest::binary>> = bytes
     {:ok, value, rest}
   end

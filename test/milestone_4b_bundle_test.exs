@@ -299,16 +299,27 @@ defmodule Gitility.M4b.BundleTest do
     assert File.read!(first) == File.read!(second)
     assert :ok = Bundle.verify(first)
 
-    assert {:ok,
-            %{
-              format_version: {1, 0},
-              hash_algorithm: :sha1,
-              generation: 1,
-              source_identity: "fixture:basic",
-              total_bytes: bytes
-            }} = Bundle.info(first)
+    assert {:ok, info} = Bundle.info(first)
 
-    assert bytes == receipt1.bytes
+    assert MapSet.new(Map.keys(info)) ==
+             MapSet.new([
+               :format_version,
+               :hash_algorithm,
+               :generation,
+               :source_identity,
+               :metadata,
+               :file_count,
+               :ref_count,
+               :bytes
+             ])
+
+    assert info.format_version == "1.0"
+    assert info.hash_algorithm == :sha1
+    assert info.generation == 1
+    assert info.source_identity == "fixture:basic"
+    assert info.file_count == receipt1.files
+    assert info.ref_count == receipt1.refs
+    assert info.bytes == receipt1.bytes
 
     hydration = Path.join(context.directory, "hydrated")
     assert {:ok, repository} = Bundle.open(first, into: {:dir, hydration})
@@ -327,7 +338,7 @@ defmodule Gitility.M4b.BundleTest do
     assert receipt.refs == 0
     assert Enum.any?(receipt.warnings, &String.contains?(&1.message, "HEAD"))
     assert :ok = Bundle.verify(path)
-    assert {:ok, %{files: 0, refs: 0}} = Bundle.info(path)
+    assert {:ok, %{file_count: 0, ref_count: 0}} = Bundle.info(path)
 
     assert {:ok, repository} =
              Bundle.open(path, into: {:dir, Path.join(context.directory, "odb")})
@@ -373,7 +384,8 @@ defmodule Gitility.M4b.BundleTest do
     assert_error(tiny, :malformed_object)
 
     bad_sha = copy(valid, context.directory, "bad-toc-sha")
-    mutate_file(bad_sha, byte_size(bytes) - 48, 1, <<255>>)
+    old_sha_byte = :binary.at(bytes, byte_size(bytes) - 48)
+    mutate_file(bad_sha, byte_size(bytes) - 48, 1, <<Bitwise.bxor(old_sha_byte, 1)>>)
     assert_error(bad_sha, :malformed_object)
 
     trailing = copy(valid, context.directory, "trailing")
@@ -389,15 +401,54 @@ defmodule Gitility.M4b.BundleTest do
     pack_field = Support.locate_file_field(toc, pack)
     index_field = Support.locate_file_field(toc, index)
 
-    for {label, offset, value} <- [
-          {:gap, pack_field.offset, 17},
-          {:overlap, index_field.offset, 16},
-          {:out_of_order, index_field.offset, 15}
-        ] do
-      path = copy(valid, context.directory, label)
-      Support.mutate_toc(path, offset, 8, <<value::little-64>>)
-      assert_error(path, :malformed_object)
-    end
+    gap = Path.join(context.directory, "gap.bundle")
+
+    Support.write_raw_toc(
+      gap,
+      Support.raw_toc(
+        files: [
+          section_entry(:pack, pack, 16, "pack-bytes"),
+          section_entry(:idx, index, 27, "i")
+        ]
+      ),
+      "pack-bytesidx"
+    )
+
+    assert_error(gap, :malformed_object)
+
+    overlap = Path.join(context.directory, "overlap.bundle")
+
+    Support.write_raw_toc(
+      overlap,
+      Support.raw_toc(
+        files: [
+          section_entry(:pack, pack, 16, "pack-bytes"),
+          section_entry(:idx, index, 25, "idx!")
+        ]
+      ),
+      "pack-bytesidx"
+    )
+
+    assert_error(overlap, :malformed_object)
+
+    second_pack = "pack-#{String.duplicate("b", 40)}.pack"
+    second_index = "pack-#{String.duplicate("b", 40)}.idx"
+    out_of_order = Path.join(context.directory, "out-of-order.bundle")
+
+    Support.write_raw_toc(
+      out_of_order,
+      Support.raw_toc(
+        files: [
+          section_entry(:pack, pack, 21, "bbbb"),
+          section_entry(:idx, index, 25, "iiiii"),
+          section_entry(:pack, second_pack, 16, "aa"),
+          section_entry(:idx, second_index, 18, "jjj")
+        ]
+      ),
+      "aajjjbbbbiiiii"
+    )
+
+    assert_error(out_of_order, :malformed_object)
 
     missing_index = copy(valid, context.directory, "missing-index")
     Support.mutate_toc(missing_index, index_field.kind, 1, <<1>>)
@@ -424,6 +475,21 @@ defmodule Gitility.M4b.BundleTest do
     assert {:ok, parsed} = Format.parse(unknown)
     assert parsed.files == []
     assert length(parsed.sections) == 2
+
+    interleaved_unknown = Path.join(context.directory, "interleaved-unknown.bundle")
+
+    Support.write_bundle(interleaved_unknown,
+      refs: [],
+      sections: [
+        {:pack, pack, "pack-bytes"},
+        {{:unknown, 90}, "future-section", "future"},
+        {:idx, index, "idx"}
+      ]
+    )
+
+    assert {:ok, parsed} = Format.parse(interleaved_unknown)
+    assert Enum.map(parsed.files, & &1.kind) == [:pack, :idx]
+    assert Enum.map(parsed.sections, & &1.kind) == [:pack, {:unknown, 90}, :idx]
 
     too_long = Path.join(context.directory, "long-file-name.bundle")
     name = :binary.copy("n", 4097)
@@ -457,6 +523,15 @@ defmodule Gitility.M4b.BundleTest do
       assert_error(path, :malformed_object)
     end
 
+    missing_source_identity = Path.join(context.directory, "missing-source-identity.bundle")
+
+    Support.write_raw_toc(
+      missing_source_identity,
+      Support.raw_toc(metadata: [{"publisher", "m4b:test"}])
+    )
+
+    assert_error(missing_source_identity, :malformed_object)
+
     for {label, refs} <- [
           {:unsorted_refs,
            [
@@ -486,6 +561,11 @@ defmodule Gitility.M4b.BundleTest do
     Support.mutate_toc(unknown_ref, kind_offset, 1, <<99>>)
     assert_error(unknown_ref, :malformed_object)
 
+    wrong_oid_width = Path.join(context.directory, "sha256-with-sha1-oids.bundle")
+    Support.write_bundle(wrong_oid_width)
+    Support.mutate_toc(wrong_oid_width, 0, 1, <<2>>)
+    assert_error(wrong_oid_width, :malformed_object)
+
     overrun = Path.join(context.directory, "length-overrun.bundle")
     toc = <<1, 1::little-64, 1::little-32, 100::little-32, "short">>
     Support.write_raw_toc(overrun, toc)
@@ -494,6 +574,30 @@ defmodule Gitility.M4b.BundleTest do
     tail = Path.join(context.directory, "minor-tail.bundle")
     Support.write_bundle(tail, refs: [], tail: <<222, 173, 190, 239>>)
     assert {:ok, _parsed} = Format.parse(tail)
+  end
+
+  test "format v1 refuses shallow sources and the reserved shallow metadata feature", context do
+    shallow_source = fixture("sha1-history-shallow.git")
+    output = Path.join(context.directory, "shallow.bundle")
+    shallow_file = Path.join(shallow_source, "shallow")
+
+    assert {:error, %Error{code: :unsupported_operation, message: message}} =
+             Bundle.write(output, source: {:repository, shallow_source})
+
+    assert message =~ shallow_file
+    assert message =~ "v1"
+
+    reserved = Path.join(context.directory, "reserved-shallow-roots.bundle")
+
+    Support.write_bundle(reserved,
+      refs: [],
+      metadata: %{"source_identity" => "m4b:test", "shallow_roots" => "deadbeef"}
+    )
+
+    assert {:error, %Error{code: :unsupported_operation, message: reserved_message}} =
+             Format.parse(reserved)
+
+    assert reserved_message =~ "shallow_roots"
   end
 
   test "TOC lengths above 64 MiB are rejected before allocation", context do
@@ -529,40 +633,125 @@ defmodule Gitility.M4b.BundleTest do
     assert message =~ first.name
   end
 
-  test "range reads detect generation moves and ref refresh explicitly re-pins", context do
+  test "bundle opens remain pinned across forward replacement and older-generation rollback",
+       context do
+    source = Path.join(context.directory, "moving-source.git")
+    File.cp_r!(fixture("sha1-basic-packed.git"), source)
     path = Path.join(context.directory, "moving.bundle")
     replacement = Path.join(context.directory, "replacement.bundle")
-    id = String.duplicate("a", 40)
-    sections = [{:pack, "pack-#{id}.pack", "old-pack"}, {:idx, "pack-#{id}.idx", "old-index"}]
+    older = Path.join(context.directory, "older.bundle")
 
-    Support.write_bundle(path,
-      generation: 1,
-      sections: sections,
-      refs: [%{name: "refs/heads/main", target: Support.oid(:sha1, 1), kind: :commit}]
-    )
+    assert {:ok, %{generation: 1}} =
+             Bundle.write(path, source: {:repository, source}, source_identity: "moving")
 
+    File.cp!(path, older)
+    File.cp!(path, replacement)
+
+    assert {:ok, pinned_old} =
+             Bundle.open(path, into: {:dir, Path.join(context.directory, "old-hydrated")})
+
+    assert {:ok, old_target} = RefDB.resolve(pinned_old.refs, "refs/heads/main")
+    assert {:ok, old_toc} = Format.parse(path)
     assert {:ok, range_state} = Bundle.RangeBackend.init(path)
-    assert {:ok, ref_state} = Bundle.RefBackend.init(path)
-    assert {:ok, old_target} = Bundle.RefBackend.resolve("refs/heads/main", ref_state)
+    pack = Enum.find(old_toc.files, &(&1.kind == :pack))
 
-    Support.write_bundle(replacement,
-      generation: 2,
-      sections: sections,
-      refs: [%{name: "refs/heads/main", target: Support.oid(:sha1, 2), kind: :commit}]
-    )
+    {parent, 0} =
+      System.cmd("git", ["-C", source, "rev-parse", "HEAD^"], stderr_to_stdout: true)
+
+    {_output, 0} =
+      System.cmd(
+        "git",
+        ["-C", source, "update-ref", "refs/heads/main", String.trim(parent)],
+        stderr_to_stdout: true
+      )
+
+    assert {:ok, %{generation: 2}} =
+             Bundle.write(replacement,
+               source: {:repository, source},
+               source_identity: "moving"
+             )
 
     :ok = File.rename(replacement, path)
-    range = %ByteRange{key: "pack-#{id}.pack", offset: 0, length: 1}
+    range = %ByteRange{key: pack.name, offset: 0, length: 1}
 
     assert {:error, %Error{code: :backend_error, message: message}} =
              Bundle.RangeBackend.read_ranges([range], range_state)
 
     assert message =~ "generation moved"
-    assert {:ok, ^old_target} = Bundle.RefBackend.resolve("refs/heads/main", ref_state)
-    assert :ok = Bundle.RefBackend.refresh(ref_state)
-    assert {:ok, new_target} = Bundle.RefBackend.resolve("refs/heads/main", ref_state)
+    assert :ok = RefDB.refresh(pinned_old.refs)
+    assert {:ok, ^old_target} = RefDB.resolve(pinned_old.refs, "refs/heads/main")
+
+    assert {:ok, pinned_new} =
+             Bundle.open(path, into: {:dir, Path.join(context.directory, "new-hydrated")})
+
+    assert {:ok, new_target} = RefDB.resolve(pinned_new.refs, "refs/heads/main")
     assert new_target.oid != old_target.oid
-    Bundle.RefBackend.terminate(:normal, ref_state)
+    assert {:ok, new_range_state} = Bundle.RangeBackend.init(path)
+
+    :ok = File.rename(older, path)
+
+    assert {:error, %Error{code: :backend_error, message: rollback_message}} =
+             Bundle.RangeBackend.read_ranges([range], new_range_state)
+
+    assert rollback_message =~ "generation moved"
+    assert :ok = RefDB.refresh(pinned_new.refs)
+    assert {:ok, ^new_target} = RefDB.resolve(pinned_new.refs, "refs/heads/main")
+  end
+
+  test "mixed loose and packed publication is byte deterministic", context do
+    source = fixture("sha1-basic-mixed.git")
+    first = Path.join(context.directory, "mixed-first.bundle")
+    second = Path.join(context.directory, "mixed-second.bundle")
+
+    assert {:ok, _receipt} =
+             Bundle.write(first, source: {:repository, source}, source_identity: "mixed")
+
+    assert {:ok, _receipt} =
+             Bundle.write(second, source: {:repository, source}, source_identity: "mixed")
+
+    assert :crypto.hash(:sha256, File.read!(first)) ==
+             :crypto.hash(:sha256, File.read!(second))
+  end
+
+  test "bundle ref paging is gapless and rejects malformed cursor forms", context do
+    path = Path.join(context.directory, "paged-refs.bundle")
+
+    rows =
+      Enum.map(1..7, fn index ->
+        %{
+          name: "refs/heads/page/#{String.pad_leading(Integer.to_string(index), 2, "0")}",
+          target: Support.oid(:sha1, index),
+          kind: :commit
+        }
+      end)
+
+    Support.write_bundle(path, refs: rows)
+
+    assert {:ok, supervisor} =
+             RefDB.start_link(backend: {Bundle.RefBackend, path}, concurrency: 2)
+
+    on_exit(fn ->
+      Process.unlink(supervisor)
+      if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
+    end)
+
+    assert {:ok, refs} = RefDB.handle(supervisor)
+    assert {:ok, unlimited} = RefDB.list(refs, limit: 100)
+    pages = collect_bundle_ref_pages(refs, nil, [])
+
+    assert Enum.flat_map(pages, & &1.items) == unlimited.items
+
+    assert Enum.all?(pages, fn page ->
+             page.truncated == is_binary(page.next_cursor)
+           end)
+
+    assert {:error, %Error{code: :invalid_cursor}} =
+             RefDB.list(refs, limit: 2, cursor: "not%base64url")
+
+    wrong_payload = Base.url_encode64("refs/heads/page/missing", padding: false)
+
+    assert {:error, %Error{code: :backend_error}} =
+             RefDB.list(refs, limit: 2, cursor: wrong_payload)
   end
 
   test "write refuses foreign destinations and increments valid bundle generations", context do
@@ -623,6 +812,26 @@ defmodule Gitility.M4b.BundleTest do
       sections: [{:pack, "pack-#{id}.pack", "pack-bytes"}, {:idx, "pack-#{id}.idx", "idx"}],
       refs: [%{name: "refs/heads/main", target: Support.oid(:sha1, 1), kind: :commit}]
     )
+  end
+
+  defp section_entry(kind, name, offset, contents) do
+    %{
+      kind: kind,
+      name: name,
+      offset: offset,
+      length: byte_size(contents),
+      sha256: :crypto.hash(:sha256, contents)
+    }
+  end
+
+  defp collect_bundle_ref_pages(refs, cursor, pages) do
+    {:ok, page} = RefDB.list(refs, limit: 2, cursor: cursor)
+
+    if page.truncated do
+      collect_bundle_ref_pages(refs, page.next_cursor, [page | pages])
+    else
+      Enum.reverse([page | pages])
+    end
   end
 
   defp copy(source, directory, label) do

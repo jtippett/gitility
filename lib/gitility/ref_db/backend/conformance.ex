@@ -135,7 +135,8 @@ defmodule Gitility.RefDB.Backend.Conformance do
           end)
         end
 
-        if function_exported?(@conformance_backend, :list, 2) do
+        if Code.ensure_loaded?(@conformance_backend) and
+             function_exported?(@conformance_backend, :list, 2) do
           test "list returns one ordered Gitility.Page", context do
             query = Gitility.RefDB.Backend.Conformance.query(length(context.refs))
             reply = @conformance_backend.list(query, context.state)

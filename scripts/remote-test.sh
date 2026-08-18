@@ -34,7 +34,7 @@
 # this directory (or SPRITE=<name>).
 set -euo pipefail
 
-SPRITE_NAME="${SPRITE:-gitility-test}"
+SPRITE_NAME="${SPRITE:-gitility-test-2}"
 REMOTE_DIR="${GITILITY_REMOTE_DIR:-\$HOME/gitility}"
 PIDS_MAX="${GITILITY_REMOTE_PIDS_MAX:-2000}"
 STAGES=("$@")

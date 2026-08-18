@@ -139,6 +139,17 @@ These findings are load-bearing; the design references them by ID.
   tokio): ~47 GiB verified byte-correct at ~2.2 GiB/s, connection
   open/close churn clean, zero errors or deadlocks. The rusqlite fallback
   was not triggered.
+  **REVISED 2026-08-18 — SQLite dropped entirely (James's decision).** The
+  M4b conformance spike (`crates/bundle-spike`) found turso_core 0.7.2
+  cannot serve the read path (no public incremental Blob API; a 64 KiB
+  request materializes the full 1 MiB row) and cannot leave WAL mode, so
+  it cannot produce the single-file artifact alone. Rather than activate
+  the rusqlite fallback and pull the C amalgamation in to keep features
+  the bundle never uses (SQL, indexes, in-place transactions), format v1
+  is a flat container — header / raw pack+idx sections / TOC / trailer —
+  over plain `std::fs`, pure Rust with zero engine dependency,
+  byte-deterministic, updated by whole-file rewrite + atomic rename.
+  Authoritative: `docs/plans/2026-08-17-bundle-format-v1.md`.
 - **F7 — stock gix cannot serve a pack from Rust-owned bytes.** Verified in
   `gix-pack/src/{bundle,index}/init.rs`: `Bundle::at` and `index::File::at`
   accept paths and mmap the files; there is no in-memory constructor. In 0.2,
@@ -972,6 +983,18 @@ readable while refresh builds and verifies the replacement local-store handle.
 
 ### Single-file bundles — `Gitility.Bundle`
 
+> **Amended 2026-08-18 (F6 revision):** the mechanism below — SQLite
+> format via turso_core, chunked 1 MiB blob rows, in-place transactional
+> updates — is superseded. Format v1 is a flat container (header, raw
+> pack/idx byte sections, TOC, trailer) implemented with `std::fs` only;
+> updates and repack are whole-file rewrite + atomic rename; output is
+> byte-deterministic. The product promises in this section (one file =
+> ODB + refs, packs stay packs, `PackFetch`/`RefDB.Backend`/`into:
+> {:bundle, path}` consumption, refs snapshotted at publish) are
+> unchanged. `docs/plans/2026-08-17-bundle-format-v1.md` is
+> authoritative; the prose below stands as the historical record of the
+> SQLite design.
+
 A repository published for querying is naturally several artifacts: packs,
 indexes, a manifest, and a refs snapshot. `Gitility.Bundle` packages all of
 them as **one SQLite file**. SQLite is a proven application file format —
@@ -1028,6 +1051,12 @@ answer is a `RefDB.Backend` call away when the caller wants live refs
 instead.
 
 ### Updating a bundle
+
+> **Amended 2026-08-18:** superseded with the F6 revision — v1 updates
+> and repack build a complete new file and atomically rename it into
+> place (readers' fds pin the old inode; S3 PUT is the same move).
+> Incremental in-place append is recorded headroom in the format spec,
+> owned by a future major revision.
 
 Updates are incremental by design, because the manifest-of-packs model is
 Git's own accumulation model. An incremental `git fetch` produces one new

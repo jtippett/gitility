@@ -118,7 +118,11 @@ defmodule Gitility.Milestone5aFetchTest do
       "+refs/heads/*:refs/remotes/origin/heads/*",
       "+refs/archive/*:refs/remotes/origin/archive/*",
       "+refs/pull/*/head:refs/pull/*",
-      "+refs/heads/pinned:refs/remotes/origin/heads/stale/pinned"
+      # Nested under the wildcard destination space but NOT under any real
+      # branch name: `.../heads/stale/pinned` would be a directory/file
+      # conflict with the wildcard-created `.../heads/stale` ref, which git
+      # itself refuses at ref-transaction time.
+      "+refs/heads/pinned:refs/remotes/origin/heads/zz-keep/pinned"
     ]
 
     destination = Path.join(scratch, "prune.git")
@@ -138,7 +142,9 @@ defmodule Gitility.Milestone5aFetchTest do
     assert "refs/remotes/origin/heads/stale" in pruned
     assert "refs/pull/17" in pruned
     assert refs(destination)["refs/remotes/origin/archive/shared"] == oid
-    assert refs(destination)["refs/remotes/origin/heads/stale/pinned"] == oid
+    # No remote ref named zz-keep/pinned exists, so ONLY exact-destination
+    # protection keeps this ref alive through prune.
+    assert refs(destination)["refs/remotes/origin/heads/zz-keep/pinned"] == oid
 
     no_prune = Path.join(scratch, "no-prune.git")
     git!(remote, ["update-ref", "refs/heads/transient", oid])

@@ -388,8 +388,10 @@ defmodule Gitility.Differential.Oracle do
            stderr_to_stdout: true
          ) do
       {_output, 0} ->
+        # --no-tags matches Gitility.Fetch's contract (implicit tag
+        # auto-following disabled; tags fetch only via explicit refspecs).
         arguments =
-          ["fetch"] ++ optional_flag(opts[:prune], "--prune") ++ [url] ++ refspecs
+          ["fetch", "--no-tags"] ++ optional_flag(opts[:prune], "--prune") ++ [url] ++ refspecs
 
         git(destination, arguments)
 

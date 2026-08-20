@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## 0.3.0 - 2026-08-20
+
 ### Changed
 
 - **Breaking**: `Gitility.Commit` fields renamed for consistency with every

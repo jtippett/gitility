@@ -1,7 +1,40 @@
 # M5a — Native fetch (`Gitility.Fetch`)
 
-Status: SPEC v7 (2026-08-20, amended per codex review rounds 1–6). Scope +
-feasibility background: `docs/plans/2026-08-20-native-fetch-scope.md`.
+Status: SPEC v8 (2026-08-20; v7 froze after codex review rounds 1–6;
+v8 adds three rulings from first sprite contact). Scope + feasibility
+background: `docs/plans/2026-08-20-native-fetch-scope.md`.
+
+## v8 rulings (first-BEAM-contact findings, 2026-08-20)
+
+1. **Implicit tag auto-following is DISABLED** (`Tags::None` on the
+   remote). gix defaults to git's tag auto-following, which made an
+   exact PR-refspec fetch also create `refs/tags/*` — wrong for
+   mirror semantics. Tags fetch only via explicit refspecs; moduledoc
+   states it.
+2. **Refspec destination conflicts are `:invalid_argument`.** Two
+   refspecs mapping different sources to the SAME destination (e.g.
+   `refs/heads/*:refs/remotes/origin/*` + `refs/archive/*:refs/
+   remotes/origin/*` with `shared` in both) are refused by gix (and by
+   git itself) at ref-map validation. Classify that refusal as
+   `:invalid_argument` naming the conflicting destination — it is
+   caller input, not the network. Matrix's "overlapping destinations"
+   rows must use NON-conflicting overlaps (exact-under-wildcard),
+   plus one row asserting the typed conflict error.
+3. **SHA-256 destinations**: gix 0.86 cannot open
+   `extensions.objectFormat=sha256` repositories at all
+   (`open::Error::Config` on that key). Classify that exact failure as
+   `:unsupported_hash` (honest message: the destination's object
+   format is unsupported by native fetch), never "not a Git
+   repository".
+
+Also binding (root cause of the 401 failures): gix's `prepare::Error`
+and `ref_map::Error` wrap inner errors with `#[error(transparent)]`,
+which forwards BOTH Display and `source()` — the inner
+`handshake::Error`/transport types are UNREACHABLE by
+source-chain downcasting. All error classification in fetch.rs must
+match gix's typed variants STRUCTURALLY (chain-walk downcasts only as
+a fallback), and the 401 regression test must exercise a REAL 401 HTTP
+response, not a synthetic error chain.
 
 Deliverable: `Gitility.Fetch.fetch/4` — client-side smart-HTTP git
 fetch into a local bare repository, over gix 0.86.0, statically-linked

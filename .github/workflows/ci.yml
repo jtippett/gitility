@@ -92,8 +92,16 @@ jobs:
           # and a source tree nested inside the repo would be claimed by
           # gitility's own cargo workspace ("add to workspace.members").
           cd "$RUNNER_TEMP"
-          curl -fsSL --retry 8 --retry-all-errors --connect-timeout 20 \
-            "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${VERSION}.tar.gz" | tar -xz
+          # Download to a file, then extract: piping curl into tar is not
+          # retry-safe (tar dies on the first partial stream). GitHub's tag
+          # archive is primary — runner-to-GitHub is the reliable path;
+          # kernel.org has flaked twice — with the official dist as fallback.
+          # Both extract to git-${VERSION}/.
+          curl -fsSL --retry 8 --retry-all-errors --connect-timeout 20 -o git-src.tar.gz \
+            "https://github.com/git/git/archive/refs/tags/v${VERSION}.tar.gz" ||
+            curl -fsSL --retry 8 --retry-all-errors --connect-timeout 20 -o git-src.tar.gz \
+              "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${VERSION}.tar.gz"
+          tar -xzf git-src.tar.gz
           make -C "git-${VERSION}" -j"$(nproc)" prefix="$HOME/pinned-git" \
             NO_TCLTK=1 NO_GETTEXT=1 INSTALL_SYMLINKS=1 install
 

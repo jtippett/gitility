@@ -498,7 +498,7 @@ defmodule Gitility.Differential.Oracle do
     prefix_size = byte_size(prefix)
 
     case binary do
-      <<candidate::binary-size(prefix_size), rest::binary>> when candidate == prefix ->
+      <<candidate::binary-size(^prefix_size), rest::binary>> when candidate == prefix ->
         {:ok, rest}
 
       _ ->

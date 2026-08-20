@@ -320,7 +320,7 @@ defmodule Gitility.TrackingRangeBackend do
 
   defp replace_binary_part(bytes, offset, replacement) do
     replacement_size = byte_size(replacement)
-    <<head::binary-size(offset), _old::binary-size(replacement_size), tail::binary>> = bytes
+    <<head::binary-size(^offset), _old::binary-size(^replacement_size), tail::binary>> = bytes
     head <> replacement <> tail
   end
 end

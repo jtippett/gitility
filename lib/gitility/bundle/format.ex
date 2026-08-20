@@ -431,7 +431,7 @@ defmodule Gitility.Bundle.Format do
   defp take_u64(_bytes, label), do: malformed("TOC ended while reading #{label}")
 
   defp take_bytes(bytes, length, _label) when byte_size(bytes) >= length do
-    <<value::binary-size(length), rest::binary>> = bytes
+    <<value::binary-size(^length), rest::binary>> = bytes
     {:ok, value, rest}
   end
 

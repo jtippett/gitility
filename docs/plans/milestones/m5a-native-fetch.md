@@ -1,6 +1,6 @@
 # M5a — Native fetch (`Gitility.Fetch`)
 
-Status: SPEC v5 (2026-08-20, amended per codex review rounds 1–4). Scope +
+Status: SPEC v6 (2026-08-20, amended per codex review rounds 1–5). Scope +
 feasibility background: `docs/plans/2026-08-20-native-fetch-scope.md`.
 
 Deliverable: `Gitility.Fetch.fetch/4` — client-side smart-HTTP git
@@ -147,9 +147,10 @@ Behavioral contract (each row is a test):
   commit point is inside `receive()`) — the operation is idempotent and
   a rerun converges; the moduledoc says exactly this. POST-COMMIT
   cleanup failures return the dedicated code `:cleanup_failed` — the
-  code ITSELF means "the fetch portion committed; only post-fetch
-  cleanup failed; rerun converges" (no structured-detail plumbing; the
-  core Error has nowhere to carry a free-form flag — codex round 2).
+  code ITSELF means exactly "the fetch portion committed; only
+  post-fetch cleanup failed" (no structured-detail plumbing; the core
+  Error has nowhere to carry a free-form flag — codex round 2; whether
+  a rerun converges is per-case, below — codex round 5).
   It covers exactly three cases, distinguished in the message: the
   prune transaction failing (§4 step 6), OUR keep-file deletion
   failing (below), and gix's OWN `RemovePackKeepFile` error — gix
@@ -244,11 +245,15 @@ release.yml changes expected.
   each attempt's request map (transport timeout via the reqwest
   `configure_request` hook — this is what unwedges a fetch worker from
   a fully stalled socket, since the cooperative flag can't preempt a
-  blocked read; the HOOK ITSELF recomputes remaining time from one
-  absolute `Instant` deadline captured at task start on EVERY
-  invocation — a fetch issues multiple HTTP requests (info/refs GET +
-  upload-pack POST), and a captured fixed duration would restart per
-  request and exceed the whole-call bound — codex round 4), and each
+  blocked read; the HOOK ITSELF recomputes remaining time on EVERY
+  invocation from the job BUDGET's submission-time deadline — the
+  Budget already computes its deadline at submit (runtime/mod.rs
+  ~689), which is the authoritative whole-call bound; add a read
+  accessor if one doesn't exist. NOT a fresh `Instant` at task start
+  (queue residence would extend the bound — codex round 5), and NOT a
+  captured fixed duration (each of the fetch's multiple HTTP requests
+  — info/refs GET + upload-pack POST — would restart it — codex round
+  4)), and each
   `await_sync` await. Remaining ≤ 0 BEFORE a stage starts →
   `:timeout` without running it; a PROVIDER that consumes the
   remaining time returns `:credentials_unavailable` (the provider was
@@ -417,23 +422,27 @@ Single-flight lock — `Gitility.Fetch.Locks`:
   job is terminal. Rules:
   - `acquire(key)` before provider/submit. Around EVERY submission
     (attempt 1 AND attempt 2), the caller brackets:
-    `pending_submit(key)` → NIF submit → on `{:ok, job}`
-    `attach(key, job)`, on ANY error `submission_failed(key)` — both
-    clear the pending flag, and the caller wraps the bracket in
-    `try/after` so an unexpected raise between the two calls also
-    clears it (codex round 4: with attach as the only clearing
-    transition, a failed submit left the destination `:busy` forever
-    while the caller lived). The flag is what closes the submit/attach
-    death window for BOTH attempts — codex round 3: the attempt-2
-    window was uncovered because attempt 1's terminal job satisfied
-    the old release condition.
+    `pending_submit(key)` → NIF submit → on submit ERROR (or raise
+    from the submit call itself) `submission_failed(key)`; on
+    `{:ok, job}` `attach(key, job)` IMMEDIATELY. The two clearing
+    transitions are asymmetric BY DESIGN (codex round 5: a blanket
+    `try/after` clear would, on a raise after `{:ok, job}` but before
+    attach, leave a LIVE job neither pending nor attached — the lease
+    could free under a running fetch). Once a job exists, attach is
+    the only clearing transition: if anything raises between submit-ok
+    and attach, the pending flag STAYS SET (holder-death grace covers
+    a dead caller; a live caller's `fetch/4` rescues, attaches the
+    job, then propagates). codex rounds 3–4 context: the flag closes
+    the submit/attach death window for both attempts; a failed submit
+    must clear it or the destination stays `:busy` forever.
   - Test seam: `fetch/4` honors an undocumented internal opt
     `:__after_submit__` (a 0-arity fun invoked between submit and
     attach), existing solely so the matrix's death-window test can
     place a deterministic barrier in that window. Named with the
     dunder prefix, excluded from docs, validated like other opts but
     only in test envs — there is no other observable point between
-    submit and attach (codex round 4).
+    submit and attach (codex round 4). Its invocation sits under the
+    rescue-then-attach rule above.
   - BOTH jobs of an auth retry attach under the one lease; a terminal
     attached job never releases anything while the holder holds or a
     submission is pending.

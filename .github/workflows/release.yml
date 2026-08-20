@@ -144,7 +144,11 @@ jobs:
         # repo disagrees with the published package.
         run: |
           git fetch origin master:refs/remotes/origin/master
-          if git diff --quiet origin/master -- checksum-Elixir.Gitility.Native.exs; then
+          # Stage first: a freshly generated checksum file is untracked, and
+          # plain `git diff` never reports untracked files (the 0.2.0 release
+          # silently skipped this commit because of that).
+          git add checksum-Elixir.Gitility.Native.exs
+          if git diff --cached --quiet origin/master -- checksum-Elixir.Gitility.Native.exs; then
             echo "Checksum is already present on master"
           else
             git config user.name "github-actions[bot]"

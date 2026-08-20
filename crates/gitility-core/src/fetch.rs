@@ -156,6 +156,10 @@ pub fn fetch(request: FetchRequest, budget: &Budget) -> Result<FetchResult, Erro
     let mut connection = remote
         .connect(gix::remote::Direction::Fetch)
         .map_err(|error| map_connect_error(&error, budget))?;
+    // The closure's Err type is gix's 192-byte credential protocol error; the
+    // shape is mandated (disarming the git-credential cascade) and the Err
+    // variant is never constructed.
+    #[allow(clippy::result_large_err)]
     connection.set_credentials(|_| Ok(None));
     connection.set_transport_options(transport_options(
         request.authorization.as_deref(),
@@ -683,12 +687,16 @@ fn authentication_error() -> Error {
 }
 
 fn conflicting_destination(error: &gix_refspec::match_group::validate::Error) -> Option<String> {
-    error.issues.iter().find_map(|issue| match issue {
-        gix_refspec::match_group::validate::Issue::Conflict {
-            destination_full_ref_name,
-            ..
-        } => Some(destination_full_ref_name.to_str_lossy().into_owned()),
-    })
+    error
+        .issues
+        .iter()
+        .map(|issue| match issue {
+            gix_refspec::match_group::validate::Issue::Conflict {
+                destination_full_ref_name,
+                ..
+            } => destination_full_ref_name.to_str_lossy().into_owned(),
+        })
+        .next()
 }
 
 fn prepare_error_is_authentication(error: &gix::remote::fetch::prepare::Error) -> bool {
@@ -1003,7 +1011,7 @@ mod tests {
 
     #[test]
     fn refspec_mapping_conflict_is_invalid_argument_and_names_destination() {
-        let specs = vec![
+        let specs = [
             spec("+refs/heads/*:refs/remotes/conflict/*"),
             spec("+refs/archive/*:refs/remotes/conflict/*"),
         ];

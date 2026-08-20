@@ -1,13 +1,13 @@
 # M4b — `Gitility.Bundle`: flat-container single-file repositories
 
 Implements the bundle format v1 spec. NORMATIVE FORMAT REFERENCE:
-`docs/plans/2026-08-17-bundle-format-v1.md` — read it first and follow it
+`docs/format/bundle-v1.md` — read it first and follow it
 byte-for-byte; where this document and the format spec conflict, the
 format spec wins on format, this document wins on API shape.
 
 ## Read these before writing code
 
-- `docs/plans/2026-08-17-bundle-format-v1.md` (normative format)
+- `docs/format/bundle-v1.md` (normative format)
 - `lib/gitility/odb/range_backend.ex` + `range_backend/local_directory.ex`
   (the reference local backend AND the publisher whose inventory/loose-
   packing logic you will reuse) + `range_backend/conformance.ex`

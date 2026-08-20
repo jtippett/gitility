@@ -30,7 +30,8 @@ container with a table of contents serves every requirement with
 threads, byte-deterministic output, offset reads via plain `pread`, and a
 format whose longevity is governed by this spec rather than an engine's.
 The 1 MiB chunk machinery (an artifact of SQL row storage) disappears;
-the spike crate remains in-tree as evidence.
+the spike crate is preserved in git history (removed from the working
+tree after the 0.2.0 release).
 
 ## Design rules inherited from the design doc
 

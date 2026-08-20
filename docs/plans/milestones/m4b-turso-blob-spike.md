@@ -2,7 +2,7 @@
 
 A SHORT, throwaway-adjacent spike (crates/bundle-spike, modeled on the
 F6 spike crate) answering the bundle format spec's open question 1
-(docs/plans/2026-08-17-bundle-format-v1.md) BEFORE the format freezes:
+(docs/format/bundle-v1.md) BEFORE the format freezes:
 
 Q: Does the turso_core engine (pinned =0.7.2 like the F6 spike, or the
 newest version compatible with our workspace — record which) support

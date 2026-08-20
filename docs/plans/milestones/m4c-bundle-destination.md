@@ -3,13 +3,13 @@
 Closes the last reserved `into:` mode (design doc: "a remote store
 hydrates into a local bundle that survives restarts on a reused
 volume"). NORMATIVE FORMAT REFERENCE:
-`docs/plans/2026-08-17-bundle-format-v1.md` (all open questions now
+`docs/format/bundle-v1.md` (all open questions now
 resolved). Where this document and the format spec conflict, the format
 spec wins on format.
 
 ## Read these before writing code
 
-- `docs/plans/2026-08-17-bundle-format-v1.md`
+- `docs/format/bundle-v1.md`
 - `lib/gitility/odb/pack_fetch.ex` (destination/3, start flow,
   `packfetch_cleanup_destination`), `lib/gitility/odb/provider.ex`
   (terminate cleanup at ~223)

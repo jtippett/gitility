@@ -3,7 +3,7 @@
 Applies on top of commit 28bf007 ("Checkpoint: M4b Gitility.Bundle
 implementation"). Where this document conflicts with
 `docs/plans/milestones/m4b-bundle.md`, THIS document wins. The format
-spec `docs/plans/2026-08-17-bundle-format-v1.md` was amended alongside
+spec `docs/format/bundle-v1.md` was amended alongside
 this spec (shallow reserved key, no-op refresh, pack-objects threads) —
 re-read its "Required metadata keys", writer-contract generation bullet,
 and determinism bullet before starting.

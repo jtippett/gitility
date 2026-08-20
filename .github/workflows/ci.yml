@@ -70,6 +70,12 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
+      - name: Resolve Rust dependencies
+        run: cargo fetch
+
+      - name: Audit gix normal/build features
+        run: scripts/check-gix-features.sh
+
       # The differential oracle is pinned to the exact canonical git in
       # test/differential/GIT_VERSION (the suite hard-fails on a
       # major.minor mismatch — oracle upgrades are deliberate, triaged

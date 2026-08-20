@@ -21,9 +21,10 @@ defmodule Gitility.Error do
   malformed_ref             hash_mismatch            pack_checksum_mismatch
   index_checksum_mismatch   object_too_large         budget_exceeded
   result_too_large          timeout                  await_timeout
-  cancelled                 busy                     provider_down
-  provider_timeout          provider_protocol_error  backend_error
-  runtime_mismatch          internal_error
+  cancelled                 busy                     authentication_failed
+  network_error             cleanup_failed           credentials_unavailable
+  provider_down             provider_timeout         provider_protocol_error
+  backend_error             runtime_mismatch         internal_error
   ```
 
   Two timeouts are deliberately distinct: `:await_timeout` means
@@ -39,6 +40,7 @@ defmodule Gitility.Error do
     hash_mismatch pack_checksum_mismatch index_checksum_mismatch
     object_too_large budget_exceeded result_too_large
     timeout await_timeout cancelled busy
+    authentication_failed network_error cleanup_failed credentials_unavailable
     provider_down provider_timeout provider_protocol_error backend_error
     runtime_mismatch internal_error
   )a

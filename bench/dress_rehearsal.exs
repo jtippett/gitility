@@ -2,16 +2,19 @@
 # "ship" the file (copy = the S3 round trip; transport is just bytes), open it
 # cold, and check every query answer against real git on the source repo.
 #
-# Covers both product flows:
+# Covers all product flows:
 #   A. Bundle.write/open — "clone a repo to a single S3 file" (refs + objects)
 #   B. PackFetch into: {:bundle, path} — hydration snapshot, cold then warm
 #      (warm runs under a byte budget far below pack size, so any remote
 #      fetch would trip it — success proves the bundle served everything)
+#   C. Native smart-HTTP fetch — fixture server → bare destination → queries
 #
 # Usage (remote sprite only — never load the NIF on a Mac):
 #   GITILITY_BUILD=1 mix run bench/dress_rehearsal.exs <source.git> <workdir>
 
-alias Gitility.{Bundle, Repository, RefDB, OID, Limits}
+Code.require_file("../test/support/smart_http_server.ex", __DIR__)
+
+alias Gitility.{Bundle, Fetch, Repository, RefDB, OID, Limits}
 alias Gitility.ODB.PackFetch
 
 defmodule Rehearsal do
@@ -411,6 +414,52 @@ Rehearsal.check("shipped hydration bundle serves file reads fully in memory", fn
     do: {:ok, "#{byte_size(file.data)} bytes"},
     else: {:fail, "content differs"}
 end)
+
+IO.puts("\n=== Flow C: native smart-HTTP fetch → open → spot queries ===")
+
+fetch_root = Path.dirname(Path.expand(source))
+fetch_repository = Path.basename(source)
+fetch_destination = Path.join(workdir, "native-fetch.git")
+
+{:ok, fetch_server} =
+  Gitility.TestSupport.SmartHTTPServer.start_link(project_root: fetch_root)
+
+fetch_url = Gitility.TestSupport.SmartHTTPServer.url(fetch_server, fetch_repository)
+
+Rehearsal.check("native fetch receives the Phoenix refs and pack", fn ->
+  case Fetch.fetch(
+         fetch_destination,
+         fetch_url,
+         ["+refs/heads/*:refs/remotes/origin/*"],
+         timeout_ms: 120_000
+       ) do
+    {:ok, result} when result.remote_ref_count > 0 and result.pack_received ->
+      {:ok,
+       "remote_refs=#{result.remote_ref_count} updates=#{length(result.updated_refs)} pack=true"}
+
+    other ->
+      {:fail, inspect(other)}
+  end
+end)
+
+Rehearsal.check("fetched repository opens and serves spot queries", fn ->
+  with {:ok, fetched} <- Repository.open(fetch_destination),
+       {:ok, fetched_snapshot} <- Repository.snapshot(fetched, {:oid, OID.parse!(head)}),
+       {:ok, file} <- Gitility.read_file(fetched_snapshot, "README.md"),
+       {:ok, page} <- Gitility.list_tree(fetched_snapshot, "lib/phoenix", limit: 20) do
+    expected = Rehearsal.git!(source, ["show", "#{head}:README.md"])
+
+    if file.data == expected and page.items != [] do
+      {:ok, "README #{byte_size(file.data)} bytes; #{length(page.items)} tree entries"}
+    else
+      {:fail, "fetched query results differ from the source"}
+    end
+  else
+    other -> {:fail, inspect(other)}
+  end
+end)
+
+GenServer.stop(fetch_server)
 
 case Rehearsal.failures() do
   [] ->

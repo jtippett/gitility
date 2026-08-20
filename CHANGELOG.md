@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `Gitility.Fetch.fetch/4`: bounded, cancellable smart-HTTP fetch into local
+  bare repositories using gix, reqwest, and statically linked rustls, with
+  credential providers, optional prune, destination single-flight leases, and
+  a dedicated two-worker runtime.
+
+### Changed
+
+- The Rust MSRV for from-source consumers is now 1.85, required by gix 0.86.
+
 ### Fixed
 
 - Compile warning on Elixir 1.20: bound variables in binary-size matches

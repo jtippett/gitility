@@ -20,6 +20,7 @@ pub mod cursor;
 pub mod decode;
 pub mod diff;
 pub mod error;
+pub mod fetch;
 pub mod file;
 mod git_config;
 pub mod layered_odb;
@@ -58,6 +59,10 @@ pub use diff::{
     DiffWarning, DiffWarningCode, RenameTracking,
 };
 pub use error::{Error, ErrorCode};
+pub use fetch::{
+    fetch, validate_request as validate_fetch_request, FetchAction, FetchRejectedRef,
+    FetchRejection, FetchRequest, FetchResult, FetchUpdatedRef,
+};
 pub use file::{read_file, FileKind, FileOptions, FileRead, LfsPointer};
 pub use layered_odb::{CacheLayer, CacheOptions, LayeredOdb};
 pub use local_odb::{LocalOdb, LocalOdbOptions, RepositoryLayout};

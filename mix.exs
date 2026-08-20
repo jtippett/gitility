@@ -12,6 +12,7 @@ defmodule Gitility.MixProject do
       version: @version,
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
+      elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       package: package(),
       docs: docs(),
@@ -41,6 +42,9 @@ defmodule Gitility.MixProject do
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_env), do: ["lib"]
 
   defp package do
     [

@@ -8,24 +8,25 @@
 
 use gitility_core::runtime::thread_budget;
 use gitility_core::{
-    blame as core_blame, diff as core_diff, history as core_history,
+    blame as core_blame, diff as core_diff, fetch as core_fetch, history as core_history,
     is_ancestor as core_is_ancestor, list_tree as core_list_tree, log as core_log,
     merge_base as core_merge_base, peel as core_peel, read_file as core_read_file,
     search as core_search, submodules as core_submodules, BlameOptions, Budget, BudgetLimits,
     BusyReason, ByteRange as CoreByteRange, CacheOptions, CacheStats, CallbackRangeTransport,
     DiffFormat, DiffLineOrigin, DiffOptions, DiffStatus, DiffWarningCode, Error, ErrorCode,
-    FileKind, FileOptions, HashKind, HistoryOptions, HydrationStats, Job as CoreJob, JobObserver,
-    JobOutput, JobSpec, JobState, LayeredOdb, LocalOdb, LocalOdbOptions, LocalRefDb, LogIdentity,
-    LogOptions, LogOrder, ObjectDb, ObjectHeader, ObjectKind, ObjectReadResult, Oid,
-    PackDescriptor, PackFetchOdb, PackFetchOptions, PackManifest, PeelTarget, PendingTable,
-    ProviderCacheOptions, ProviderKind, ProviderOdb, ProviderOptions, ProviderPayload,
-    ProviderRefDb, ProviderReplyValue, ProviderRequest, ProviderTransport, QueryStats,
-    RangePayload, RangePendingTable, RangeRequest, RangeRequestKind, RangeRequestSender,
-    ReadManyBudget, RefDb, RefPage, RefPendingTable, RefProviderKind, RefProviderOptions,
-    RefProviderPayload, RefProviderRequest, RefProviderTransport, RefQuery as CoreRefQuery,
-    RefTarget as CoreRefTarget, RenameTracking, Runtime as CoreRuntime, RuntimeConfig,
-    SearchBinaryMode, SearchMode, SearchOptions, Snapshot, StaticOdb, SubmitError, SubmoduleStatus,
-    TreeItemKind, TreeOptions, TypeFilter, PROVIDER_HEADER_SIZE_CEILING,
+    FetchAction, FetchRejection, FetchRequest, FileKind, FileOptions, HashKind, HistoryOptions,
+    HydrationStats, Job as CoreJob, JobObserver, JobOutput, JobSpec, JobState, LayeredOdb,
+    LocalOdb, LocalOdbOptions, LocalRefDb, LogIdentity, LogOptions, LogOrder, ObjectDb,
+    ObjectHeader, ObjectKind, ObjectReadResult, Oid, PackDescriptor, PackFetchOdb,
+    PackFetchOptions, PackManifest, PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind,
+    ProviderOdb, ProviderOptions, ProviderPayload, ProviderRefDb, ProviderReplyValue,
+    ProviderRequest, ProviderTransport, QueryStats, RangePayload, RangePendingTable, RangeRequest,
+    RangeRequestKind, RangeRequestSender, ReadManyBudget, RefDb, RefPage, RefPendingTable,
+    RefProviderKind, RefProviderOptions, RefProviderPayload, RefProviderRequest,
+    RefProviderTransport, RefQuery as CoreRefQuery, RefTarget as CoreRefTarget, RenameTracking,
+    Runtime as CoreRuntime, RuntimeConfig, SearchBinaryMode, SearchMode, SearchOptions, Snapshot,
+    StaticOdb, SubmitError, SubmoduleStatus, TreeItemKind, TreeOptions, TypeFilter,
+    PROVIDER_HEADER_SIZE_CEILING,
 };
 use rustler::{
     types::{map::MapIterator, tuple::get_tuple},
@@ -731,6 +732,50 @@ struct LimitsMap {
     max_delta_depth: u32,
 }
 
+/// An authorization value decoded from the BEAM. Formatting this wrapper can
+/// never reveal the value, including in Rustler decode diagnostics or panics.
+struct Redacted(String);
+
+impl Redacted {
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl std::fmt::Display for Redacted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl<'a> Decoder<'a> for Redacted {
+    fn decode(term: Term<'a>) -> NifResult<Self> {
+        String::decode(term).map(Self)
+    }
+}
+
+impl Encoder for Redacted {
+    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+        "[REDACTED]".encode(env)
+    }
+}
+
+// Intentionally no Debug derive: the authorization field is radioactive.
+#[derive(NifMap)]
+struct FetchRequestMap {
+    dest: String,
+    url: String,
+    refspecs: Vec<String>,
+    authorization: Option<Redacted>,
+    prune: bool,
+}
+
 #[derive(NifMap)]
 struct ListTreeOptions<'a> {
     path: Binary<'a>,
@@ -984,6 +1029,29 @@ struct HydrationStatsMap {
     write_ms: u64,
     open_ms: u64,
     elapsed_ms: u64,
+}
+
+#[derive(NifMap)]
+struct FetchUpdatedRefMap {
+    name: String,
+    action: Atom,
+    old_oid: Option<String>,
+    new_oid: String,
+}
+
+#[derive(NifMap)]
+struct FetchRejectedRefMap {
+    name: String,
+    reason: Atom,
+}
+
+#[derive(NifMap)]
+struct FetchResultMap {
+    updated_refs: Vec<FetchUpdatedRefMap>,
+    rejected_refs: Vec<FetchRejectedRefMap>,
+    pruned_refs: Vec<String>,
+    remote_ref_count: u64,
+    pack_received: bool,
 }
 
 #[derive(NifMap)]
@@ -2406,6 +2474,43 @@ fn submit_job<'a>(
 }
 
 #[rustler::nif]
+fn job_submit_fetch<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    request: FetchRequestMap,
+    limits: LimitsMap,
+) -> NifResult<Term<'a>> {
+    let FetchRequestMap {
+        dest,
+        url,
+        refspecs,
+        authorization,
+        prune,
+    } = request;
+    let request = FetchRequest {
+        dest: dest.into(),
+        url,
+        refspecs,
+        authorization: authorization.map(Redacted::into_inner),
+        prune,
+    };
+    if let Err(error) = gitility_core::validate_fetch_request(&request) {
+        return Ok(Result::<(), _>::Err(error_map(env, error)?).encode(env));
+    }
+
+    let task = Box::new(move |budget: &Budget| core_fetch(request, budget).map(JobOutput::Fetch));
+    submit_job(
+        env,
+        runtime,
+        false,
+        limits,
+        budget_limits(limits),
+        JobResultKind::Other,
+        task,
+    )
+}
+
+#[rustler::nif]
 fn job_submit_odb_header<'a>(
     env: Env<'a>,
     runtime: ResourceArc<RuntimeResource>,
@@ -3806,6 +3911,30 @@ fn encode_job_output<'a>(
             tree_oid: binary(env, snapshot.tree_oid.as_bytes()),
         }
         .encode(env),
+        JobOutput::Fetch(result) => FetchResultMap {
+            updated_refs: result
+                .updated_refs
+                .into_iter()
+                .map(|updated| FetchUpdatedRefMap {
+                    name: updated.name,
+                    action: fetch_action_atom(updated.action),
+                    old_oid: updated.old_oid,
+                    new_oid: updated.new_oid,
+                })
+                .collect(),
+            rejected_refs: result
+                .rejected_refs
+                .into_iter()
+                .map(|rejected| FetchRejectedRefMap {
+                    name: rejected.name,
+                    reason: fetch_rejection_atom(rejected.reason),
+                })
+                .collect(),
+            pruned_refs: result.pruned_refs,
+            remote_ref_count: result.remote_ref_count as u64,
+            pack_received: result.pack_received,
+        }
+        .encode(env),
         JobOutput::Hydration(stats) => hydration_stats_map(stats).encode(env),
     };
     Ok(term)
@@ -3982,6 +4111,31 @@ fn output_payload_bytes(output: &JobOutput) -> u64 {
         JobOutput::Boolean(_) => 1,
         JobOutput::Snapshot(snapshot) => length(snapshot.commit_oid.as_bytes())
             .saturating_add(length(snapshot.tree_oid.as_bytes())),
+        JobOutput::Fetch(result) => result
+            .updated_refs
+            .iter()
+            .fold(0u64, |total, updated| {
+                total
+                    .saturating_add(length(updated.name.as_bytes()))
+                    .saturating_add(
+                        updated
+                            .old_oid
+                            .as_ref()
+                            .map(|oid| length(oid.as_bytes()))
+                            .unwrap_or(0),
+                    )
+                    .saturating_add(length(updated.new_oid.as_bytes()))
+                    .saturating_add(16)
+            })
+            .saturating_add(result.rejected_refs.iter().fold(0u64, |total, rejected| {
+                total
+                    .saturating_add(length(rejected.name.as_bytes()))
+                    .saturating_add(16)
+            }))
+            .saturating_add(result.pruned_refs.iter().fold(0u64, |total, name| {
+                total.saturating_add(length(name.as_bytes()))
+            }))
+            .saturating_add(16),
         JobOutput::Hydration(stats) => length(stats.generation.as_bytes()).saturating_add(96),
     }
 }
@@ -4348,6 +4502,24 @@ fn submodule_status_atom(status: SubmoduleStatus) -> Atom {
     }
 }
 
+fn fetch_action_atom(action: FetchAction) -> Atom {
+    match action {
+        FetchAction::Created => atoms::created(),
+        FetchAction::FastForward => atoms::fast_forward(),
+        FetchAction::Forced => atoms::forced(),
+    }
+}
+
+fn fetch_rejection_atom(reason: FetchRejection) -> Atom {
+    match reason {
+        FetchRejection::SourceObjectNotFound => atoms::source_object_not_found(),
+        FetchRejection::TagUpdate => atoms::tag_update(),
+        FetchRejection::NonFastForward => atoms::non_fast_forward(),
+        FetchRejection::ReplaceWithUnborn => atoms::replace_with_unborn(),
+        FetchRejection::CurrentlyCheckedOut => atoms::currently_checked_out(),
+    }
+}
+
 fn diff_status_atom(status: DiffStatus) -> Atom {
     match status {
         DiffStatus::Added => atoms::added(),
@@ -4506,6 +4678,14 @@ mod atoms {
         copied,
         type_changed,
         active,
+        created,
+        fast_forward,
+        forced,
+        source_object_not_found,
+        tag_update,
+        non_fast_forward,
+        replace_with_unborn,
+        currently_checked_out,
         undeclared,
         orphaned,
         context,

@@ -38,6 +38,10 @@ pub enum ErrorCode {
     AwaitTimeout,
     Cancelled,
     Busy,
+    AuthenticationFailed,
+    NetworkError,
+    CleanupFailed,
+    CredentialsUnavailable,
     ProviderDown,
     ProviderTimeout,
     ProviderProtocolError,
@@ -76,6 +80,10 @@ impl ErrorCode {
             Self::AwaitTimeout,
             Self::Cancelled,
             Self::Busy,
+            Self::AuthenticationFailed,
+            Self::NetworkError,
+            Self::CleanupFailed,
+            Self::CredentialsUnavailable,
             Self::ProviderDown,
             Self::ProviderTimeout,
             Self::ProviderProtocolError,
@@ -114,6 +122,10 @@ impl ErrorCode {
             Self::AwaitTimeout => "await_timeout",
             Self::Cancelled => "cancelled",
             Self::Busy => "busy",
+            Self::AuthenticationFailed => "authentication_failed",
+            Self::NetworkError => "network_error",
+            Self::CleanupFailed => "cleanup_failed",
+            Self::CredentialsUnavailable => "credentials_unavailable",
             Self::ProviderDown => "provider_down",
             Self::ProviderTimeout => "provider_timeout",
             Self::ProviderProtocolError => "provider_protocol_error",
@@ -305,7 +317,7 @@ mod tests {
 
     #[test]
     fn all_contains_every_variant_once() {
-        let mut seen = [false; 32];
+        let mut seen = [false; 36];
 
         for code in ErrorCode::all() {
             let index = match code {
@@ -335,12 +347,16 @@ mod tests {
                 ErrorCode::AwaitTimeout => 23,
                 ErrorCode::Cancelled => 24,
                 ErrorCode::Busy => 25,
-                ErrorCode::ProviderDown => 26,
-                ErrorCode::ProviderTimeout => 27,
-                ErrorCode::ProviderProtocolError => 28,
-                ErrorCode::BackendError => 29,
-                ErrorCode::RuntimeMismatch => 30,
-                ErrorCode::InternalError => 31,
+                ErrorCode::AuthenticationFailed => 26,
+                ErrorCode::NetworkError => 27,
+                ErrorCode::CleanupFailed => 28,
+                ErrorCode::CredentialsUnavailable => 29,
+                ErrorCode::ProviderDown => 30,
+                ErrorCode::ProviderTimeout => 31,
+                ErrorCode::ProviderProtocolError => 32,
+                ErrorCode::BackendError => 33,
+                ErrorCode::RuntimeMismatch => 34,
+                ErrorCode::InternalError => 35,
             };
 
             assert!(!seen[index], "duplicate error code: {code:?}");

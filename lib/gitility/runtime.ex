@@ -60,6 +60,8 @@ defmodule Gitility.Runtime do
 
   @default_name Gitility.DefaultRuntime
   @default_key {__MODULE__, :default}
+  @fetch_default_name Gitility.FetchRuntime
+  @fetch_default_key {__MODULE__, :fetch_default}
   @default_shutdown_join_timeout_ms 5_000
   @supervisor_shutdown_margin_ms 2_000
 
@@ -128,12 +130,28 @@ defmodule Gitility.Runtime do
   """
   @spec default() :: t() | {:error, Error.t()}
   def default do
-    case :persistent_term.get(@default_key, nil) do
+    named_default(@default_name, @default_key, [])
+  end
+
+  @doc false
+  @spec fetch_default() :: t() | {:error, Error.t()}
+  def fetch_default do
+    named_default(
+      @fetch_default_name,
+      @fetch_default_key,
+      workers: 2,
+      max_queue: 32,
+      max_jobs_per_owner: 4
+    )
+  end
+
+  defp named_default(name, key, opts) do
+    case :persistent_term.get(key, nil) do
       pid when is_pid(pid) ->
-        if Process.alive?(pid), do: pid, else: start_default()
+        if Process.alive?(pid), do: pid, else: start_named_default(name, key, opts)
 
       _ ->
-        start_default()
+        start_named_default(name, key, opts)
     end
   end
 
@@ -173,11 +191,11 @@ defmodule Gitility.Runtime do
     Process.flag(:trap_exit, true)
     resource = Native.runtime_start(config)
 
-    if name == @default_name do
-      :persistent_term.put(@default_key, self())
+    if key = default_key(name) do
+      :persistent_term.put(key, self())
     end
 
-    {:ok, %{resource: resource, default?: name == @default_name}}
+    {:ok, %{resource: resource, default_key: default_key(name)}}
   end
 
   @impl GenServer
@@ -185,8 +203,8 @@ defmodule Gitility.Runtime do
 
   @impl GenServer
   def terminate(_reason, state) do
-    if state.default? and :persistent_term.get(@default_key, nil) == self() do
-      :persistent_term.erase(@default_key)
+    if state.default_key && :persistent_term.get(state.default_key, nil) == self() do
+      :persistent_term.erase(state.default_key)
     end
 
     %{detached_workers: detached_workers, last_detach_reason: reason} =
@@ -207,8 +225,8 @@ defmodule Gitility.Runtime do
     Logger.warning("Gitility runtime shutdown detached #{detached_workers} worker(s)#{suffix}")
   end
 
-  defp start_default do
-    child = {__MODULE__, name: @default_name}
+  defp start_named_default(name, key, opts) do
+    child = {__MODULE__, Keyword.put(opts, :name, name)}
 
     try do
       case Supervisor.start_child(Gitility.Supervisor, child) do
@@ -219,10 +237,10 @@ defmodule Gitility.Runtime do
           pid
 
         {:error, :already_present} ->
-          Process.whereis(@default_name) || retry_default()
+          Process.whereis(name) || retry_named_default(name, key)
 
         {:error, {:already_present, _child}} ->
-          Process.whereis(@default_name) || retry_default()
+          Process.whereis(name) || retry_named_default(name, key)
 
         {:error, _reason} ->
           runtime_supervisor_error()
@@ -232,17 +250,17 @@ defmodule Gitility.Runtime do
     end
   end
 
-  defp retry_default do
-    await_default(System.monotonic_time(:millisecond) + 5_000)
+  defp retry_named_default(name, key) do
+    await_named_default(name, key, System.monotonic_time(:millisecond) + 5_000)
   end
 
-  defp await_default(deadline) do
-    case :persistent_term.get(@default_key, nil) do
+  defp await_named_default(name, key, deadline) do
+    case :persistent_term.get(key, nil) do
       pid when is_pid(pid) ->
         pid
 
       _ ->
-        case Process.whereis(@default_name) do
+        case Process.whereis(name) do
           pid when is_pid(pid) ->
             pid
 
@@ -252,7 +270,7 @@ defmodule Gitility.Runtime do
             else
               receive do
               after
-                1 -> await_default(deadline)
+                1 -> await_named_default(name, key, deadline)
               end
             end
         end
@@ -260,6 +278,10 @@ defmodule Gitility.Runtime do
   end
 
   defp default_workers, do: max(div(System.schedulers_online(), 2), 1)
+
+  defp default_key(@default_name), do: @default_key
+  defp default_key(@fetch_default_name), do: @fetch_default_key
+  defp default_key(_name), do: nil
 
   defp runtime_supervisor_error do
     {:error, Error.new(:cancelled, "gitility runtime supervisor is not running", retryable: true)}

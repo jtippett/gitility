@@ -39,6 +39,8 @@ defmodule Gitility.Native do
   def packfetch_hydrate(_runtime, _store, _limits), do: :erlang.nif_error(:nif_not_loaded)
   def packfetch_refresh(_runtime, _store, _limits), do: :erlang.nif_error(:nif_not_loaded)
 
+  def job_submit_fetch(_runtime, _request, _limits), do: :erlang.nif_error(:nif_not_loaded)
+
   def job_submit_snapshot_open(_runtime, _resource, _oid, _limits),
     do: :erlang.nif_error(:nif_not_loaded)
 

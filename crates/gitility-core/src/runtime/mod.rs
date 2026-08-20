@@ -24,6 +24,7 @@ use crate::blame::Blame;
 use crate::budget::{Budget, BudgetLimits};
 use crate::diff::Diff;
 use crate::error::{Error, ErrorCode};
+use crate::fetch::FetchResult;
 use crate::file::FileRead;
 use crate::log::LogPage;
 use crate::object::{ObjectHeader, ObjectKind, Oid};
@@ -91,6 +92,7 @@ pub enum JobOutput {
     Boolean(bool),
     Snapshot(Snapshot),
     Hydration(HydrationStats),
+    Fetch(FetchResult),
 }
 
 /// One ordered batch of object reads, retaining missing entries as `None` and

@@ -428,10 +428,10 @@ defmodule Gitility.Milestone1cQueryTest do
     assert error.details == %{limit: :max_tree_entries}
   end
 
-  test "native error code atoms are non-empty and covered by Gitility.Error" do
+  test "native and Elixir error code registries are exactly synchronized" do
     codes = Gitility.Native.error_codes()
     assert codes != []
-    assert MapSet.subset?(MapSet.new(codes), MapSet.new(Error.codes()))
+    assert MapSet.new(codes) == MapSet.new(Error.codes())
   end
 
   test "every wired public function rejects unknown option keys", %{

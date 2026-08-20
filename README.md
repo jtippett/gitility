@@ -59,6 +59,33 @@ Results are structured pages with cursors; byte, entry, and time budgets are
 explicit options with conservative defaults. SHA-1 and SHA-256 repositories
 are both supported.
 
+## Fetching
+
+`Gitility.Fetch` performs client-side smart-HTTP fetches into local bare
+repositories without invoking Git or a credential helper. Production callers
+should use HTTPS; authorization headers go directly to the in-process
+rustls client and are never stored or logged. Redirects are refused, and one
+absolute timeout covers credential-provider work, queue residence, HTTP, and
+the optional single 401 retry.
+
+```elixir
+{:ok, result} =
+  Gitility.Fetch.fetch(
+    "/srv/git/widgets.git",
+    "https://github.com/acme/widgets.git",
+    ["+refs/heads/*:refs/remotes/origin/*"],
+    prune: true,
+    credentials: fn %{attempt: attempt} ->
+      {:ok, %{authorization: MyApp.GitToken.header(attempt)}}
+    end,
+    retry_unauthorized: true
+  )
+```
+
+Fetches are single-flight per expanded destination path and use a dedicated
+two-worker runtime by default. Query APIs remain snapshot-pinned and read-only;
+fetch is the sole path that writes refs and objects in a real Git directory.
+
 ## Bundles: a repository in one file
 
 `Gitility.Bundle` clones a repository into **one flat file** — packs,
@@ -117,8 +144,9 @@ from wherever they live:
   time) and returns structured errors when exceeded — no unbounded scans.
 - **Cancellable**: long operations run as jobs that can be cancelled from
   Elixir.
-- **Read-only**: Gitility never mutates a repository, never takes locks, and
-  never shells out for queries.
+- **Read-only queries**: snapshot and object queries never mutate a repository
+  or shell out. `Gitility.Fetch` is the explicit, isolated write path into a
+  local bare repository.
 
 ## Development
 

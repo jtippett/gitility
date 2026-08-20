@@ -6,6 +6,7 @@ defmodule Gitility.NativeSupport do
     Commit,
     Diff,
     Error,
+    Fetch,
     File,
     Identity,
     Job,
@@ -206,6 +207,22 @@ defmodule Gitility.NativeSupport do
       truncated: page.truncated,
       stats: struct!(Stats, Map.to_list(stats)),
       warnings: page_warnings(page.truncated, stats.stopped_by)
+    }
+  end
+
+  def job_payload(%{
+        updated_refs: updated_refs,
+        rejected_refs: rejected_refs,
+        pruned_refs: pruned_refs,
+        remote_ref_count: remote_ref_count,
+        pack_received: pack_received
+      }) do
+    %Fetch.Result{
+      updated_refs: updated_refs,
+      rejected_refs: rejected_refs,
+      pruned_refs: pruned_refs,
+      remote_ref_count: remote_ref_count,
+      pack_received: pack_received
     }
   end
 

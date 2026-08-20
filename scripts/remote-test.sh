@@ -163,12 +163,12 @@ for s in "${STAGES[@]}"; do
     sync) stage_sync ;;
     postgres) stage_postgres ;;
     smoke) run_stage smoke "echo hello-from-cap; cat /proc/self/cgroup; cat /sys/fs/cgroup/gitility-test/pids.max 2>/dev/null; nproc" ;;
-    rust) run_stage rust "cargo test --workspace 2>&1 | grep -E \"^test result|error|FAILED|panicked\"; cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -2; cargo fmt --all --check && echo FMT-OK; bash scripts/check-thread-spawns.sh" ;;
+    rust) run_stage rust "cargo fetch; bash scripts/check-gix-features.sh; cargo test --workspace 2>&1 | grep -E \"^test result|error|FAILED|panicked\"; cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -2; cargo fmt --all --check && echo FMT-OK; bash scripts/check-thread-spawns.sh" ;;
     loom) run_stage loom "RUSTFLAGS=\"--cfg loom\" cargo test -p gitility-core --release 2>&1 | grep -E \"^test .*loom_|^test result\"" ;;
     # Failure blocks must survive the log: keep every ExUnit failure section
     # plus the tail summary (a bare tail -15 once swallowed the only failure
     # of a run — 2026-08-17).
-    mix)  run_stage mix "mix local.hex --force >/dev/null && mix local.rebar --force >/dev/null && mix deps.get >/dev/null && status=0; out=\$(mix test 2>&1) || status=\$?; echo \"\$out\" | grep -B 2 -A 25 \"^  *[0-9][0-9]*[)] test\" || true; echo \"\$out\" | tail -15; exit \$status" ;;
+    mix)  run_stage mix "mix local.hex --force >/dev/null && mix local.rebar --force >/dev/null && mix deps.get >/dev/null && status=0; out=\$(mix test 2>&1) || status=\$?; echo \"\$out\" | grep -B 2 -A 25 \"^  *[0-9][0-9]*[)] test\" || true; echo \"\$out\" | tail -15; [ \$status -eq 0 ] || exit \$status; for run in \$(seq 1 12); do echo \"[remote] M5a repetition \$run/12\"; mix test test/milestone_5a_fetch_test.exs; done" ;;
     soak) run_stage soak "status=0; out=\$(mix test --only soak 2>&1) || status=\$?; echo \"\$out\" | grep -B 2 -A 25 \"^  *[0-9][0-9]*[)] test\" || true; echo \"\$out\" | tail -15; exit \$status" ;;
     *) echo "unknown stage: $s" >&2; exit 2 ;;
   esac

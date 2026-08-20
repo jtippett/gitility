@@ -377,6 +377,27 @@ defmodule Gitility.Differential.Oracle do
     end
   end
 
+  @spec fetch(Path.t(), String.t(), [String.t()], keyword()) :: result(binary())
+  def fetch(destination, url, refspecs, opts \\ []) do
+    opts = Keyword.validate!(opts, prune: false)
+    destination = Path.expand(destination)
+    File.mkdir_p!(Path.dirname(destination))
+
+    case System.cmd("git", @git_options ++ ["init", "--bare", destination],
+           env: @git_environment,
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} ->
+        arguments =
+          ["fetch"] ++ optional_flag(opts[:prune], "--prune") ++ [url] ++ refspecs
+
+        git(destination, arguments)
+
+      {output, status} ->
+        {:error, %{status: status, output: output}}
+    end
+  end
+
   defp git(repository, arguments) do
     command_arguments = @git_options ++ ["-C", Path.expand(repository)] ++ arguments
 

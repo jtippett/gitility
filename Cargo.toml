@@ -11,7 +11,7 @@ edition = "2021"
 # The shipped NIF is precompiled (CI builds with `stable`), so this only
 # constrains rare from-source consumer builds — keep it recent rather than
 # artificially low.
-rust-version = "1.82"
+rust-version = "1.85"
 
 [workspace.dependencies]
 gitility-core = { path = "crates/gitility-core" }

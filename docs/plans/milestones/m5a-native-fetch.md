@@ -1,6 +1,6 @@
 # M5a — Native fetch (`Gitility.Fetch`)
 
-Status: SPEC v6 (2026-08-20, amended per codex review rounds 1–5). Scope +
+Status: SPEC v7 (2026-08-20, amended per codex review rounds 1–6). Scope +
 feasibility background: `docs/plans/2026-08-20-native-fetch-scope.md`.
 
 Deliverable: `Gitility.Fetch.fetch/4` — client-side smart-HTTP git
@@ -241,20 +241,21 @@ release.yml changes expected.
   provider calls and the auth retry). `fetch/4` records a monotonic
   deadline at entry (`System.monotonic_time(:millisecond) + timeout_ms`)
   and every subsequent stage receives the REMAINING time: each provider
-  invocation (§5), each attempt's limits map (native job deadline),
-  each attempt's request map (transport timeout via the reqwest
-  `configure_request` hook — this is what unwedges a fetch worker from
+  invocation (§5), each attempt's limits map (native job deadline —
+  which becomes the Budget's submission-time deadline, the SOLE
+  deadline source on the native side), and each `await_sync` await.
+  Native transport timeouts derive from that same Budget deadline: the
+  reqwest `configure_request` hook — what unwedges a fetch worker from
   a fully stalled socket, since the cooperative flag can't preempt a
-  blocked read; the HOOK ITSELF recomputes remaining time on EVERY
-  invocation from the job BUDGET's submission-time deadline — the
-  Budget already computes its deadline at submit (runtime/mod.rs
-  ~689), which is the authoritative whole-call bound; add a read
-  accessor if one doesn't exist. NOT a fresh `Instant` at task start
-  (queue residence would extend the bound — codex round 5), and NOT a
-  captured fixed duration (each of the fetch's multiple HTTP requests
-  — info/refs GET + upload-pack POST — would restart it — codex round
-  4)), and each
-  `await_sync` await. Remaining ≤ 0 BEFORE a stage starts →
+  blocked read — recomputes remaining time on EVERY invocation from
+  the job BUDGET's submission-time deadline (the Budget computes it at
+  submit, runtime/mod.rs ~689; add a read accessor if one doesn't
+  exist). NOT a fresh `Instant` at task start (queue residence would
+  extend the bound — codex round 5), NOT a captured fixed duration
+  (each of the fetch's multiple HTTP requests — info/refs GET +
+  upload-pack POST — would restart it — codex round 4), and NOT a
+  request-map field (a second source is a route back to those bugs —
+  codex round 6; FetchRequestMap carries no timeout). Remaining ≤ 0 BEFORE a stage starts →
   `:timeout` without running it; a PROVIDER that consumes the
   remaining time returns `:credentials_unavailable` (the provider was
   the stage that spent it — this is the one deliberate exception to
@@ -289,8 +290,11 @@ release.yml changes expected.
 ## 4. Fetch task semantics (Rust, `crates/gitility-core/src/fetch.rs` + NIF glue)
 
 `FetchRequestMap` (NifMap): `dest`, `url`, `refspecs: Vec<String>`,
-`authorization: Option<String>`, `prune: bool`, `timeout_ms: u64`
-(for the transport deadline; the job deadline comes from limits).
+`authorization: Option<String>`, `prune: bool`. NO timeout field —
+the ONLY deadline source is the job Budget's submission-time deadline
+(§3); the transport hook reads it from the budget, never from the
+request (codex round 6: a second source is a route back to the
+task-start-duration bug).
 
 Task flow (all on the fetch worker thread):
 1. Open or init dest — EXACT APIs (codex round 1: the convenience fns
@@ -432,7 +436,11 @@ Single-flight lock — `Gitility.Fetch.Locks`:
     the only clearing transition: if anything raises between submit-ok
     and attach, the pending flag STAYS SET (holder-death grace covers
     a dead caller; a live caller's `fetch/4` rescues, attaches the
-    job, then propagates). codex rounds 3–4 context: the flag closes
+    job, RELEASES the lease, then propagates — without the release, an
+    upstream caller catching the exception would leave a live holder
+    and the lease pinned forever; the released-holder + attached-job
+    lease then frees on job terminal — codex round 6). codex rounds
+    3–4 context: the flag closes
     the submit/attach death window for both attempts; a failed submit
     must clear it or the destination stays `:busy` forever.
   - Test seam: `fetch/4` honors an undocumented internal opt
@@ -585,7 +593,10 @@ external network):
     caller) → lease holds for the grace period, concurrent fetch gets
     `:busy` (the pending-submission flag, §5); submit that FAILS
     admission (e.g. runtime stopped) → pending flag cleared, dest not
-    stuck `:busy` (codex round 4); Locks GenServer
+    stuck `:busy` (codex round 4); seam RAISES with a live caller who
+    catches the exception → job attached AND lease released before the
+    re-raise, dest stays `:busy` only until the job is terminal, then
+    a new fetch proceeds (codex round 6); Locks GenServer
     restart mid-lease documented behavior (leases die with it — a
     restarted Locks admits new fetches; note in moduledoc).
 14. Runtime isolation: long fetch does not delay a default-runtime

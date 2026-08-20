@@ -13,7 +13,11 @@ defmodule Gitility.Native do
       x86_64-unknown-linux-gnu
       aarch64-unknown-linux-gnu
     ),
-    force_build: System.get_env("GITILITY_BUILD") in ["1", "true"]
+    # Keep in sync with NIF_NAME in .github/workflows/release.yml.
+    nif_versions: ["2.15"],
+    # Working in this repo (deps always compile as :prod) never downloads:
+    # an unreleased @version has no artifact to fetch.
+    force_build: System.get_env("GITILITY_BUILD") in ["1", "true"] or Mix.env() in [:dev, :test]
 
   def ping(), do: :erlang.nif_error(:nif_not_loaded)
   def runtime_start(_config), do: :erlang.nif_error(:nif_not_loaded)

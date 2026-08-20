@@ -39,6 +39,17 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Assert tag matches mix.exs version
+        # The artifact names built here and the download URLs
+        # rustler_precompiled constructs from mix.exs @version must agree;
+        # a re-tag or hand-edited version would 404 only at install time.
+        run: |
+          MIX_VERSION="$(sed -n 's/^  @version "\(.*\)"$/\1/p' mix.exs)"
+          if [ "v${MIX_VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match mix.exs @version ${MIX_VERSION}" >&2
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

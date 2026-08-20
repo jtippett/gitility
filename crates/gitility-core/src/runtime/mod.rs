@@ -24,6 +24,7 @@ use crate::blame::Blame;
 use crate::budget::{Budget, BudgetLimits};
 use crate::diff::Diff;
 use crate::error::{Error, ErrorCode};
+#[cfg(feature = "fetch")]
 use crate::fetch::FetchResult;
 use crate::file::FileRead;
 use crate::log::LogPage;
@@ -83,7 +84,10 @@ pub enum JobOutput {
     File(FileRead),
     Submodules(Vec<Submodule>),
     Header(Option<ObjectHeader>),
-    Object { kind: ObjectKind, data: Vec<u8> },
+    Object {
+        kind: ObjectKind,
+        data: Vec<u8>,
+    },
     ReadMany(ReadManyOutput),
     RefTarget(Option<RefTarget>),
     Refs(RefPage),
@@ -92,6 +96,7 @@ pub enum JobOutput {
     Boolean(bool),
     Snapshot(Snapshot),
     Hydration(HydrationStats),
+    #[cfg(feature = "fetch")]
     Fetch(FetchResult),
 }
 

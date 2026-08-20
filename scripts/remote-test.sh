@@ -164,7 +164,7 @@ for s in "${STAGES[@]}"; do
     postgres) stage_postgres ;;
     smoke) run_stage smoke "echo hello-from-cap; cat /proc/self/cgroup; cat /sys/fs/cgroup/gitility-test/pids.max 2>/dev/null; nproc" ;;
     rust) run_stage rust "cargo fetch; bash scripts/check-gix-features.sh; cargo test --workspace 2>&1 | grep -E \"^test result|error|FAILED|panicked\"; cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -2; cargo fmt --all --check && echo FMT-OK; bash scripts/check-thread-spawns.sh" ;;
-    loom) run_stage loom "RUSTFLAGS=\"--cfg loom\" cargo test -p gitility-core --release 2>&1 | grep -E \"^test .*loom_|^test result\"" ;;
+    loom) run_stage loom "RUSTFLAGS=\"--cfg loom\" cargo test -p gitility-core --release --no-default-features 2>&1 | grep -E \"^test .*loom_|^test result\"" ;;
     # Failure blocks must survive the log: keep every ExUnit failure section
     # plus the tail summary (a bare tail -15 once swallowed the only failure
     # of a run — 2026-08-17).

@@ -1,3 +1,5 @@
+#![cfg(feature = "fetch")]
+
 use gitility_core::{Budget, ErrorCode, FetchRequest};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

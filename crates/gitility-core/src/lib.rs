@@ -20,6 +20,7 @@ pub mod cursor;
 pub mod decode;
 pub mod diff;
 pub mod error;
+#[cfg(feature = "fetch")]
 pub mod fetch;
 pub mod file;
 mod git_config;
@@ -59,6 +60,7 @@ pub use diff::{
     DiffWarning, DiffWarningCode, RenameTracking,
 };
 pub use error::{Error, ErrorCode};
+#[cfg(feature = "fetch")]
 pub use fetch::{
     fetch, validate_request as validate_fetch_request, FetchAction, FetchRejectedRef,
     FetchRejection, FetchRequest, FetchResult, FetchUpdatedRef,

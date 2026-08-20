@@ -150,7 +150,10 @@ jobs:
           RUSTFLAGS: --cfg loom
         run: |
           set -o pipefail
-          cargo test -p gitility-core --release -- \
+          # --no-default-features drops the `fetch` network stack: tokio
+          # built under --cfg loom mocks its internals (no `net`), which
+          # breaks hyper-util/reqwest compilation.
+          cargo test -p gitility-core --release --no-default-features -- \
             --exact \
             runtime::loom_tests::loom_queue_has_no_lost_wakeup \
             runtime::loom_tests::loom_cancel_dequeue_race_has_one_terminal_transition \

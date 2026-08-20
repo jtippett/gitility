@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## 0.4.0 - 2026-08-20
+
 ### Added
 
 - `Gitility.Fetch.fetch/4`: bounded, cancellable smart-HTTP fetch into local

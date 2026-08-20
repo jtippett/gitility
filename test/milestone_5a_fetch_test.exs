@@ -110,10 +110,10 @@ defmodule Gitility.Milestone5aFetchTest do
     )
 
     refspecs = [
-      "+refs/heads/*:refs/remotes/origin/*",
-      "+refs/archive/*:refs/remotes/origin/*",
+      "+refs/heads/*:refs/remotes/origin/heads/*",
+      "+refs/archive/*:refs/remotes/origin/archive/*",
       "+refs/pull/*/head:refs/pull/*",
-      "+refs/heads/pinned:refs/remotes/origin/stale/pinned"
+      "+refs/heads/pinned:refs/remotes/origin/heads/stale/pinned"
     ]
 
     destination = Path.join(scratch, "prune.git")
@@ -130,10 +130,10 @@ defmodule Gitility.Milestone5aFetchTest do
 
     assert {:ok, _result} = Oracle.fetch(oracle_destination, url, refspecs, prune: true)
     assert refs(destination) == refs(oracle_destination)
-    assert "refs/remotes/origin/stale" in pruned
+    assert "refs/remotes/origin/heads/stale" in pruned
     assert "refs/pull/17" in pruned
-    assert refs(destination)["refs/remotes/origin/shared"] == oid
-    assert refs(destination)["refs/remotes/origin/stale/pinned"] == oid
+    assert refs(destination)["refs/remotes/origin/archive/shared"] == oid
+    assert refs(destination)["refs/remotes/origin/heads/stale/pinned"] == oid
 
     no_prune = Path.join(scratch, "no-prune.git")
     git!(remote, ["update-ref", "refs/heads/transient", oid])
@@ -141,6 +141,23 @@ defmodule Gitility.Milestone5aFetchTest do
     git!(remote, ["update-ref", "-d", "refs/heads/transient"])
     assert {:ok, %Result{pruned_refs: []}} = Fetch.fetch(no_prune, url, [@wildcard])
     assert Map.has_key?(refs(no_prune), "refs/remotes/origin/transient")
+  end
+
+  test "conflicting refspec destinations are invalid arguments", %{scratch: scratch} do
+    {remote, url} = remote_fixture(scratch, "sha1-basic.git")
+    oid = git!(remote, ["rev-parse", "refs/heads/main"])
+    git!(remote, ["update-ref", "refs/heads/shared", oid])
+    git!(remote, ["update-ref", "refs/archive/shared", oid])
+
+    conflicting = [
+      "+refs/heads/*:refs/remotes/conflict/*",
+      "+refs/archive/*:refs/remotes/conflict/*"
+    ]
+
+    assert {:error, %Error{code: :invalid_argument, message: message}} =
+             Fetch.fetch(Path.join(scratch, "conflict.git"), url, conflicting)
+
+    assert message =~ "refs/remotes/conflict/shared"
   end
 
   test "exact PR refspecs work and missing exact refs abort mixed requests before transfer", %{

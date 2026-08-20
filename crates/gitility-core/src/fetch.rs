@@ -117,7 +117,8 @@ pub fn fetch(request: FetchRequest, budget: &Budget) -> Result<FetchResult, Erro
 
     let remote = repo
         .remote_at_without_url_rewrite(request.url.as_str())
-        .map_err(|_| invalid_transport())?;
+        .map_err(|_| invalid_transport())?
+        .with_fetch_tags(gix::remote::fetch::Tags::None);
     let effective_url = remote
         .url(gix::remote::Direction::Fetch)
         .ok_or_else(invalid_transport)?;
@@ -261,12 +262,7 @@ fn open_or_init_bare(path: &Path) -> Result<gix::Repository, Error> {
             )
         })?
     } else {
-        gix::open_opts(path, gix::open::Options::isolated()).map_err(|_| {
-            Error::new(
-                ErrorCode::InvalidArgument,
-                "fetch destination is not a Git repository",
-            )
-        })?
+        gix::open_opts(path, gix::open::Options::isolated()).map_err(map_open_error)?
     };
 
     if !repo.is_bare() {
@@ -276,6 +272,24 @@ fn open_or_init_bare(path: &Path) -> Result<gix::Repository, Error> {
         ));
     }
     Ok(repo)
+}
+
+fn map_open_error(error: gix::open::Error) -> Error {
+    if matches!(
+        &error,
+        gix::open::Error::Config(gix::config::Error::ConfigTypedString(inner))
+            if inner.key.as_bstr() == "extensions.objectFormat"
+    ) {
+        Error::new(
+            ErrorCode::UnsupportedHash,
+            "the destination repository object format is unsupported by native fetch",
+        )
+    } else {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            "fetch destination is not a Git repository",
+        )
+    }
 }
 
 fn transport_options(authorization: Option<&str>, deadline: Option<Instant>) -> Box<dyn Any> {
@@ -529,20 +543,54 @@ fn map_connect_error(error: &gix::remote::connect::Error, budget: &Budget) -> Er
     if let Err(error) = budget.check() {
         return error;
     }
-    network_error(error, "fetch connection failed")
+    if connect_error_is_redirect(error) {
+        redirect_error()
+    } else {
+        network_error("fetch connection failed")
+    }
 }
 
 fn map_prepare_error(error: &gix::remote::fetch::prepare::Error, budget: &Budget) -> Error {
     if let Err(error) = budget.check() {
         return error;
     }
-    if is_authentication_error(error) {
-        return Error::new(
-            ErrorCode::AuthenticationFailed,
-            "remote authentication failed",
-        );
+
+    if let gix::remote::fetch::prepare::Error::RefMap(ref_map_error) = error {
+        match ref_map_error {
+            gix::remote::ref_map::Error::Handshake(handshake)
+                if handshake_error_is_authentication(handshake) =>
+            {
+                return authentication_error();
+            }
+            gix::remote::ref_map::Error::InitRefMap(
+                gix_protocol::fetch::refmap::init::Error::MappingValidation(validation),
+            ) => {
+                if let Some(destination) = conflicting_destination(validation) {
+                    return Error::new(
+                        ErrorCode::InvalidArgument,
+                        format!("conflicting fetch refspec destination: {destination}"),
+                    );
+                }
+            }
+            gix::remote::ref_map::Error::InitRefMap(
+                gix_protocol::fetch::refmap::init::Error::UnknownObjectFormat { .. },
+            ) => {
+                return Error::new(
+                    ErrorCode::UnsupportedHash,
+                    "the remote repository object format is unsupported by native fetch",
+                );
+            }
+            _ => {}
+        }
     }
-    network_error(error, "fetch handshake failed")
+
+    if prepare_error_is_authentication(error) {
+        authentication_error()
+    } else if prepare_error_is_redirect(error) {
+        redirect_error()
+    } else {
+        network_error("fetch handshake failed")
+    }
 }
 
 fn map_receive_error(error: &gix::remote::fetch::Error, budget: &Budget) -> Error {
@@ -569,7 +617,11 @@ fn map_receive_error(error: &gix::remote::fetch::Error, budget: &Budget) -> Erro
             map_pack_error(source.as_ref())
         }
         gix::remote::fetch::Error::Fetch(_) | gix::remote::fetch::Error::Client(_) => {
-            network_error(error, "fetch transfer failed")
+            if receive_error_is_redirect(error) {
+                redirect_error()
+            } else {
+                network_error("fetch transfer failed")
+            }
         }
         gix::remote::fetch::Error::UpdateRefs(_) => Error::new(
             ErrorCode::BackendError,
@@ -617,7 +669,61 @@ fn map_pack_error(error: &(dyn StdError + 'static)) -> Error {
     )
 }
 
-fn is_authentication_error(error: &(dyn StdError + 'static)) -> bool {
+fn authentication_error() -> Error {
+    Error::new(
+        ErrorCode::AuthenticationFailed,
+        "remote authentication failed",
+    )
+}
+
+fn conflicting_destination(error: &gix_refspec::match_group::validate::Error) -> Option<String> {
+    error.issues.iter().find_map(|issue| match issue {
+        gix_refspec::match_group::validate::Issue::Conflict {
+            destination_full_ref_name,
+            ..
+        } => Some(destination_full_ref_name.to_str_lossy().into_owned()),
+    })
+}
+
+fn prepare_error_is_authentication(error: &gix::remote::fetch::prepare::Error) -> bool {
+    match error {
+        gix::remote::fetch::prepare::Error::RefMap(gix::remote::ref_map::Error::Handshake(
+            handshake,
+        )) => handshake_error_is_authentication(handshake),
+        gix::remote::fetch::prepare::Error::RefMap(gix::remote::ref_map::Error::Transport(
+            transport,
+        )) => transport_error_is_authentication(transport),
+        _ => authentication_signal_in_chain(error),
+    }
+}
+
+fn handshake_error_is_authentication(error: &gix_protocol::handshake::Error) -> bool {
+    match error {
+        gix_protocol::handshake::Error::Credentials(_)
+        | gix_protocol::handshake::Error::EmptyCredentials
+        | gix_protocol::handshake::Error::InvalidCredentials { .. } => true,
+        gix_protocol::handshake::Error::Transport(transport) => {
+            transport_error_is_authentication(transport)
+        }
+        _ => authentication_signal_in_chain(error),
+    }
+}
+
+fn transport_error_is_authentication(error: &gix_transport::client::Error) -> bool {
+    match error {
+        gix_transport::client::Error::Io(io) => {
+            io.kind() == std::io::ErrorKind::PermissionDenied || authentication_signal_in_chain(io)
+        }
+        gix_transport::client::Error::Http(
+            gix_transport::client::blocking_io::http::Error::PostBody(io),
+        ) => {
+            io.kind() == std::io::ErrorKind::PermissionDenied || authentication_signal_in_chain(io)
+        }
+        _ => authentication_signal_in_chain(error),
+    }
+}
+
+fn authentication_signal_in_chain(error: &(dyn StdError + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(item) = current {
         if let Some(handshake) = item.downcast_ref::<gix_protocol::handshake::Error>() {
@@ -641,26 +747,137 @@ fn is_authentication_error(error: &(dyn StdError + 'static)) -> bool {
     false
 }
 
-fn network_error(error: &(dyn StdError + 'static), message: &'static str) -> Error {
-    if is_redirect_error(error) {
-        Error::retryable(
-            ErrorCode::NetworkError,
-            "fetch was redirected, but redirects are not followed",
-        )
-    } else {
-        Error::retryable(ErrorCode::NetworkError, message)
+fn network_error(message: &'static str) -> Error {
+    Error::retryable(ErrorCode::NetworkError, message)
+}
+
+fn redirect_error() -> Error {
+    Error::retryable(
+        ErrorCode::NetworkError,
+        "fetch was redirected, but redirects are not followed",
+    )
+}
+
+fn connect_error_is_redirect(error: &gix::remote::connect::Error) -> bool {
+    match error {
+        // gix-transport keeps the concrete connect error module private, but
+        // matching this public gix variant still gets past its transparent
+        // wrapper before the boxed backend fallback is inspected.
+        gix::remote::connect::Error::Connect(source) => redirect_signal_in_chain(source),
+        _ => redirect_signal_in_chain(error),
     }
 }
 
-fn is_redirect_error(error: &(dyn StdError + 'static)) -> bool {
+fn prepare_error_is_redirect(error: &gix::remote::fetch::prepare::Error) -> bool {
+    match error {
+        gix::remote::fetch::prepare::Error::RefMap(gix::remote::ref_map::Error::Handshake(
+            handshake,
+        )) => handshake_error_is_redirect(handshake),
+        gix::remote::fetch::prepare::Error::RefMap(gix::remote::ref_map::Error::Transport(
+            transport,
+        )) => transport_error_is_redirect(transport),
+        _ => redirect_signal_in_chain(error),
+    }
+}
+
+fn handshake_error_is_redirect(error: &gix_protocol::handshake::Error) -> bool {
+    match error {
+        gix_protocol::handshake::Error::Transport(transport) => {
+            transport_error_is_redirect(transport)
+        }
+        _ => redirect_signal_in_chain(error),
+    }
+}
+
+fn receive_error_is_redirect(error: &gix::remote::fetch::Error) -> bool {
+    match error {
+        gix::remote::fetch::Error::Client(transport)
+        | gix::remote::fetch::Error::Fetch(gix_protocol::fetch::Error::Client(transport)) => {
+            transport_error_is_redirect(transport)
+        }
+        gix::remote::fetch::Error::Fetch(gix_protocol::fetch::Error::FetchResponse(response)) => {
+            match response {
+                gix_protocol::fetch::response::Error::Io(io) => io_error_is_redirect(io),
+                gix_protocol::fetch::response::Error::Transport(transport) => {
+                    transport_error_is_redirect(transport)
+                }
+                _ => redirect_signal_in_chain(response),
+            }
+        }
+        gix::remote::fetch::Error::Fetch(gix_protocol::fetch::Error::ReadRemainingBytes(io)) => {
+            io_error_is_redirect(io)
+        }
+        _ => redirect_signal_in_chain(error),
+    }
+}
+
+fn transport_error_is_redirect(error: &gix_transport::client::Error) -> bool {
+    match error {
+        gix_transport::client::Error::Io(io) => io_error_is_redirect(io),
+        gix_transport::client::Error::Http(http) => match http {
+            gix_transport::client::blocking_io::http::Error::InitHttpClient { source } => source
+                .downcast_ref::<gix_transport::client::blocking_io::http::reqwest::remote::Error>()
+                .is_some_and(reqwest_remote_error_is_redirect)
+                || redirect_signal_in_chain(source.as_ref()),
+            gix_transport::client::blocking_io::http::Error::PostBody(io) => {
+                io_error_is_redirect(io)
+            }
+            _ => redirect_signal_in_chain(http),
+        },
+        _ => redirect_signal_in_chain(error),
+    }
+}
+
+fn io_error_is_redirect(error: &std::io::Error) -> bool {
+    // std::io::Error::source() forwards to the wrapped error's source and can
+    // skip the wrapped reqwest::Error itself. Inspect get_ref() structurally
+    // before falling back to a source-chain walk.
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<reqwest::Error>())
+        .is_some_and(reqwest::Error::is_redirect)
+        || error
+            .get_ref()
+            .and_then(|source| {
+                source.downcast_ref::<
+                    gix_transport::client::blocking_io::http::reqwest::remote::Error,
+                >()
+            })
+            .is_some_and(reqwest_remote_error_is_redirect)
+        || redirect_signal_in_chain(error)
+}
+
+fn reqwest_remote_error_is_redirect(
+    error: &gix_transport::client::blocking_io::http::reqwest::remote::Error,
+) -> bool {
+    match error {
+        gix_transport::client::blocking_io::http::reqwest::remote::Error::Reqwest(error) => {
+            error.is_redirect()
+        }
+        gix_transport::client::blocking_io::http::reqwest::remote::Error::Redirect(_) => true,
+        _ => redirect_signal_in_chain(error),
+    }
+}
+
+/// Fallback for boxed IO/backend errors after all public gix wrapper variants
+/// have been matched structurally. Transparent wrappers cannot be recovered by
+/// downcasting a `source()` chain, which is why callers must unwrap them first.
+fn redirect_signal_in_chain(error: &(dyn StdError + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(item) = current {
-        if let Some(gix_transport::client::blocking_io::http::reqwest::remote::Error::Reqwest(
-            reqwest,
-        )) =
+        if let Some(io) = item.downcast_ref::<std::io::Error>() {
+            if io.get_ref().is_some_and(|source| {
+                source
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_redirect)
+            }) {
+                return true;
+            }
+        }
+        if let Some(remote) =
             item.downcast_ref::<gix_transport::client::blocking_io::http::reqwest::remote::Error>()
         {
-            if reqwest.is_redirect() {
+            if reqwest_remote_error_is_redirect(remote) {
                 return true;
             }
         }
@@ -672,6 +889,15 @@ fn is_redirect_error(error: &(dyn StdError + 'static)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    struct RemoveDirectory(PathBuf);
+
+    impl Drop for RemoveDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn oid(byte: u8) -> gix_hash::ObjectId {
         gix_hash::ObjectId::from_bytes_or_panic(&[byte; 20])
@@ -759,12 +985,90 @@ mod tests {
     #[test]
     fn authentication_and_network_error_signals_map_to_stable_codes() {
         let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-        assert!(is_authentication_error(&denied));
+        assert!(authentication_signal_in_chain(&denied));
 
         let network = std::io::Error::other("connection failed");
-        let mapped = network_error(&network, "fetch connection failed");
+        assert!(!authentication_signal_in_chain(&network));
+        let mapped = network_error("fetch connection failed");
         assert_eq!(mapped.code, ErrorCode::NetworkError);
         assert!(mapped.retryable);
         assert_eq!(mapped.message, "fetch connection failed");
+    }
+
+    #[test]
+    fn refspec_mapping_conflict_is_invalid_argument_and_names_destination() {
+        let specs = vec![
+            spec("+refs/heads/*:refs/remotes/conflict/*"),
+            spec("+refs/archive/*:refs/remotes/conflict/*"),
+        ];
+        let names = [
+            BString::from("refs/heads/shared"),
+            BString::from("refs/archive/shared"),
+        ];
+        let target = oid(1);
+        let items: Vec<_> = names
+            .iter()
+            .map(|name| gix_refspec::match_group::Item {
+                full_ref_name: name.as_bstr(),
+                target: target.as_ref(),
+                object: None,
+            })
+            .collect();
+        let validation = gix_refspec::MatchGroup::from_fetch_specs(
+            specs.iter().map(gix_refspec::RefSpec::to_ref),
+        )
+        .match_lhs(items.iter().copied())
+        .validated()
+        .expect_err("the two sources map to the same destination");
+        let prepare_error =
+            gix::remote::fetch::prepare::Error::RefMap(gix::remote::ref_map::Error::InitRefMap(
+                gix_protocol::fetch::refmap::init::Error::MappingValidation(validation),
+            ));
+
+        let mapped = map_prepare_error(&prepare_error, &Budget::unlimited());
+        assert_eq!(mapped.code, ErrorCode::InvalidArgument);
+        assert!(mapped.message.contains("refs/remotes/conflict/shared"));
+    }
+
+    #[test]
+    fn real_sha256_destination_is_an_unsupported_hash() {
+        let destination = std::env::temp_dir().join(format!(
+            "gitility-fetch-sha256-{}-{}.git",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time follows the Unix epoch")
+                .as_nanos()
+        ));
+        let _cleanup = RemoveDirectory(destination.clone());
+        let output = Command::new("git")
+            .args(["init", "--bare", "--object-format=sha256"])
+            .arg(&destination)
+            .output()
+            .expect("git can be invoked");
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let sha256_unavailable = [
+                "unknown option",
+                "unknown hash algorithm",
+                "invalid object format",
+                "unsupported object format",
+            ]
+            .iter()
+            .any(|signal| stderr.to_ascii_lowercase().contains(signal));
+            assert!(
+                sha256_unavailable,
+                "git init failed for an unrelated reason: {stderr}"
+            );
+            eprintln!("skipping SHA-256 fetch test: local git lacks SHA-256 support");
+            return;
+        }
+
+        let error = open_or_init_bare(&destination).expect_err("gix 0.86 cannot open SHA-256");
+        assert_eq!(error.code, ErrorCode::UnsupportedHash);
+        assert!(error
+            .message
+            .contains("destination repository object format"));
     }
 }

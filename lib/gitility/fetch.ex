@@ -31,7 +31,8 @@ defmodule Gitility.Fetch do
 
   Pruning is limited to destination spaces of wildcard fetch refspecs and uses
   reverse refspec matching. Exact destinations and symbolic refs are never
-  pruned.
+  pruned. Tags are fetched only when an explicit tag refspec is supplied;
+  implicit tag auto-following is disabled.
 
   Transport, negotiation, and pack-verification failures precede gix's ref
   transaction and leave refs untouched. Cancellation is cooperative, so a

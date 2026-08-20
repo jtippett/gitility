@@ -710,6 +710,7 @@ dependencies = [
  "gix-worktree",
  "loom",
  "regex",
+ "reqwest",
  "sha1-checked",
  "sha2",
 ]

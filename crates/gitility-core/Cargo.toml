@@ -31,6 +31,7 @@ gix-traverse = { version = "=0.60.0", default-features = false, features = ["sha
 gix-worktree = { version = "=0.55.0", default-features = false, features = ["attributes"] }
 gix-transport = { version = "=0.58.1", default-features = false }
 regex = { version = "=1.13.1", default-features = false, features = ["std"] }
+reqwest = { version = "=0.13.4", default-features = false }
 sha1-checked = { version = "=0.10.0", default-features = false }
 sha2 = { version = "=0.11.0", default-features = false }
 

@@ -109,8 +109,23 @@ defmodule Gitility.RangeTestSupport do
 
   def stop(supervisor) when is_pid(supervisor) do
     Process.unlink(supervisor)
-    if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
-    :ok
+    ref = Process.monitor(supervisor)
+
+    # The supervisor may already be shutting down on its own (it is linked
+    # to whichever process ran start_link, often a finished Task), so stop
+    # can race a concurrent normal exit. Any exit here is fine as long as
+    # the process is confirmed down before returning.
+    try do
+      Supervisor.stop(supervisor)
+    catch
+      :exit, _ -> :ok
+    end
+
+    receive do
+      {:DOWN, ^ref, :process, ^supervisor, _reason} -> :ok
+    after
+      5_000 -> raise "supervisor #{inspect(supervisor)} did not stop"
+    end
   end
 end
 

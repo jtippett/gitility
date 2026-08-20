@@ -1,6 +1,6 @@
 %{
-  "libgitility-v0.3.0-nif-2.15-aarch64-apple-darwin.so.tar.gz" => "sha256:b7e7cdad683c46f4b8e9311daaf8db32f581c9229ea1fb5ada8ce6b8fc40ac53",
-  "libgitility-v0.3.0-nif-2.15-aarch64-unknown-linux-gnu.so.tar.gz" => "sha256:09696afb9c97609d1ea3a3ff13c81d2080267fb5982623fe18bd8b63e2d966e6",
-  "libgitility-v0.3.0-nif-2.15-x86_64-apple-darwin.so.tar.gz" => "sha256:f68b824c5a53da340660e93ac212a3c0850f9b0812128529f9897fcc9ed8cfa8",
-  "libgitility-v0.3.0-nif-2.15-x86_64-unknown-linux-gnu.so.tar.gz" => "sha256:0324ce47ef3df23f4bcb52c431f24c6693a5578ffd7105901249052990463435",
+  "libgitility-v0.4.0-nif-2.15-aarch64-apple-darwin.so.tar.gz" => "sha256:38bdd97753f9de92cd4a73a073cf6c0629678f8ce80053b84159f6732a4a7b04",
+  "libgitility-v0.4.0-nif-2.15-aarch64-unknown-linux-gnu.so.tar.gz" => "sha256:3003cf84266928e90433714d6f72c4aa860206e314ee43098f15811c28448446",
+  "libgitility-v0.4.0-nif-2.15-x86_64-apple-darwin.so.tar.gz" => "sha256:828b1df7d26ce86d117e242bb1d8186d6599752fbaeac08104d1fb9f8c9d78cf",
+  "libgitility-v0.4.0-nif-2.15-x86_64-unknown-linux-gnu.so.tar.gz" => "sha256:dbc8aec3af6fbccb4a357b028273a12e23e3eaf3702c673b7a54d9030ede444d",
 }

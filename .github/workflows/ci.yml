@@ -24,8 +24,11 @@ jobs:
         # backward-compatible across the OTP versions we support, so a wider
         # matrix would only re-test the Elixir layer.
         include:
+          # Matches the sprite verification environment; the 1.19 formatter
+          # disagrees with 1.18 on canonical form, so the format check must
+          # run the same line the code is authored against.
           - otp: "27.2"
-            elixir: "1.18.0"
+            elixir: "1.19.2"
     env:
       MIX_ENV: test
       GITILITY_BUILD: "1"

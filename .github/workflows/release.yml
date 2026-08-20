@@ -114,7 +114,7 @@ jobs:
         uses: erlef/setup-beam@v1
         with:
           otp-version: "27.2"
-          elixir-version: "1.18.0"
+          elixir-version: "1.19.2"
 
       - uses: dtolnay/rust-toolchain@stable
 

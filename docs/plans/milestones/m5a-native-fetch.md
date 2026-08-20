@@ -1,6 +1,6 @@
 # M5a — Native fetch (`Gitility.Fetch`)
 
-Status: SPEC v2 (2026-08-20, amended per codex review round 1). Scope +
+Status: SPEC v3 (2026-08-20, amended per codex review rounds 1–2). Scope +
 feasibility background: `docs/plans/2026-08-20-native-fetch-scope.md`.
 
 Deliverable: `Gitility.Fetch.fetch/4` — client-side smart-HTTP git
@@ -17,18 +17,28 @@ query API stays read-only and the module docs must say so.
   runtime is a second instance of the existing `Gitility.Runtime` —
   same `runtime_start()` NIF, same two allowlisted spawn sites.
   `scripts/check-thread-spawns.sh` must pass UNCHANGED.
-- KNOWN AND BUDGETED dependency threads: gix's reqwest blocking
-  transport spawns ONE helper thread per live connection
-  (`gix-transport .../http/reqwest/remote.rs:50`, JoinHandle owned by
-  the Remote, joined on drop; the curl backend spawns one too, so this
-  is not avoidable by switching backends). The fetch task MUST reserve
-  one slot from `thread_budget::global()` before constructing the
-  connection and release it when the connection is dropped; reservation
-  failure → `Busy` (retryable). Steady-state ceiling: 2 workers + 1
-  pump + at most 2 transient transport threads (one per in-flight
-  fetch). The sprite thread sampler assertion in §9 uses these numbers.
-  If you find yourself needing `thread::spawn` anywhere in our code,
-  stop and flag it — that is a design escalation.
+- KNOWN AND BUDGETED dependency threads (codex round 2, verified in
+  gix-transport AND the reqwest/hyper-util sources): each in-flight
+  fetch connection carries up to THREE short-lived dependency threads —
+  gix's transport worker (`.../http/reqwest/remote.rs:50`), reqwest's
+  blocking-client internal runtime thread
+  (`reqwest .../blocking/client.rs:1408`), and possibly a tokio
+  blocking-pool DNS thread (hyper-util getaddrinfo). Teardown is
+  ASYNCHRONOUS: gix does not join its worker on drop (its only join is
+  failure recovery), and pool threads linger briefly. Therefore the
+  budget accounting is honest, not exact: the fetch task reserves
+  THREE slots from `thread_budget::global()` before constructing the
+  connection and releases them when the connection is dropped, with a
+  documented caveat that release is advisory (the threads exit shortly
+  after, not provably before — the budget bounds steady state, and at
+  512 total the slack is irrelevant). Reservation failure → `Busy`
+  (retryable). Numbers for §9: 3 resident (2 workers + pump); during 2
+  concurrent fetches up to ~9 briefly (3 resident + 2×3 transient),
+  draining back to 3 within a grace window after completion. The curl
+  backend is NOT an escape (it spawns a worker too, and drags libcurl
+  into the static build). If you find yourself needing `thread::spawn`
+  anywhere in OUR code, stop and flag it — that is a design
+  escalation.
 - gix must not spawn any OTHER threads. See §2 feature audit
   (single-threaded pack indexing).
 - The authorization value is radioactive: it must never appear in any
@@ -116,8 +126,15 @@ non-forced fetch that couldn't apply is visible, never silent.
 Behavioral contract (each row is a test):
 - Empty remote + wildcard refspecs → `{:ok, %Result{remote_ref_count: 0,
   updated_refs: [], pack_received: false}}`. NOT an error.
-- Exact-name refspec with no matching remote ref → `:ref_not_found`
-  (gix `Error::NoMapping`), message includes the refspec.
+- Exact-name refspec with no matching remote ref → `:ref_not_found`,
+  message includes the refspec — INCLUDING in mixed requests. gix's
+  `Error::NoMapping` fires only when NO refspec matched at all (codex
+  round 2: one wildcard match + one missing exact ref would silently
+  succeed), so the task must check the prepared ref map itself: after
+  `prepare_fetch`, every exact (non-glob) refspec source must appear in
+  the mappings; a missing one aborts with `RefNotFound` BEFORE any
+  transfer. Test: mixed wildcard + missing exact refspec →
+  `:ref_not_found`, no ref updates applied.
 - Up-to-date re-fetch → ok, empty `updated_refs`, `pack_received:
   false`. Idempotent.
 - Non-forced refspec against a rewound remote branch → ok with the ref
@@ -129,10 +146,18 @@ Behavioral contract (each row is a test):
   MAY leave the fetch committed (cancellation is cooperative; the
   commit point is inside `receive()`) — the operation is idempotent and
   a rerun converges; the moduledoc says exactly this. A prune failure
-  after a committed fetch returns `:backend_error` with
-  `details: %{fetch_committed: true}`.
-- If gix reports a kept pack (`.keep` path in the outcome) after ref
-  edits were applied, delete the keep file before returning.
+  after a committed fetch returns the dedicated code `:prune_failed` —
+  the code ITSELF means "the fetch portion committed; only pruning
+  failed" (no structured-detail plumbing; the core Error has nowhere
+  to carry a free-form flag — codex round 2).
+- `.keep` cleanup, exact condition (codex round 2): gix removes the
+  keep file ITSELF whenever ref edits exist or the pack was empty — a
+  keep path still present in the outcome therefore means a nonempty
+  pack with NO ref edits (e.g. an all-rejected fetch), exactly the case
+  that would otherwise leave a permanent GC-blocking `.keep`. Whenever
+  the outcome carries a keep path, delete it unconditionally before
+  returning. Test: all-rejected fetch leaves no `.keep` in
+  `objects/pack`.
 
 ## 2. Cargo wiring + gix feature audit + MSRV
 
@@ -214,6 +239,16 @@ release.yml changes expected.
   Some(Box::new(|req: &mut reqwest::blocking::Request| { *req.timeout_mut() =
   Some(remaining); })) }`. Both the outer Options (with
   `extra_headers`) and the nested backend Options are needed.
+- REDIRECT CONSEQUENCE, accepted for v1 (codex round 2): gix treats a
+  configured request hook (and configured headers) as a reason to
+  select `RejectConfiguredHeaders` redirect policy — HTTP redirects
+  (renamed/moved repos) are REFUSED, for every fetch, since the hook is
+  always installed. This is the right trade: authenticated fetches
+  must not chase redirects with an Authorization header anyway, and
+  the timeout guarantee matters more than anonymous redirect-following.
+  Map the redirect refusal to `NetworkError` with the message naming
+  the redirect so callers can re-issue against the new URL; document
+  "redirects are not followed" in the moduledoc.
 
 ## 4. Fetch task semantics (Rust, `crates/gitility-core/src/fetch.rs` + NIF glue)
 
@@ -242,13 +277,16 @@ Task flow (all on the fetch worker thread):
    git-credential subprocess cascade; a 401 becomes a typed error,
    never a helper invocation), then `set_transport_options(...)` per §3
    (extra_headers with the authorization value if present + backend
-   timeout hook). Reserve the transport-thread budget slot (§0) before
-   connect; release on connection drop via a guard.
-4. `prepare_fetch(...)` → `receive(NoProgress, should_interrupt)`.
+   timeout hook). Reserve the transport-thread budget slots (§0, three)
+   before connect; release on connection drop via a guard.
+4. `prepare_fetch(...)`; check the prepared ref map for the
+   missing-exact-refspec rule (§1) BEFORE transfer; then
+   `receive(NoProgress, should_interrupt)`.
 5. Map outcome per §1: zip mappings×updates, filter Modes, collect
    rejections, `remote_ref_count` from the ref map's remote refs,
-   `pack_received` from `Status::Change` vs `NoPackReceived`; delete a
-   reported `.keep` after successful ref edits.
+   `pack_received` from `Status::Change` vs `NoPackReceived`; delete
+   any reported `.keep` unconditionally (§1 — a reported keep means
+   pack-without-edits; gix already removed it in every other case).
 6. Prune (only if `prune: true`): use gix-refspec's
    `MatchGroup::match_rhs()` reverse matching (NOT prefix
    approximation — wrong for wildcard suffixes, overlapping
@@ -258,7 +296,7 @@ Task flow (all on the fetch worker thread):
    whose remote counterpart is absent from the advertised set. Exact
    refspec destinations are protected; symbolic refs never touched;
    dedup; output sorted. Failure here after a committed fetch →
-   `BackendError` + fetch_committed detail (§1).
+   **PruneFailed** (§1).
 
 New `JobOutput::Fetch(...)` variant: handle EVERY exhaustive site —
 result encoding AND result size accounting in the NIF
@@ -275,11 +313,15 @@ tests that hard-code the registry: the Rust exhaustive-index test
 the cross-language comparison in `milestone_1c_query_test.exs` ~431 —
 which currently asserts SUBSET equality and must be tightened to exact
 set equality as part of this milestone.
-- HTTP 401 (io PermissionDenied from the transport — gix maps ONLY
-  401 to PermissionDenied; 403 and other statuses become opaque
-  `Other`) → **AuthenticationFailed**, retryable: false. Message must
-  not echo the header. 403 therefore surfaces as **NetworkError** —
-  do not promise 401/403 equivalence anywhere.
+- HTTP 401 → **AuthenticationFailed**, retryable: false. CORRECT
+  DETECTION (codex round 2): with `set_credentials(|_| Ok(None))`, the
+  transport's io `PermissionDenied` is CONSUMED by gix's handshake and
+  resurfaces as `handshake::Error` credentials variants (e.g.
+  `EmptyCredentials`) — match those in the fetch error chain as the
+  primary 401 signal, with io PermissionDenied as fallback. Message
+  must not echo the header. 403 and other statuses become opaque
+  `Other` errors → **NetworkError**; do not promise 401/403
+  equivalence anywhere.
 - Connect/read/TLS/DNS/stall/truncation failures → **NetworkError**,
   retryable: true. Phase/context goes in the MESSAGE text (the core
   Error struct has no free-form details field; do not add one for
@@ -289,8 +331,13 @@ set equality as part of this milestone.
 - Interrupt via cancel → existing `Cancelled`.
 - Pack/index verification failures → existing checksums/malformed
   codes.
+- **PruneFailed** — prune transaction failed after a committed fetch
+  (§1); retryable: true (rerun with prune converges).
 - **CredentialsUnavailable** — constructed Elixir-side only (§5) but
   present in both registries so exact-equality sync holds.
+
+Four new codes total: AuthenticationFailed, NetworkError, PruneFailed,
+CredentialsUnavailable.
 
 ## 5. Credential provider + single-flight (Elixir-side)
 
@@ -299,15 +346,21 @@ Provider:
   `apply(m, f, args ++ [context])`). Context v1: `%{url:, host:,
   attempt: 1 | 2}`. Returns `{:ok, %{authorization: binary}}` or
   `{:error, term}`.
-- Called in the caller's process immediately before each submission.
-  Raise or bad return → `{:error, %Error{code: :credentials_unavailable}}`
-  whose `cause` carries ONLY the exception module or `:bad_return` —
+- Invoked under a TIME BOUND (codex round 2: an unbounded provider
+  would hold the destination lease forever and void the single
+  time-bound promise): run in a `Task` linked to the caller,
+  `Task.yield(task, remaining_timeout) || Task.shutdown(task,
+  :brutal_kill)` — where remaining_timeout is what's left of
+  `timeout_ms`. Timeout, raise, or bad return →
+  `{:error, %Error{code: :credentials_unavailable}}` whose `cause`
+  carries ONLY the exception module, `:bad_return`, or `:timeout` —
   never the term itself (a provider error embedding the token must not
   leak; test this). The returned authorization value passes the same
   header validation as the static opt.
 - `retry_unauthorized: true`: on `:authentication_failed`, invoke the
-  provider once with `attempt: 2`, submit ONE fresh job under the SAME
-  lock lease. Second 401 → the error. Never loops.
+  provider once with `attempt: 2` (same remaining-time bound), submit
+  ONE fresh job under the SAME lock lease. Second 401 → the error.
+  Never loops.
 
 Single-flight lock — `Gitility.Fetch.Locks`:
 - An EAGER, permanent GenServer child of `Gitility.Supervisor`
@@ -321,20 +374,33 @@ Single-flight lock — `Gitility.Fetch.Locks`:
   aliases of the same directory defeat the key (we do not resolve
   symlinks; fix-forward if it ever bites — the failure mode is two
   concurrent fetches, which git itself tolerates).
-- Lease lifecycle (codex round 1 — caller death does NOT end native
-  work): `acquire(key)` before provider/submit; after submission the
-  caller `attach(key, job)`-es the job, and Locks registers ITSELF as a
-  waiter on the job (`Native.job_register_waiter/1` from the Locks
-  process; `:terminal` fast-path releases immediately). The lease is
-  released only on the job's terminal notification `{:gitility_job,
-  id, :done}` — never merely on caller DOWN. Caller DOWN before attach
-  releases the lease; caller DOWN after attach additionally
-  `Job.cancel/1`s the job (cooperative) but the lease still waits for
-  terminal. The same rule covers `await_sync`'s `:timeout` return: the
-  caller may be gone, the lease holds until the native job actually
-  ends. `fetch/4` releases explicitly after taking the result on the
-  happy path (attach-then-release-on-terminal makes this automatic —
-  explicit release only for the never-submitted paths).
+- Lease lifecycle v2 (codex round 2 — the v1 "release on job terminal"
+  design couldn't span the auth retry and had a submit/attach death
+  race). A lease has two components: the HOLDER (caller pid, monitored)
+  and a set of ATTACHED JOBS. Release condition: (holder has released
+  OR holder is DOWN) AND (every attached job is terminal). Rules:
+  - `acquire(key)` before provider/submit. Caller `attach(key, job)`
+    after each submission — BOTH jobs of an auth retry attach under the
+    one lease; the first job reaching terminal does not release
+    anything while the holder still holds.
+  - Locks registers ITSELF as a waiter on each attached job
+    (`Native.job_register_waiter/1` from the Locks process; `:terminal`
+    fast path counts as already-terminal) and marks jobs terminal on
+    `{:gitility_job, id, :done}`.
+  - Happy path: `fetch/4` calls `release(key)` after taking the result;
+    with all attached jobs terminal, the lease frees immediately.
+  - `await_sync` `:timeout` return: fetch/4 still calls release, but
+    the cancelled job is not yet terminal → lease holds until the
+    native job actually ends. Correct by the release condition, no
+    special case.
+  - Holder DOWN with attached jobs: `Job.cancel/1` them (cooperative);
+    lease frees when they reach terminal.
+  - Holder DOWN with NO attached job (the submit/attach race window —
+    owner-death only requests cooperative cancellation, the native job
+    may still be running unobserved): hold the lease for a grace period
+    of 2× the lease's declared `timeout_ms` (recorded at acquire), then
+    free. The unobservable job self-terminates via owner-death
+    cancellation + its own deadline well within that.
 - Contended acquire → `{:error, %Error{code: :busy, retryable: true}}`.
 
 ## 6. Token hygiene (tests required for each)
@@ -381,8 +447,10 @@ convention as the differential oracle). No new deps. Scope:
   but MUST deliver EOF and collect full binary stdout + exit status).
   Parse CGI response headers, frame HTTP/1.1, `Connection: close`.
 - Modes per server start: `require_authorization: value` (else 401 +
-  `WWW-Authenticate: Basic`), `stall: :after_headers` (hold the socket
-  silently), `truncate_pack: n_bytes` (close mid-body), plain.
+  `WWW-Authenticate: Basic`), `respond_status: 403` (fixed status for
+  every request — the 403≠401 mapping test), `stall: :after_headers`
+  (hold the socket silently), `truncate_pack: n_bytes` (close
+  mid-body), plain.
 - 127.0.0.1 ephemeral port; `start_supervised!`; URL returned.
 
 Oracle extension (`test/differential/oracle.ex`): `fetch/4` shelling
@@ -403,17 +471,23 @@ external network):
    ref survives; overlapping wildcard destinations; exact destination
    nested under a wildcard destination. Plus `prune: false` leaves
    stale refs.
-5. PR-style exact refspec fetch; missing exact ref → `:ref_not_found`.
+5. PR-style exact refspec fetch; missing exact ref → `:ref_not_found`;
+   MIXED wildcard + missing exact refspec → `:ref_not_found`, no ref
+   updates applied (the silent-omission trap, §1).
 6. Empty remote → ok, `remote_ref_count: 0`.
 7. Non-fast-forward without force → ok + `rejected_refs:
-   [%{reason: :non_fast_forward}]`, local ref unchanged, oracle parity.
+   [%{reason: :non_fast_forward}]`, local ref unchanged, oracle parity,
+   and NO `.keep` file left in `objects/pack` (the all-rejected keep
+   cleanup, §1).
 8. Auth: correct static header succeeds; wrong → `:authentication_failed`;
    provider fun succeeds; provider raising → `:credentials_unavailable`
-   (cause carries no token); `retry_unauthorized: true` with
-   attempt-keyed bad-then-good provider succeeds, provider saw attempts
-   1 and 2, SAME lock lease throughout (assert a concurrent fetch gets
-   `:busy` during the retry window). 403 mode (server returns 403) →
-   `:network_error`, NOT `:authentication_failed`.
+   (cause carries no token); provider that sleeps past `timeout_ms` →
+   `:credentials_unavailable` within the bound, lease released;
+   `retry_unauthorized: true` with attempt-keyed bad-then-good provider
+   succeeds, provider saw attempts 1 and 2, SAME lock lease throughout
+   (assert a concurrent fetch gets `:busy` during the retry window).
+   `respond_status: 403` mode → `:network_error`, NOT
+   `:authentication_failed`.
 9. Token hygiene per §6.
 10. Stalled server → typed error within `timeout_ms` + margin
     (condition-based waiting, no fixed sleeps), worker reusable after
@@ -454,8 +528,10 @@ new path).
   in-process HTTP client; credential cascade explicitly disarmed — a
   401 can never invoke a subprocess; token never stored/logged),
   provider contract, single-flight semantics + symlink caveat, prune
-  scoping, the honest timeout/commit-point contract from §1, fixed 20s
-  connect timeout, and the read-only-queries positioning paragraph.
+  scoping, the honest timeout/commit-point contract from §1 (including
+  `:prune_failed` meaning fetch-committed), fixed 20s connect timeout,
+  redirects-not-followed, and the read-only-queries positioning
+  paragraph.
 - README "Fetching" section mirroring the moduledoc opening.
 - CHANGELOG [Unreleased]: Added (Gitility.Fetch), Changed (MSRV 1.85).
 - `mix docs --warnings-as-errors` clean.
@@ -469,7 +545,11 @@ new path).
 - Sprite: full mix suite green (12x loop for the new file), rehearsal
   ALL CHECKS PASSED including Flow C.
 - CI green.
-- Sprite thread sampler: fetch runtime adds exactly 3 resident threads
-  (2 workers + pump); during 2 concurrent fetches at most 5; back to 3
-  after they finish.
+- Sprite thread sampler: fetch runtime adds exactly 3 RESIDENT threads
+  (2 workers + pump). During 2 concurrent fetches, transient
+  dependency threads may briefly push the total up (~3 per in-flight
+  connection, §0); the assertion is on the resident count RETURNING to
+  3 within a grace window after fetches complete, plus an in-flight
+  ceiling of 9 — teardown is asynchronous, so assert with
+  condition-based polling, not an instant snapshot.
 - Opus adversarial review of the diff, findings fixed, re-verified.

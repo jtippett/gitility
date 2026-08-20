@@ -1,6 +1,6 @@
 # M5a — Native fetch (`Gitility.Fetch`)
 
-Status: SPEC v4 (2026-08-20, amended per codex review rounds 1–3). Scope +
+Status: SPEC v5 (2026-08-20, amended per codex review rounds 1–4). Scope +
 feasibility background: `docs/plans/2026-08-20-native-fetch-scope.md`.
 
 Deliverable: `Gitility.Fetch.fetch/4` — client-side smart-HTTP git
@@ -154,7 +154,13 @@ Behavioral contract (each row is a test):
   prune transaction failing (§4 step 6), OUR keep-file deletion
   failing (below), and gix's OWN `RemovePackKeepFile` error — gix
   commits refs BEFORE its automatic keep removal, so that error too
-  arrives post-commit (codex round 3).
+  arrives post-commit (codex round 3). Retryability is per-case
+  (codex round 4: a rerun does NOT converge for keep failures — the
+  rerun receives no new pack, so there is no keep path to re-delete):
+  prune failure → retryable: true (rerun with prune converges);
+  either keep-deletion failure → retryable: false, the message names
+  the leftover `.keep` path, and the moduledoc tells the caller the
+  file is safe to delete manually.
 - `.keep` cleanup, exact condition (codex round 2): gix removes the
   keep file ITSELF whenever ref edits exist or the pack was empty — a
   keep path still present in the outcome therefore means a nonempty
@@ -235,11 +241,20 @@ release.yml changes expected.
   deadline at entry (`System.monotonic_time(:millisecond) + timeout_ms`)
   and every subsequent stage receives the REMAINING time: each provider
   invocation (§5), each attempt's limits map (native job deadline),
-  each attempt's request map (transport total-timeout via the reqwest
+  each attempt's request map (transport timeout via the reqwest
   `configure_request` hook — this is what unwedges a fetch worker from
   a fully stalled socket, since the cooperative flag can't preempt a
-  blocked read), and each `await_sync` await. Remaining ≤ 0 at any
-  stage → `:timeout` without submitting. Consequence to state in docs
+  blocked read; the HOOK ITSELF recomputes remaining time from one
+  absolute `Instant` deadline captured at task start on EVERY
+  invocation — a fetch issues multiple HTTP requests (info/refs GET +
+  upload-pack POST), and a captured fixed duration would restart per
+  request and exceed the whole-call bound — codex round 4), and each
+  `await_sync` await. Remaining ≤ 0 BEFORE a stage starts →
+  `:timeout` without running it; a PROVIDER that consumes the
+  remaining time returns `:credentials_unavailable` (the provider was
+  the stage that spent it — this is the one deliberate exception to
+  the `:timeout` rule, stated here so §5 and the matrix don't
+  contradict this section). Consequence to state in docs
   and assert in tests: a stalled server produces a typed error
   (`:network_error` or `:timeout`, both acceptable) within `timeout_ms`
   plus margin — including on the retry path — and the worker is
@@ -349,8 +364,8 @@ set equality as part of this milestone.
   codes.
 - **CleanupFailed** — post-commit cleanup failed after a committed
   fetch: prune transaction, our keep-file deletion, or gix's own
-  `RemovePackKeepFile` (§1); retryable: true (rerun converges); the
-  message names which cleanup failed.
+  `RemovePackKeepFile` (§1); retryable per-case (§1: true for prune,
+  false for keep); the message names which cleanup failed.
 - **CredentialsUnavailable** — constructed Elixir-side only (§5) but
   present in both registries so exact-equality sync holds.
 
@@ -402,11 +417,23 @@ Single-flight lock — `Gitility.Fetch.Locks`:
   job is terminal. Rules:
   - `acquire(key)` before provider/submit. Around EVERY submission
     (attempt 1 AND attempt 2), the caller brackets:
-    `pending_submit(key)` → NIF submit → `attach(key, job)` (attach
-    clears the pending flag). The flag is what closes the
-    submit/attach death window for BOTH attempts — codex round 3: the
-    attempt-2 window was uncovered because attempt 1's terminal job
-    satisfied the old release condition.
+    `pending_submit(key)` → NIF submit → on `{:ok, job}`
+    `attach(key, job)`, on ANY error `submission_failed(key)` — both
+    clear the pending flag, and the caller wraps the bracket in
+    `try/after` so an unexpected raise between the two calls also
+    clears it (codex round 4: with attach as the only clearing
+    transition, a failed submit left the destination `:busy` forever
+    while the caller lived). The flag is what closes the submit/attach
+    death window for BOTH attempts — codex round 3: the attempt-2
+    window was uncovered because attempt 1's terminal job satisfied
+    the old release condition.
+  - Test seam: `fetch/4` honors an undocumented internal opt
+    `:__after_submit__` (a 0-arity fun invoked between submit and
+    attach), existing solely so the matrix's death-window test can
+    place a deterministic barrier in that window. Named with the
+    dunder prefix, excluded from docs, validated like other opts but
+    only in test envs — there is no other observable point between
+    submit and attach (codex round 4).
   - BOTH jobs of an auth retry attach under the one lease; a terminal
     attached job never releases anything while the holder holds or a
     submission is pending.
@@ -482,7 +509,9 @@ convention as the differential oracle). No new deps. Scope:
   every request — the 403≠401 mapping test), `redirect: location`
   (301 + Location header — the redirects-not-followed test),
   `stall: :after_headers` (hold the socket silently),
-  `truncate_pack: n_bytes` (close mid-body), plain.
+  `truncate_pack: n_bytes` (close mid-body), `delay_body:
+  {chunk_bytes, delay_ms}` (serve the response body slowly in chunks —
+  gives cancellation/timeout a mid-transfer window to land in), plain.
 - 127.0.0.1 ephemeral port; `start_supervised!`; URL returned.
 
 Oracle extension (`test/differential/oracle.ex`): `fetch/4` shelling
@@ -531,19 +560,23 @@ external network):
     (condition-based waiting, no fixed sleeps), worker reusable after
     (a subsequent fetch on the same runtime succeeds).
 11. Truncated pack → typed error, dest refs untouched, dest still opens.
-12. Cancellation mid-transfer (Task + cancel or timeout against
-    stall/slow mode) → `:timeout`/`:cancelled`; document-and-test the
-    post-commit race semantics: a timeout firing after ref commit may
-    leave refs updated (assert EITHER outcome is coherent: refs
-    all-old or all-new, never torn).
+12. Cancellation mid-transfer against the `delay_body` mode →
+    `:timeout`/`:cancelled`; plus the coherence property: run a fetch
+    with a timeout tuned to race completion and assert the outcome is
+    coherent EITHER way — refs all-old or all-new, never torn. (The
+    post-commit-timing branch cannot be forced deterministically; the
+    load-bearing assertion is never-torn, stated as such — codex
+    round 4.)
 13. Single-flight: concurrent same-dest → one `:busy`; lock released
     after job terminal (poll until second fetch succeeds); caller
     killed mid-fetch → lease persists until job end, then a new fetch
     proceeds; holder killed inside attempt 2's submit/attach window
-    (orchestrate with a provider that blocks on attempt 2 until the
-    test kills the caller right after submission) → lease holds for
-    the grace period, concurrent fetch gets `:busy` (the
-    pending-submission flag, §5 — codex round 3); Locks GenServer
+    (deterministic via the `:__after_submit__` test seam, §5 — the
+    barrier blocks between submit and attach while the test kills the
+    caller) → lease holds for the grace period, concurrent fetch gets
+    `:busy` (the pending-submission flag, §5); submit that FAILS
+    admission (e.g. runtime stopped) → pending flag cleared, dest not
+    stuck `:busy` (codex round 4); Locks GenServer
     restart mid-lease documented behavior (leases die with it — a
     restarted Locks admits new fetches; note in moduledoc).
 14. Runtime isolation: long fetch does not delay a default-runtime

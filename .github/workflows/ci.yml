@@ -163,4 +163,7 @@ jobs:
         run: mix test
 
       - name: Build API docs
+        # ex_doc is a dev-only dep; the job-level MIX_ENV=test hides it.
+        env:
+          MIX_ENV: dev
         run: mix docs --warnings-as-errors

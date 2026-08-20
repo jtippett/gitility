@@ -576,6 +576,52 @@ defmodule Gitility.M4b.BundleTest do
     assert {:ok, _parsed} = Format.parse(tail)
   end
 
+  test "nonzero reserved bytes and unknown peeled flags are refused", context do
+    header_reserved = synthetic_pair_bundle(context.directory, "header-reserved")
+    mutate_file(header_reserved, 12, 1, <<1>>)
+    assert_error(header_reserved, :malformed_object)
+
+    trailer_reserved = synthetic_pair_bundle(context.directory, "trailer-reserved")
+    size = byte_size(File.read!(trailer_reserved))
+    mutate_file(trailer_reserved, size - 16, 1, <<1>>)
+    assert_error(trailer_reserved, :malformed_object)
+
+    bad_peeled = Path.join(context.directory, "bad-peeled-flag.bundle")
+
+    Support.write_bundle(bad_peeled,
+      refs: [%{name: "refs/heads/main", target: Support.oid(:sha1, 1), kind: :commit}]
+    )
+
+    toc = Support.toc_bytes(bad_peeled)
+    flag_offset = Support.locate_ref_kind(toc, "refs/heads/main", :sha1) + 1
+    Support.mutate_toc(bad_peeled, flag_offset, 1, <<2>>)
+    assert_error(bad_peeled, :malformed_object)
+  end
+
+  test "the writer refuses a table of contents beyond the v1 ceiling", context do
+    path = Path.join(context.directory, "oversized-toc.bundle")
+    value = :binary.copy("v", 65_536)
+
+    metadata =
+      Map.new(0..1_029, fn i ->
+        {"key-" <> String.pad_leading(Integer.to_string(i), 4, "0"), value}
+      end)
+      |> Map.put("source_identity", "m4b:oversized")
+
+    assert {:error, {:toc_too_large, size, max}} =
+             Gitility.Bundle.Writer.write(path,
+               pairs: [],
+               hash_algorithm: :sha1,
+               generation: 1,
+               metadata: metadata,
+               refs: []
+             )
+
+    assert size > max
+    refute File.exists?(path)
+    assert File.ls!(context.directory) == []
+  end
+
   test "format v1 refuses shallow sources and the reserved shallow metadata feature", context do
     shallow_source = fixture("sha1-history-shallow.git")
     output = Path.join(context.directory, "shallow.bundle")

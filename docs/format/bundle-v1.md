@@ -1,8 +1,10 @@
-# Gitility bundle format v1 — specification (DRAFT; freezes when 0.2 ships)
+# Gitility bundle format v1 — specification (FROZEN)
 
-Status: DRAFT, revised 2026-08-18. The design doc mandates this spec exist
-before the first byte of `Gitility.Bundle` is written (M4 item 5). Format
-version 1 is frozen when 0.2 ships; until then this document may change.
+Status: FROZEN with the 0.2.0 release (2026-08-20). This document is a
+compatibility promise: any Gitility 0.2+ reader opens any v1 bundle, v1
+fields are never reinterpreted, and format changes bump the version per the
+compatibility rule below. Normative statements here change only to correct
+a demonstrable error, never to track implementation drift.
 
 A bundle is ONE flat container file holding a complete read-only Git
 repository: packs, their indexes, a refs snapshot, and metadata. One file
@@ -78,7 +80,13 @@ are length-prefixed (`u32` length, then the bytes; no NUL terminators).
 A reader sniffs the magic before anything else; wrong magic →
 `:invalid_argument` ("not a gitility bundle"). Major greater than the
 newest major the reader knows → `:unsupported_operation` naming both
-versions. Refusal is possible without parsing anything further.
+versions. Major = 0 → `:malformed_object`. Refusal is possible without
+parsing anything further.
+
+Reserved fields (here and in the trailer) are MAJOR-version space: writers
+MUST emit zero, and readers MUST reject nonzero with `:malformed_object`.
+(Additive minor-version space lives elsewhere: optional metadata keys, new
+FILE kinds, and the reserved TOC tail.)
 
 ### Sections
 
@@ -91,11 +99,20 @@ naming the entry.
 
 ### TOC (at `toc_offset`, `toc_len` bytes)
 
+`toc_len` MUST NOT exceed 64 MiB (67,108,864 bytes) — readers reject a
+larger value with `:malformed_object` before reading the TOC, and writers
+MUST refuse to produce one with `:unsupported_operation` (the limit bounds
+reader allocation; at ~56 bytes per ref row it admits on the order of a
+million refs).
+
 Parsed strictly within `toc_len`; every length prefix is bounds-checked
-against the remaining buffer before use (counts are never trusted).
+against the remaining buffer before use (counts are never trusted). All
+UTF-8 fields (metadata keys and values, file names) MUST be valid UTF-8;
+violations are `:malformed_object`.
 
 ```
 hash_algorithm   u8      1 = sha1 (20-byte oids), 2 = sha256 (32-byte oids)
+                         any other value: :malformed_object
 generation       u64     >= 1
 metadata_count   u32
 metadata entries × count, sorted strictly ascending by key bytes:
@@ -122,17 +139,28 @@ ref entries × count, sorted strictly ascending by name bytes:
 Rules:
 
 - File entries come in pairs: each `pack` immediately followed by its
-  `idx` (same stem). Names follow git convention
-  (`pack-<hash>.pack` / `.idx`). Unpaired or mis-ordered entries are
+  `idx` (same stem), evaluated over the subsequence of KNOWN-kind entries
+  — unknown-kind entries may sit between a pack and its idx without
+  breaking the pair. Names MUST be `pack-<hex>.pack` / `pack-<hex>.idx`
+  where `<hex>` is lowercase and exactly 40 (sha1) or 64 (sha256) hex
+  characters per `hash_algorithm`. Unpaired or mis-ordered entries are
   `:malformed_object`. Zero pairs is legal (empty repository).
 - Unknown `kind` values in FILE entries: the reader MUST skip the entry
-  (minor-additive space — writers never require a minor feature to read
-  the core repository). Unknown REF kind or peeled_flag values:
-  `:malformed_object` (that space is not additive).
+  in the pack/idx pairing and the object-store view, but the entry still
+  occupies its section bytes — it participates fully in the tiling rule
+  and in whole-file verification (minor-additive space — writers never
+  require a minor feature to read the core repository). Unknown REF kind
+  or peeled_flag values: `:malformed_object` (that space is not
+  additive).
 - Duplicate or unsorted metadata keys / ref names: `:malformed_object`.
-- Strictly-ascending ref names give binary-search resolution and make
+- Strictly-ascending ref names permit binary-search resolution and make
   prefix iteration a contiguous scan — same shape the cursor/paging
-  machinery already assumes.
+  machinery already assumes (readers may resolve however they like).
+- `ref_count` = 0 is legal: an object-store-only bundle (no refs
+  snapshot, so no `:head` or named-ref resolution). Gitility's PackFetch
+  hydration destination writes such bundles; a full-repository bundle
+  from `Bundle.write/2` always carries its refs snapshot. Zero ref rows
+  carries no further format-level meaning.
 - `HEAD` is stored as a ref row named `HEAD` with its RESOLVED direct
   target (symbolic refs are resolved at publish time). The optional
   metadata key `head_symref` (e.g. `refs/heads/main`) preserves the
@@ -177,20 +205,27 @@ RESERVED key (a feature gate, not ignorable):
 | 48–55 | reserved   | zero                                   |
 | 56–63 | magic      | `"GITBNDL\0"` (the last 8 bytes)      |
 
-The trailer MUST end exactly at EOF; trailing bytes after it are
-`:malformed_object` (this is what makes "the trailer is at EOF" a safe
-place to look). Minimum legal file size is 80 bytes (header + trailer).
-Bounds: `16 <= toc_offset`, `toc_offset + toc_len + 64 == file size`.
+The trailer MUST end exactly at EOF: a reader reads the final 64 bytes of
+the file as the trailer and validates the magic and the bounds equation
+below — appending anything after a valid trailer shifts that window, so
+the magic or bounds check fails and the file is rejected (`:malformed_object`).
+This is what makes "the trailer is at EOF" a safe place to look. Minimum
+legal file size is 80 bytes (header + trailer). Bounds: `16 <= toc_offset`,
+`toc_offset + toc_len + 64 == file size`. The reserved field follows the
+header's reserved rule: writers emit zero, readers reject nonzero.
 
 ## Writer contract (`Gitility.Bundle.write/2` and `into: {:bundle, path}`)
 
 - A publish (and every update, and repack) builds a COMPLETE new file:
-  write to a temp file in the destination directory, fsync the file,
-  atomically rename over the destination, fsync the directory. Readers
-  holding the old file keep a coherent old repository (their fd pins the
-  old inode); new opens see the new one. On S3 the equivalent is the
-  whole-object PUT, atomic by construction. In-place append is NOT in
-  v1 (see headroom note below).
+  write to a temp file in the destination directory, fsync the file, and
+  atomically rename over the destination — the artifact is always
+  complete-or-absent. The writer SHOULD also fsync the directory where
+  the platform allows; the reference Elixir writer cannot (Erlang exposes
+  no portable directory-fsync), so rename durability across sudden power
+  loss is platform-dependent there. Readers holding the old file keep a
+  coherent old repository (their fd pins the old inode); new opens see
+  the new one. On S3 the equivalent is the whole-object PUT, atomic by
+  construction. In-place append is NOT in v1 (see headroom note below).
 - Single streaming pass: header, then each pack/idx streamed through
   sha256 while being copied, then the TOC, then the trailer. The writer
   never seeks backward.
@@ -226,8 +261,9 @@ Bounds: `16 <= toc_offset`, `toc_offset + toc_len + 64 == file size`.
   by the writer and verified by `Gitility.Bundle.verify/1`, which streams
   the whole file (structure + every checksum). The TOC sha256 is always
   verified at open.
-- The refs table implements `RefDB.Backend`: resolve by binary search,
-  list/prefix by contiguous scan, from the pinned snapshot. Per-hop
+- The refs table implements `RefDB.Backend` from the pinned snapshot
+  (the sorted rows permit binary-search resolution and contiguous prefix
+  scans; how a reader indexes them is its own business). Per-hop
   atomicity is trivial — all rows are direct targets by construction.
 - Read-only open of an immutable 0444 file works by construction: the
   reader opens `O_RDONLY`, creates nothing, locks nothing.

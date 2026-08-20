@@ -149,7 +149,7 @@ These findings are load-bearing; the design references them by ID.
   is a flat container — header / raw pack+idx sections / TOC / trailer —
   over plain `std::fs`, pure Rust with zero engine dependency,
   byte-deterministic, updated by whole-file rewrite + atomic rename.
-  Authoritative: `docs/plans/2026-08-17-bundle-format-v1.md`.
+  Authoritative: `docs/format/bundle-v1.md`.
 - **F7 — stock gix cannot serve a pack from Rust-owned bytes.** Verified in
   `gix-pack/src/{bundle,index}/init.rs`: `Bundle::at` and `index::File::at`
   accept paths and mmap the files; there is no in-memory constructor. In 0.2,
@@ -994,7 +994,7 @@ readable while refresh builds and verifies the replacement local-store handle.
 > byte-deterministic. The product promises in this section (one file =
 > ODB + refs, packs stay packs, `PackFetch`/`RefDB.Backend`/`into:
 > {:bundle, path}` consumption, refs snapshotted at publish) are
-> unchanged. `docs/plans/2026-08-17-bundle-format-v1.md` is
+> unchanged. `docs/format/bundle-v1.md` is
 > authoritative; the prose below stands as the historical record of the
 > SQLite design.
 

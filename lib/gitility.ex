@@ -55,7 +55,6 @@ defmodule Gitility do
     Limits,
     Native,
     NativeSupport,
-    NotImplementedError,
     ODB,
     OID,
     Page,
@@ -1326,14 +1325,15 @@ defmodule Gitility do
   end
 
   ## ————————————————————————————————————————————————————————————————
-  ## Scaffold
+  ## Diagnostics
   ## ————————————————————————————————————————————————————————————————
 
   @doc """
   Confirms the native library is loaded. Returns `:pong`.
 
-  Scaffold-only smoke check; it will be removed once the real native
-  surface lands.
+  Useful as an install smoke check: it fails to load (rather than
+  answering) when no precompiled NIF matched this platform and no local
+  build was available.
   """
   @spec ping() :: :pong
   defdelegate ping(), to: Gitility.Native

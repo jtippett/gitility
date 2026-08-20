@@ -32,6 +32,7 @@ defmodule Gitility.Bundle.Writer do
                      files: files,
                      refs: refs
                    }),
+                 :ok <- validate_toc_size(toc),
                  toc_sha256 <- :crypto.hash(:sha256, toc),
                  :ok <- IO.binwrite(output, toc),
                  :ok <-
@@ -62,6 +63,14 @@ defmodule Gitility.Bundle.Writer do
       end
     after
       File.rm(temp)
+    end
+  end
+
+  defp validate_toc_size(toc) do
+    if byte_size(toc) <= Format.max_toc_len() do
+      :ok
+    else
+      {:error, {:toc_too_large, byte_size(toc), Format.max_toc_len()}}
     end
   end
 

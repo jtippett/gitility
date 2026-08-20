@@ -52,14 +52,18 @@ defmodule Gitility.MixProject do
       files: ~w(lib Cargo.toml Cargo.lock native/gitility/Cargo.toml native/gitility/src
            crates/gitility-core/Cargo.toml crates/gitility-core/src crates/gitility-core/vendor
            checksum-Elixir.Gitility.Native.exs .formatter.exs mix.exs
-           README.md CHANGELOG.md LICENSE)
+           README.md CHANGELOG.md LICENSE docs/format/bundle-v1.md)
     ]
   end
 
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md"],
+      extras: [
+        "README.md",
+        "docs/format/bundle-v1.md": [title: "Bundle format v1 (frozen)"],
+        "CHANGELOG.md": []
+      ],
       source_url: @source_url,
       source_ref: "v#{@version}"
     ]

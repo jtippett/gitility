@@ -662,6 +662,16 @@ defmodule Gitility.Bundle do
      )}
   end
 
+  defp write_error({:toc_too_large, size, max}) do
+    {:error,
+     Error.new(
+       :unsupported_operation,
+       "bundle table of contents exceeds the v1 format ceiling",
+       operation: :bundle_write,
+       details: %{toc_bytes: size, max_toc_bytes: max}
+     )}
+  end
+
   defp write_error(reason) do
     {:error,
      Error.new(:backend_error, "bundle publication failed",

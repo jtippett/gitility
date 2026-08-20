@@ -398,10 +398,14 @@ end)
 Rehearsal.check("shipped hydration bundle serves file reads fully in memory", fn ->
   shipped_odb = Path.join(workdir, "shipped-hydration.bundle")
   File.cp!(odb_bundle, shipped_odb)
-  {:ok, repo} = Bundle.open(shipped_odb, into: :memory)
+  # start_link + repository/1 (not open/2) so the store can be stopped
+  # cleanly — orderly shutdown is what removes the /dev/shm scratch dir.
+  {:ok, sup} = Bundle.start_link(path: shipped_odb, into: :memory)
+  {:ok, repo} = Bundle.repository(sup)
   {:ok, snap} = Repository.snapshot(repo, {:oid, OID.parse!(head)})
   {:ok, file} = Gitility.read_file(snap, "README.md")
   expected = Rehearsal.git!(source, ["show", "#{head}:README.md"])
+  :ok = Supervisor.stop(sup)
 
   if file.data == expected,
     do: {:ok, "#{byte_size(file.data)} bytes"},

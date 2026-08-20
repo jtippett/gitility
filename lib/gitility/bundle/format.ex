@@ -88,6 +88,10 @@ defmodule Gitility.Bundle.Format do
     end
   end
 
+  @doc "The format's TOC size ceiling; readers reject and writers refuse beyond it."
+  @spec max_toc_len() :: pos_integer()
+  def max_toc_len, do: @max_toc_len
+
   @doc "Encodes the fixed bundle v1 header."
   @spec encode_header() :: binary()
   def encode_header, do: <<@magic, @major::little-16, @minor::little-16, 0::little-32>>

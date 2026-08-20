@@ -12,6 +12,8 @@ defmodule Gitility.ODB.PackInventory do
 
   @spec collect(Path.t(), Path.t(), keyword()) :: {:ok, [pair()]} | {:error, term()}
   def collect(repository, staging, opts \\ [])
+
+  def collect(repository, staging, opts)
       when is_binary(repository) and is_binary(staging) do
     opts = Keyword.validate!(opts, allow_empty: false, git_executable: nil)
     repository = Path.expand(repository)

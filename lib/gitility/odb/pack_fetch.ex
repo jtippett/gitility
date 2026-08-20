@@ -103,6 +103,14 @@ defmodule Gitility.ODB.PackFetch do
   @default_hydration_bytes 4 * 1024 * 1024 * 1024
   @copy_chunk_bytes 8 * 1024 * 1024
 
+  @doc """
+  Starts a PackFetch store over a range backend.
+
+  `:backend` (`{module, init_arg}`) and `:limits` are required; `:into`
+  selects the hydration destination (`:memory` by default, `{:dir, path}`,
+  or `{:bundle, path}`). See the moduledoc for the full option set and the
+  semantics of each destination.
+  """
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) do
     opts =
@@ -755,8 +763,20 @@ defmodule Gitility.ODB.PackFetch do
            metadata: metadata,
            refs: []
          ) do
-      {:ok, _receipt} -> :ok
-      {:error, reason} -> bundle_write_error("bundle snapshot publication failed", reason)
+      {:ok, _receipt} ->
+        :ok
+
+      {:error, {:toc_too_large, size, max}} ->
+        {:error,
+         Error.new(
+           :unsupported_operation,
+           "bundle table of contents exceeds the v1 format ceiling",
+           operation: :packfetch_bundle_write,
+           details: %{toc_bytes: size, max_toc_bytes: max}
+         )}
+
+      {:error, reason} ->
+        bundle_write_error("bundle snapshot publication failed", reason)
     end
   end
 

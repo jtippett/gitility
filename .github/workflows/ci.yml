@@ -126,7 +126,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Rust tests (workspace)
-        run: cargo test --workspace --all-targets
+        # --all-targets would also execute benches; verify_tax requires the
+        # sources/gitoxide dev corpus and hard-fails without it by design.
+        run: cargo test --workspace --lib --bins --tests
 
       - name: Cache loom cargo artifacts
         uses: actions/cache@v5

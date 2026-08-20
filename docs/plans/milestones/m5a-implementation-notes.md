@@ -102,10 +102,10 @@ No Elixir tests, compilation, docs, or rehearsal command was run locally.
 
 ```text
 $ cargo build
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.99s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.67s
 
 $ cargo test --workspace --lib --bins --tests
-gitility:                         1 passed; 0 failed
+gitility:                         2 passed; 0 failed
 gitility-core unit tests:       256 passed; 0 failed
 gitility-core integration tests: 3 passed; 0 failed
 gix-diff:                         4 passed; 0 failed
@@ -128,3 +128,48 @@ $ mix format
 $ git diff --check
 (success; no output)
 ```
+
+## Fix round 2
+
+- Redirect detection was re-verified against the real headers-channel shape:
+  each `std::io::Error` is inspected with `get_ref()` and the boxed
+  `reqwest::Error` is downcast before following `source()`. The real loopback
+  301 Cargo test now requires the exact public "redirects are not followed"
+  message rather than merely looking for the word "redirect".
+- The attempt-two submit/attach death-window test now has a 2,000 ms whole-call
+  budget. Its 500 ms in-grace probe remains well below the resulting 4,000 ms
+  lease grace, and its 6,000 ms release-polling window exceeds that grace.
+- `Mode::New` updates explicitly report `old_oid: nil`; gix's transaction
+  expectation for a newly created ref is no longer mistaken for a pre-existing
+  value. Fresh-fetch coverage checks every created result, while the existing
+  fast-forward assertion still checks the actual prior OID.
+- Locks treats unexpected `job_register_waiter` returns and NIF exceptions as
+  non-terminal without crashing. Every fetch-side Locks call now catches
+  process exits and returns a retryable typed `:backend_error`; release is
+  best-effort cleanup and can never replace the fetch result. A deterministic
+  pre-release seam covers both an absent Locks process and a successful fetch
+  whose release runs after the Locks supervisor is stopped.
+- Fetch results are exempt from `max_result_bytes` at NIF result-taking time.
+  Their size is controlled by the remote's advertised ref count, not a caller
+  input bound, and the pack/ref transaction has already committed before
+  encoding. The existing oversized truncated-search-progress exemption remains
+  unchanged.
+- The smart-HTTP shell redirects `git http-backend` stderr to `/dev/null` and no
+  longer merges port stderr into CGI stdout. CGI header splitting chooses the
+  earliest of CRLF and LF separators. The token-hygiene test now states
+  explicitly that BEAM `CaptureIO` cannot observe native OS fd 2 writes.
+- The Linux `nlwp` test is skipped on non-Linux hosts. Its post-fetch condition
+  polls for a settled count less than or equal to the three-resident baseline,
+  and timeout failures carry the last observed thread count.
+- Exact-refspec errors render the deduplicated `RefMap` spec itself, with a
+  duplicate-refspec regression row. Provider `{:error, term}` refusals use the
+  sanitized `:provider_error` cause, while non-binary successful authorization
+  values (including `nil`) are rejected as bad provider returns.
+- The public `Gitility.Fetch` documentation records both single-flight limits:
+  leases are keyed by `Path.expand/1` without resolving symlink aliases, and a
+  Locks restart loses all in-memory leases and immediately admits new fetches.
+  Locks now runs under the dedicated `Gitility.Fetch.Supervisor`, isolating its
+  ordinary restart accounting from dynamically added runtimes.
+- Busy probes now retry the state-read/fetch pair within a bounded polling
+  window and accept the legitimate case where the observed holder completes in
+  the gap before the probe fetch.

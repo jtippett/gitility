@@ -78,11 +78,13 @@ defmodule Gitility.Fetch do
     deadline = entered_at + request.timeout_ms
     key = Path.expand(request.dest)
 
-    with :ok <- Locks.acquire(key, request.timeout_ms) do
+    with :ok <- locks_call(fn -> Locks.acquire(key, request.timeout_ms) end) do
       try do
-        run_fetch(key, deadline, request)
+        result = run_fetch(key, deadline, request)
+        if request.before_release, do: request.before_release.()
+        result
       after
-        Locks.release(key)
+        release_lock(key)
       end
     end
   end
@@ -146,12 +148,16 @@ defmodule Gitility.Fetch do
         credentials_unavailable(:timeout)
       else
         case provider_result do
-          {:ok, {:provider_return, {:ok, %{authorization: authorization}}}} ->
+          {:ok, {:provider_return, {:ok, %{authorization: authorization}}}}
+          when is_binary(authorization) ->
             if validate_authorization(authorization) == :ok do
               {:ok, authorization}
             else
               credentials_unavailable(:bad_return)
             end
+
+          {:ok, {:provider_return, {:error, _provider_error}}} ->
+            credentials_unavailable(:provider_error)
 
           {:ok, {:provider_exception, module}} when is_atom(module) ->
             credentials_unavailable(module)
@@ -215,31 +221,37 @@ defmodule Gitility.Fetch do
         prune: request.prune
       }
 
-      :ok = Locks.pending_submit(key)
+      with :ok <- locks_call(fn -> Locks.pending_submit(key) end) do
+        submission =
+          try do
+            NativeSupport.submit_job(runtime, :fetch, fn runtime_resource ->
+              Native.job_submit_fetch(runtime_resource, native_request, limits)
+            end)
+          rescue
+            exception ->
+              _ = locks_call(fn -> Locks.submission_failed(key) end)
+              reraise exception, __STACKTRACE__
+          catch
+            kind, reason ->
+              _ = locks_call(fn -> Locks.submission_failed(key) end)
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
 
-      submission =
-        try do
-          NativeSupport.submit_job(runtime, :fetch, fn runtime_resource ->
-            Native.job_submit_fetch(runtime_resource, native_request, limits)
-          end)
-        rescue
-          exception ->
-            :ok = Locks.submission_failed(key)
-            reraise exception, __STACKTRACE__
-        catch
-          kind, reason ->
-            :ok = Locks.submission_failed(key)
-            :erlang.raise(kind, reason, __STACKTRACE__)
+        case submission do
+          {:ok, job} ->
+            case attach_after_submit(key, job, request.after_submit) do
+              :ok ->
+                await_job(job, deadline)
+
+              {:error, %Error{} = error} ->
+                :ok = Job.cancel(job)
+                {:error, error}
+            end
+
+          {:error, %Error{} = error} ->
+            _ = locks_call(fn -> Locks.submission_failed(key) end)
+            {:error, %{error | operation: :fetch}}
         end
-
-      case submission do
-        {:ok, job} ->
-          attach_after_submit(key, job, request.after_submit)
-          await_job(job, deadline)
-
-        {:error, %Error{} = error} ->
-          :ok = Locks.submission_failed(key)
-          {:error, %{error | operation: :fetch}}
       end
     end
   end
@@ -249,14 +261,14 @@ defmodule Gitility.Fetch do
       if after_submit, do: after_submit.()
     rescue
       exception ->
-        :ok = Locks.attach(key, job)
+        _ = locks_call(fn -> Locks.attach(key, job) end)
         reraise exception, __STACKTRACE__
     catch
       kind, reason ->
-        :ok = Locks.attach(key, job)
+        _ = locks_call(fn -> Locks.attach(key, job) end)
         :erlang.raise(kind, reason, __STACKTRACE__)
     else
-      _ -> Locks.attach(key, job)
+      _ -> locks_call(fn -> Locks.attach(key, job) end)
     end
   end
 
@@ -304,7 +316,8 @@ defmodule Gitility.Fetch do
          timeout_ms: options.timeout_ms,
          retry_unauthorized: options.retry_unauthorized,
          runtime: options.runtime,
-         after_submit: options.after_submit
+         after_submit: options.after_submit,
+         before_release: options.before_release
        }}
     end
   end
@@ -374,7 +387,8 @@ defmodule Gitility.Fetch do
       timeout_ms: @default_timeout_ms,
       retry_unauthorized: false,
       runtime: nil,
-      after_submit: nil
+      after_submit: nil,
+      before_release: nil
     }
 
     if proper_list?(opts) do
@@ -407,6 +421,10 @@ defmodule Gitility.Fetch do
         {:__after_submit__, value}, {:ok, options}
         when @test_env and (is_nil(value) or is_function(value, 0)) ->
           {:cont, {:ok, %{options | after_submit: value}}}
+
+        {:__before_release__, value}, {:ok, options}
+        when @test_env and (is_nil(value) or is_function(value, 0)) ->
+          {:cont, {:ok, %{options | before_release: value}}}
 
         {key, _value}, _acc when is_atom(key) ->
           {:halt, invalid("unknown or invalid fetch option: #{inspect(key)}")}
@@ -471,6 +489,41 @@ defmodule Gitility.Fetch do
 
   defp timeout_error do
     {:error, Error.new(:timeout, "fetch deadline expired", operation: :fetch)}
+  end
+
+  defp locks_call(call) do
+    try do
+      case call.() do
+        :ok -> :ok
+        {:error, %Error{}} = error -> error
+        _unexpected -> locks_unavailable()
+      end
+    rescue
+      _exception -> locks_unavailable()
+    catch
+      :exit, _reason -> locks_unavailable()
+    end
+  end
+
+  # Release is cleanup: an unavailable or restarted lock manager has already
+  # lost the lease, and must never replace the fetch's underlying result.
+  defp release_lock(key) do
+    try do
+      _ = Locks.release(key)
+      :ok
+    rescue
+      _exception -> :ok
+    catch
+      :exit, _reason -> :ok
+    end
+  end
+
+  defp locks_unavailable do
+    {:error,
+     Error.new(:backend_error, "fetch lock manager is unavailable",
+       operation: :fetch,
+       retryable: true
+     )}
   end
 
   defp invalid(message), do: {:error, Error.new(:invalid_argument, message, operation: :fetch)}

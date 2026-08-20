@@ -165,7 +165,7 @@ pub fn fetch(request: FetchRequest, budget: &Budget) -> Result<FetchResult, Erro
     let prepared = connection
         .prepare_fetch(gix::progress::Discard, Default::default())
         .map_err(|error| map_prepare_error(&error, budget))?;
-    check_exact_refspecs(prepared.ref_map(), &request.refspecs)?;
+    check_exact_refspecs(prepared.ref_map())?;
     budget.check()?;
 
     let outcome = prepared
@@ -317,10 +317,7 @@ fn transport_options(authorization: Option<&str>, deadline: Option<Instant>) -> 
     })
 }
 
-fn check_exact_refspecs(
-    ref_map: &gix::remote::fetch::RefMap,
-    submitted_refspecs: &[String],
-) -> Result<(), Error> {
+fn check_exact_refspecs(ref_map: &gix::remote::fetch::RefMap) -> Result<(), Error> {
     for (index, spec) in ref_map.refspecs.iter().enumerate() {
         let spec_ref = spec.to_ref();
         let Some(source) = spec_ref.source() else {
@@ -336,13 +333,16 @@ fn check_exact_refspecs(
             )
         });
         if !matched {
-            let shown = submitted_refspecs
-                .get(index)
-                .map(String::as_str)
-                .unwrap_or("<unknown>");
+            // RefMap refspecs are deduplicated, so their indices cannot be
+            // used to index the caller's raw list. Render the exact spec that
+            // failed from the RefMap itself.
+            let shown = spec_ref.to_bstring();
             return Err(Error::new(
                 ErrorCode::RefNotFound,
-                format!("fetch refspec did not match a remote reference: {shown}"),
+                format!(
+                    "fetch refspec did not match a remote reference: {}",
+                    shown.to_str_lossy()
+                ),
             ));
         }
     }
@@ -402,14 +402,20 @@ fn map_updates(
             let Some(new_oid) = mapping.remote.as_id() else {
                 continue;
             };
-            let old_oid = update
-                .edit_index
-                .and_then(|index| outcome.edits.get(index))
-                .and_then(|edit| edit.change.previous_value())
-                .and_then(|target| match target {
-                    gix_ref::TargetRef::Object(oid) => Some(oid.to_string()),
-                    gix_ref::TargetRef::Symbolic(_) => None,
-                });
+            let old_oid = match action {
+                // gix represents Mode::New with an expected value equal to
+                // the new target. That is transaction machinery, not a
+                // pre-existing ref, so the public old_oid contract is nil.
+                FetchAction::Created => None,
+                FetchAction::FastForward | FetchAction::Forced => update
+                    .edit_index
+                    .and_then(|index| outcome.edits.get(index))
+                    .and_then(|edit| edit.change.previous_value())
+                    .and_then(|target| match target {
+                        gix_ref::TargetRef::Object(oid) => Some(oid.to_string()),
+                        gix_ref::TargetRef::Symbolic(_) => None,
+                    }),
+            };
             updated.push(FetchUpdatedRef {
                 name,
                 action,

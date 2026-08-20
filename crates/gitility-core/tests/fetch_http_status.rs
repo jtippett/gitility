@@ -154,10 +154,9 @@ fn real_301_is_redirect_network_error() {
     let error = gitility_core::fetch::fetch(request, &Budget::unlimited())
         .expect_err("redirect must be refused");
     assert_eq!(error.code, ErrorCode::NetworkError);
-    assert!(
-        error.message.contains("redirect"),
-        "redirect-specific message was lost: {}",
-        error.message
+    assert_eq!(
+        error.message, "fetch was redirected, but redirects are not followed",
+        "the refused 301 must survive the headers-channel io::Error wrapper"
     );
 }
 

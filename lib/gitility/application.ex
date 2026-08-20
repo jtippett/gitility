@@ -5,7 +5,7 @@ defmodule Gitility.Application do
 
   @impl Application
   def start(_type, _args) do
-    Supervisor.start_link([Gitility.Fetch.Locks],
+    Supervisor.start_link([Gitility.Fetch.Supervisor],
       strategy: :one_for_one,
       name: Gitility.Supervisor,
       max_restarts: 10,

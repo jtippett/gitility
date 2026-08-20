@@ -3527,7 +3527,7 @@ fn job_take_result<'a>(env: Env<'a>, resource: ResourceArc<JobResource>) -> NifR
     let provider_spend = resource.job.spent();
     match result {
         Ok(output)
-            if !allows_oversized_search_progress(&output)
+            if !allows_oversized_result(&output)
                 && output_payload_bytes(&output) > resource.max_result_bytes =>
         {
             let error = Error::new(
@@ -4166,6 +4166,14 @@ fn allows_oversized_search_progress(output: &JobOutput) -> bool {
     )
 }
 
+fn allows_oversized_result(output: &JobOutput) -> bool {
+    // Fetch results scale with the remote's advertised ref count, which the
+    // caller cannot bound. By the time this value is encoded, the pack and ref
+    // transaction are already committed, so discarding it is both too late
+    // and leaves the caller without a usable success result.
+    matches!(output, JobOutput::Fetch(_)) || allows_oversized_search_progress(output)
+}
+
 fn submit_error_map(error: SubmitError) -> SubmitErrorMap {
     match error {
         SubmitError::Busy {
@@ -4615,7 +4623,8 @@ fn limit_atom(limit: &str) -> Option<Atom> {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_utf8;
+    use super::{allows_oversized_result, truncate_utf8};
+    use gitility_core::{FetchResult, JobOutput};
 
     #[test]
     fn nif_error_reasons_are_capped_at_one_kibibyte_on_utf8_boundaries() {
@@ -4625,6 +4634,19 @@ mod tests {
         let multibyte = truncate_utf8("é".repeat(1_000), 1_025);
         assert!(multibyte.len() <= 1_024);
         assert!(std::str::from_utf8(multibyte.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn fetch_results_are_exempt_from_the_post_commit_result_size_cap() {
+        let output = JobOutput::Fetch(FetchResult {
+            updated_refs: Vec::new(),
+            rejected_refs: Vec::new(),
+            pruned_refs: Vec::new(),
+            remote_ref_count: 0,
+            pack_received: false,
+        });
+
+        assert!(allows_oversized_result(&output));
     }
 }
 

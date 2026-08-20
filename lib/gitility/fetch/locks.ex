@@ -74,11 +74,7 @@ defmodule Gitility.Fetch.Locks do
   def handle_call({:attach, key, holder, job}, _from, leases) do
     case holder_lease(leases, key, holder) do
       {:ok, lease} ->
-        terminal =
-          case Native.job_register_waiter(job.ref) do
-            :terminal -> true
-            :registered -> false
-          end
+        terminal = waiter_already_terminal?(job)
 
         jobs = Map.put(lease.jobs, job.id, %{job: job, terminal: terminal})
         lease = %{lease | pending: false, jobs: jobs}
@@ -173,6 +169,24 @@ defmodule Gitility.Fetch.Locks do
   end
 
   defp terminal_states, do: [:completed, :failed, :cancelled]
+
+  # An unexpected NIF return or exception must not crash the global lock
+  # manager and drop every lease in the VM. Conservatively retaining the job
+  # as non-terminal leaves release to the normal notification/holder/grace
+  # rules.
+  defp waiter_already_terminal?(job) do
+    try do
+      case Native.job_register_waiter(job.ref) do
+        :terminal -> true
+        :registered -> false
+        _unexpected -> false
+      end
+    rescue
+      _exception -> false
+    catch
+      _kind, _reason -> false
+    end
+  end
 
   defp put_or_finish(leases, key, lease) do
     if releasable?(lease) do

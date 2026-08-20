@@ -221,13 +221,12 @@ defmodule Gitility.TestSupport.SmartHTTPServer do
     ]
 
     command =
-      "dd bs=1 count=\"$CONTENT_LENGTH\" 2>/dev/null | \"$GITILITY_GIT\" http-backend"
+      "dd bs=1 count=\"$CONTENT_LENGTH\" 2>/dev/null | \"$GITILITY_GIT\" http-backend 2>/dev/null"
 
     port =
       Port.open({:spawn_executable, "/bin/sh"}, [
         :binary,
         :use_stdio,
-        :stderr_to_stdout,
         :exit_status,
         :eof,
         args: ["-c", command],
@@ -288,21 +287,34 @@ defmodule Gitility.TestSupport.SmartHTTPServer do
   end
 
   defp split_headers(output) do
-    case :binary.match(output, "\r\n\r\n") do
-      {offset, 4} ->
-        {:ok, binary_part(output, 0, offset),
-         binary_part(output, offset + 4, byte_size(output) - offset - 4)}
+    crlf = :binary.match(output, "\r\n\r\n")
+    lf = :binary.match(output, "\n\n")
 
-      :nomatch ->
-        case :binary.match(output, "\n\n") do
-          {offset, 2} ->
-            {:ok, binary_part(output, 0, offset),
-             binary_part(output, offset + 2, byte_size(output) - offset - 2)}
+    case {crlf, lf} do
+      {{crlf_offset, 4}, {lf_offset, 2}} when crlf_offset <= lf_offset ->
+        split_at(output, crlf_offset, 4)
 
-          :nomatch ->
-            :error
-        end
+      {{_crlf_offset, 4}, {lf_offset, 2}} ->
+        split_at(output, lf_offset, 2)
+
+      {{crlf_offset, 4}, :nomatch} ->
+        split_at(output, crlf_offset, 4)
+
+      {:nomatch, {lf_offset, 2}} ->
+        split_at(output, lf_offset, 2)
+
+      {:nomatch, :nomatch} ->
+        :error
     end
+  end
+
+  defp split_at(output, offset, separator_size) do
+    {:ok, binary_part(output, 0, offset),
+     binary_part(
+       output,
+       offset + separator_size,
+       byte_size(output) - offset - separator_size
+     )}
   end
 
   defp send_cgi_response(socket, request, status, headers, body, opts) do

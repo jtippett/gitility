@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Compile warning on Elixir 1.20: bound variables in binary-size matches
+  are now pinned (`binary-size(^length)`).
+
 ## 0.3.0 - 2026-08-20
 
 ### Changed

@@ -215,7 +215,7 @@ end)
 
 Rehearsal.check("log(limit: 30) matches git log order + ids", fn ->
   {:ok, page} = Gitility.log(snapshot, limit: 30)
-  ours = Enum.map(page.items, &Rehearsal.hex(&1.id))
+  ours = Enum.map(page.items, &Rehearsal.hex(&1.oid))
   theirs = Rehearsal.git_lines!(source, ["log", "--format=%H", "-n", "30", head])
 
   if ours == theirs do
@@ -232,8 +232,8 @@ Rehearsal.check("history of lib/phoenix/router.ex matches git log -- path", fn -
   ours =
     Enum.map(page.items, fn item ->
       cond do
-        match?(%OID{}, Map.get(item, :id)) -> Rehearsal.hex(item.id)
-        match?(%{commit: _}, item) -> Rehearsal.hex(item.commit.id)
+        match?(%OID{}, Map.get(item, :oid)) -> Rehearsal.hex(item.oid)
+        match?(%{commit: _}, item) -> Rehearsal.hex(item.commit.oid)
         true -> inspect(item)
       end
     end)

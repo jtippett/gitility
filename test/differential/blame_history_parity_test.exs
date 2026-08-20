@@ -86,7 +86,7 @@ defmodule Gitility.Differential.BlameHistoryParityTest do
       assert {:ok, repository} = Repository.open(repository_path)
       assert {:ok, snapshot} = Repository.snapshot(repository, {:oid, head})
       assert {:ok, page} = Gitility.history(snapshot, path, follow_renames: follow)
-      actual = Enum.map(page.items, &OID.to_string(&1.id))
+      actual = Enum.map(page.items, &OID.to_string(&1.oid))
 
       comparison =
         Allowlist.compare(
@@ -122,7 +122,7 @@ defmodule Gitility.Differential.BlameHistoryParityTest do
     assert {:ok, repository} = Repository.open(repository_path)
     assert {:ok, snapshot} = Repository.snapshot(repository, {:oid, head})
     assert {:ok, full} = Gitility.history(snapshot, path)
-    expected = Enum.map(full.items, &OID.to_string(&1.id))
+    expected = Enum.map(full.items, &OID.to_string(&1.oid))
 
     {actual, pages} = collect_history(snapshot, path, nil, [], 0)
     assert pages >= 3
@@ -131,7 +131,7 @@ defmodule Gitility.Differential.BlameHistoryParityTest do
 
   defp collect_history(snapshot, path, cursor, items, pages) do
     assert {:ok, page} = Gitility.history(snapshot, path, limit: 3, cursor: cursor)
-    items = items ++ Enum.map(page.items, &OID.to_string(&1.id))
+    items = items ++ Enum.map(page.items, &OID.to_string(&1.oid))
 
     case page.next_cursor do
       nil -> {items, pages + 1}

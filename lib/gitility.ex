@@ -114,9 +114,10 @@ defmodule Gitility do
       truncated with `truncated: true`.
     * `:limits` — a `Gitility.Limits` override.
 
-  The result's `total_lines` is `nil` when the byte budget stopped the
-  read before the whole blob could be scanned. LFS pointers are identified
-  (`lfs_pointer`) but never resolved.
+  Returns a `Gitility.File`: the payload is its `data` field (raw bytes,
+  always authoritative). `total_lines` is `nil` when the byte budget
+  stopped the read before the whole blob could be scanned. LFS pointers
+  are identified (`lfs_pointer`) but never resolved.
   """
   @spec read_file(Snapshot.t(), binary(), keyword()) :: {:ok, File.t()} | {:error, Error.t()}
   def read_file(%Snapshot{} = snapshot, path, opts \\ []) do

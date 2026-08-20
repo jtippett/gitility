@@ -138,7 +138,7 @@ defmodule Gitility.Differential.BundleParityTest do
 
       assert {:ok, source_log} = Gitility.log(source_head, limit: 25)
       assert {:ok, bundle_log} = Gitility.log(bundle_head, limit: 25)
-      assert Enum.map(bundle_log.items, & &1.id) == Enum.map(source_log.items, & &1.id)
+      assert Enum.map(bundle_log.items, & &1.oid) == Enum.map(source_log.items, & &1.oid)
 
       assert {:ok, source_tree} = Gitility.list_tree(source_head, "", recursive: true)
       assert {:ok, bundle_tree} = Gitility.list_tree(bundle_head, "", recursive: true)

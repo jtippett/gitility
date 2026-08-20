@@ -393,6 +393,39 @@ defmodule Gitility.M4b.BundleTest do
     assert_error(trailing, :malformed_object)
   end
 
+  test "trailer TOC offsets before the header boundary are refused", context do
+    path = synthetic_pair_bundle(context.directory, "toc-before-header")
+    bytes = File.read!(path)
+    trailer_offset = byte_size(bytes) - 64
+    toc_offset = 15
+    toc_len = trailer_offset - toc_offset
+    toc_sha256 = :crypto.hash(:sha256, binary_part(bytes, toc_offset, toc_len))
+
+    assert toc_offset + toc_len + 64 == byte_size(bytes)
+
+    mutate_file(
+      path,
+      trailer_offset,
+      48,
+      <<toc_offset::little-64, toc_len::little-64, toc_sha256::binary-size(32)>>
+    )
+
+    assert {:error, %Error{code: :malformed_object, message: message}} = Format.parse(path)
+    assert message =~ "TOC offset is before the section region"
+  end
+
+  test "zero generations and unknown hash algorithms are refused", context do
+    zero_generation = Path.join(context.directory, "zero-generation.bundle")
+    Support.write_bundle(zero_generation, refs: [])
+    Support.mutate_toc(zero_generation, 1, 8, <<0::little-64>>)
+    assert_error(zero_generation, :malformed_object)
+
+    unknown_hash = Path.join(context.directory, "unknown-hash.bundle")
+    Support.write_bundle(unknown_hash, refs: [])
+    Support.mutate_toc(unknown_hash, 0, 1, <<3>>)
+    assert_error(unknown_hash, :malformed_object)
+  end
+
   test "hostile section tiling, pairing, kinds, and names are validated", context do
     valid = synthetic_pair_bundle(context.directory, "section-base")
     toc = Support.toc_bytes(valid)
@@ -511,6 +544,32 @@ defmodule Gitility.M4b.BundleTest do
     assert_error(too_long, :malformed_object)
   end
 
+  test "duplicate file names and zero-length file entries are refused", context do
+    duplicate_name = Path.join(context.directory, "duplicate-file-name.bundle")
+
+    Support.write_raw_toc(
+      duplicate_name,
+      Support.raw_toc(
+        files: [
+          section_entry({:unknown, 77}, "future-section", 16, "a"),
+          section_entry({:unknown, 78}, "future-section", 17, "b")
+        ]
+      ),
+      "ab"
+    )
+
+    assert_error(duplicate_name, :malformed_object)
+
+    zero_length = Path.join(context.directory, "zero-length-file.bundle")
+
+    Support.write_raw_toc(
+      zero_length,
+      Support.raw_toc(files: [section_entry({:unknown, 77}, "empty-section", 16, <<>>)])
+    )
+
+    assert_error(zero_length, :malformed_object)
+  end
+
   test "hostile metadata/ref ordering, kinds, lengths, and minor tail follow v1 rules", context do
     target = Support.oid(:sha1, 1)
 
@@ -576,6 +635,43 @@ defmodule Gitility.M4b.BundleTest do
     assert {:ok, _parsed} = Format.parse(tail)
   end
 
+  test "metadata key and value length bounds are enforced", context do
+    for {label, metadata} <- [
+          {:empty_metadata_key, [{"", "x"}, {"source_identity", "m4b:test"}]},
+          {:oversized_metadata_key,
+           [
+             {"source_identity", "m4b:test"},
+             {:binary.copy("z", 4097), "x"}
+           ]},
+          {:oversized_metadata_value, [{"source_identity", :binary.copy("v", 65_537)}]}
+        ] do
+      path = Path.join(context.directory, "#{label}.bundle")
+      Support.write_raw_toc(path, Support.raw_toc(metadata: metadata))
+      assert_error(path, :malformed_object)
+    end
+  end
+
+  test "empty and oversized ref names are refused", context do
+    target = Support.oid(:sha1, 1)
+
+    for {label, name} <- [
+          {:empty_ref_name, ""},
+          {:oversized_ref_name, :binary.copy("r", 4097)}
+        ] do
+      path = Path.join(context.directory, "#{label}.bundle")
+
+      Support.write_raw_toc(
+        path,
+        Support.raw_toc(
+          refs: [%{name: name, target: target, kind: :commit}],
+          tail: <<0>>
+        )
+      )
+
+      assert_error(path, :malformed_object)
+    end
+  end
+
   test "nonzero reserved bytes and unknown peeled flags are refused", context do
     header_reserved = synthetic_pair_bundle(context.directory, "header-reserved")
     mutate_file(header_reserved, 12, 1, <<1>>)
@@ -596,6 +692,52 @@ defmodule Gitility.M4b.BundleTest do
     flag_offset = Support.locate_ref_kind(toc, "refs/heads/main", :sha1) + 1
     Support.mutate_toc(bad_peeled, flag_offset, 1, <<2>>)
     assert_error(bad_peeled, :malformed_object)
+  end
+
+  test "sha1 peeled flags decode present and absent values without ambiguity", context do
+    path = Path.join(context.directory, "sha1-peeled-flags.bundle")
+    peeled = Support.oid(:sha1, 3)
+
+    Support.write_bundle(path,
+      refs: [
+        %{
+          name: "refs/tags/annotated",
+          target: Support.oid(:sha1, 1),
+          kind: :tag,
+          peeled: peeled
+        },
+        %{
+          name: "refs/tags/lightweight",
+          target: Support.oid(:sha1, 2),
+          kind: :commit
+        }
+      ]
+    )
+
+    assert {:ok, %{hash_algorithm: :sha1, refs: [annotated, lightweight]}} =
+             Format.parse(path)
+
+    assert annotated.name == "refs/tags/annotated"
+    refute is_nil(annotated.peeled)
+    assert annotated.peeled == peeled.bytes
+    assert lightweight.name == "refs/tags/lightweight"
+    assert %{peeled: nil} = lightweight
+  end
+
+  test "invalid :into destinations return error tuples from the caller", context do
+    source = fixture("sha1-basic-packed.git")
+    path = Path.join(context.directory, "into-validation.bundle")
+
+    {:ok, _receipt} =
+      Bundle.write(path, source: {:repository, source}, source_identity: "fixture:into")
+
+    # Validated in the caller: a bad destination must never surface as a
+    # failed supervisor child exiting the linked caller (the test process
+    # is not trapping exits, so reaching these asserts proves it).
+    assert {:error, %Error{code: :invalid_argument}} = Bundle.start_link(path: path, into: :bogus)
+
+    assert {:error, %Error{code: :invalid_argument}} =
+             Bundle.start_link(path: path, into: {:dir, ""})
   end
 
   test "the writer refuses a table of contents beyond the v1 ceiling", context do

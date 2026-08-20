@@ -178,6 +178,7 @@ defmodule Gitility.Bundle do
       )
 
     with {:ok, path} <- required_path(opts[:path]),
+         :ok <- validate_into(opts[:into]),
          {:ok, toc} <- Format.parse(path) do
       configured =
         opts
@@ -186,6 +187,34 @@ defmodule Gitility.Bundle do
 
       Gitility.Bundle.Supervisor.start_link(configured)
     end
+  end
+
+  # Validated in the caller: an invalid destination failing inside the
+  # supervisor's child start would exit the linked caller instead of
+  # returning the documented error tuple.
+  defp validate_into(:memory) do
+    if Gitility.ODB.PackFetch.memory_supported?() do
+      :ok
+    else
+      {:error,
+       Error.new(
+         :unsupported_operation,
+         "into: :memory requires Linux /dev/shm; use into: {:dir, path}",
+         operation: :bundle_start_link
+       )}
+    end
+  end
+
+  defp validate_into({:dir, path}) when is_binary(path) and byte_size(path) > 0, do: :ok
+  defp validate_into({:bundle, path}) when is_binary(path) and byte_size(path) > 0, do: :ok
+
+  defp validate_into(_other) do
+    {:error,
+     Error.new(
+       :invalid_argument,
+       ":into must be :memory, {:dir, path}, or {:bundle, path}",
+       operation: :bundle_start_link
+     )}
   end
 
   @doc false

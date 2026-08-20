@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking**: `Gitility.Commit` fields renamed for consistency with every
+  sibling type — `id` → `oid`, `tree_id` → `tree_oid` (matching `blob_oid`,
+  `commit_oid`, `old_oid`/`new_oid` elsewhere).
+
+### Fixed
+
+- `Bundle.open/2`/`start_link/1` with an unsupported or invalid `:into`
+  destination (e.g. `into: :memory` on macOS) now returns the documented
+  error tuple instead of exiting the linked caller from inside the
+  supervisor's child start.
+- Consumers without the optional `postgrex` dependency no longer see
+  `Postgrex.* is undefined` warnings on every compile.
+- `Gitility.read_file/3` docs now name the result's `data` field.
+
 ## 0.2.0 - 2026-08-20
 
 ### Added

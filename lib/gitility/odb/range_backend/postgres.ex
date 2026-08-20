@@ -34,6 +34,10 @@ defmodule Gitility.ODB.RangeBackend.Postgres do
 
   @behaviour Gitility.ODB.RangeBackend
 
+  # Postgrex is optional; consumers without it must not see undefined-module
+  # warnings for this backend on every compile.
+  @compile {:no_warn_undefined, Postgrex}
+
   alias Gitility.ODB.RangeBackend.LocalDirectory
 
   @chunk_bytes 1024 * 1024

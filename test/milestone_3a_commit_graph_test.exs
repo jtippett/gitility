@@ -63,8 +63,8 @@ defmodule Gitility.Milestone3aCommitGraphTest do
   test "commit DTO preserves raw fields and explicit caps", %{snapshot: snapshot} do
     assert {:ok, page} = Gitility.log(snapshot, limit: 1)
     assert [%Commit{} = commit] = page.items
-    assert %OID{} = commit.id
-    assert %OID{} = commit.tree_id
+    assert %OID{} = commit.oid
+    assert %OID{} = commit.tree_oid
     assert Enum.all?(commit.parents, &match?(%OID{}, &1))
     assert is_binary(commit.author.name)
     assert is_binary(commit.author.email)
@@ -88,11 +88,11 @@ defmodule Gitility.Milestone3aCommitGraphTest do
     assert is_binary(first.next_cursor)
     assert {:ok, second} = Gitility.log(snapshot, Keyword.put(opts, :cursor, first.next_cursor))
 
-    first_ids = Enum.map(first.items, & &1.id)
-    second_ids = Enum.map(second.items, & &1.id)
+    first_ids = Enum.map(first.items, & &1.oid)
+    second_ids = Enum.map(second.items, & &1.oid)
     assert MapSet.disjoint?(MapSet.new(first_ids), MapSet.new(second_ids))
     assert {:ok, complete} = Gitility.log(snapshot, Keyword.put(opts, :limit, 1_000))
-    assert paged_ids(snapshot, opts) == Enum.map(complete.items, & &1.id)
+    assert paged_ids(snapshot, opts) == Enum.map(complete.items, & &1.oid)
 
     for changed <- [
           Keyword.put(opts, :order, :topological),
@@ -194,7 +194,7 @@ defmodule Gitility.Milestone3aCommitGraphTest do
     snapshot: snapshot
   } do
     assert {:ok, complete} = Gitility.log(snapshot)
-    commit_oids = Enum.map(complete.items, & &1.id)
+    commit_oids = Enum.map(complete.items, & &1.oid)
     assert {:ok, values} = ODB.read_many(repository.odb, commit_oids)
     objects = Map.reject(values, fn {_oid, value} -> value == :not_found end)
 
@@ -258,7 +258,7 @@ defmodule Gitility.Milestone3aCommitGraphTest do
 
   defp paged_ids(snapshot, opts, cursor \\ nil, accumulated \\ []) do
     assert {:ok, page} = Gitility.log(snapshot, Keyword.put(opts, :cursor, cursor))
-    accumulated = accumulated ++ Enum.map(page.items, & &1.id)
+    accumulated = accumulated ++ Enum.map(page.items, & &1.oid)
 
     if page.next_cursor do
       paged_ids(snapshot, opts, page.next_cursor, accumulated)

@@ -258,9 +258,9 @@ defmodule Gitility.NativeSupport do
     items =
       Enum.map(commits, fn commit ->
         %Commit{
-          id: job_oid(commit.id),
+          oid: job_oid(commit.id),
           parents: Enum.map(commit.parents, &job_oid/1),
-          tree_id: job_oid(commit.tree_id),
+          tree_oid: job_oid(commit.tree_id),
           author: identity_payload(commit.author),
           committer: identity_payload(commit.committer),
           subject: commit.subject,

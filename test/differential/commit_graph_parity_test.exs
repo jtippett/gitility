@@ -27,7 +27,7 @@ defmodule Gitility.Differential.CommitGraphParityTest do
         assert {:ok, head} = Oracle.rev_parse(repository_path, "main")
         assert {:ok, snapshot} = Snapshot.open(repository.odb, head)
         assert {:ok, page} = Gitility.log(snapshot, unquote(gitility_options))
-        actual = Enum.map(page.items, &OID.to_string(&1.id))
+        actual = Enum.map(page.items, &OID.to_string(&1.oid))
 
         assert :ok =
                  Allowlist.compare(
@@ -59,7 +59,7 @@ defmodule Gitility.Differential.CommitGraphParityTest do
       assert {:ok, tip} = Oracle.rev_parse(repository_path, "fixture/equal-merge")
       assert {:ok, snapshot} = Snapshot.open(repository.odb, tip)
       assert {:ok, page} = Gitility.log(snapshot, unquote(gitility_options))
-      assert Enum.map(page.items, &OID.to_string(&1.id)) == expected
+      assert Enum.map(page.items, &OID.to_string(&1.oid)) == expected
     end
   end
 
@@ -81,7 +81,7 @@ defmodule Gitility.Differential.CommitGraphParityTest do
       assert {:ok, head} = Oracle.rev_parse(repository_path, "main")
       assert {:ok, snapshot} = Snapshot.open(repository.odb, head)
       assert {:ok, page} = Gitility.log(snapshot, gitility_options)
-      actual = Enum.map(page.items, &OID.to_string(&1.id))
+      actual = Enum.map(page.items, &OID.to_string(&1.oid))
 
       assert :ok =
                Allowlist.compare(
@@ -106,7 +106,7 @@ defmodule Gitility.Differential.CommitGraphParityTest do
     assert {:ok, head} = Oracle.rev_parse(repository_path, "main")
     assert {:ok, snapshot} = Snapshot.open(repository.odb, head)
     assert {:ok, page} = Gitility.log(snapshot, since: since)
-    assert Enum.map(page.items, &OID.to_string(&1.id)) == expected
+    assert Enum.map(page.items, &OID.to_string(&1.oid)) == expected
   end
 
   for {case_name, left, right} <- [

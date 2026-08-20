@@ -10,9 +10,9 @@ defmodule Gitility.Commit do
   """
 
   @enforce_keys [
-    :id,
+    :oid,
     :parents,
-    :tree_id,
+    :tree_oid,
     :author,
     :committer,
     :subject,
@@ -21,9 +21,9 @@ defmodule Gitility.Commit do
     :message_truncated
   ]
   defstruct [
-    :id,
+    :oid,
     :parents,
-    :tree_id,
+    :tree_oid,
     :subject,
     :subject_truncated,
     :author,
@@ -35,9 +35,9 @@ defmodule Gitility.Commit do
   ]
 
   @type t :: %__MODULE__{
-          id: Gitility.OID.t(),
+          oid: Gitility.OID.t(),
           parents: [Gitility.OID.t()],
-          tree_id: Gitility.OID.t(),
+          tree_oid: Gitility.OID.t(),
           author: Gitility.Identity.t(),
           committer: Gitility.Identity.t(),
           subject: binary(),

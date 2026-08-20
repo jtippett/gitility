@@ -172,15 +172,15 @@ defmodule Gitility.Milestone3dBlameHistoryTest do
     assert pages >= 3
     assert Enum.all?(items, &match?(%Commit{}, &1))
 
-    ids = MapSet.new(items, &OID.to_string(&1.id))
+    ids = MapSet.new(items, &OID.to_string(&1.oid))
     assert fixture_oid(:sha1_blame_root) in ids
     assert fixture_oid(:sha1_blame_rewrite) in ids
     assert fixture_oid(:sha1_blame_rename) in ids
 
     assert %Commit{
-             id: %OID{} = root_id,
+             oid: %OID{} = root_id,
              parents: [],
-             tree_id: %OID{},
+             tree_oid: %OID{},
              author: %Gitility.Identity{
                name: "Alice Attribution",
                email: "alice@gitility.invalid",
@@ -201,7 +201,7 @@ defmodule Gitility.Milestone3dBlameHistoryTest do
              message_truncated: false,
              signature_headers: [],
              encoding: nil
-           } = Enum.find(items, &(OID.to_string(&1.id) == fixture_oid(:sha1_blame_root)))
+           } = Enum.find(items, &(OID.to_string(&1.oid) == fixture_oid(:sha1_blame_root)))
 
     assert OID.to_string(root_id) == fixture_oid(:sha1_blame_root)
 

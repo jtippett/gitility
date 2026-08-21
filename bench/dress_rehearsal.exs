@@ -14,7 +14,7 @@
 
 Code.require_file("../test/support/smart_http_server.ex", __DIR__)
 
-alias Gitility.{Bundle, Fetch, Repository, RefDB, OID, Limits}
+alias Gitility.{Bundle, Fetch, Limits, Mirror, OID, RefDB, Repository}
 alias Gitility.ODB.PackFetch
 
 defmodule Rehearsal do
@@ -453,6 +453,113 @@ Rehearsal.check("fetched repository opens and serves spot queries", fn ->
       {:ok, "README #{byte_size(file.data)} bytes; #{length(page.items)} tree entries"}
     else
       {:fail, "fetched query results differ from the source"}
+    end
+  else
+    other -> {:fail, inspect(other)}
+  end
+end)
+
+IO.puts(
+  "\n=== Flow D: fetch mirror → publish Local → restore → query → incremental fetch → publish ==="
+)
+
+replication_source = Path.join(workdir, "replication-source.git")
+replication_restored = Path.join(workdir, "replication-restored.git")
+replication_store = {Gitility.ObjectStore.Local, [root: Path.join(workdir, "mirror-store")]}
+replication_key = "rehearsal/phoenix.bundle"
+replication_refspecs = ["+refs/heads/*:refs/remotes/origin/*"]
+
+Rehearsal.check("replication source fetch", fn ->
+  case Fetch.fetch(replication_source, fetch_url, replication_refspecs, timeout_ms: 120_000) do
+    {:ok, result} when result.remote_ref_count > 0 and result.pack_received ->
+      {:ok, "remote_refs=#{result.remote_ref_count} updates=#{length(result.updated_refs)}"}
+
+    other ->
+      {:fail, inspect(other)}
+  end
+end)
+
+Rehearsal.check("publish generation 1 to ObjectStore.Local", fn ->
+  case Mirror.publish(replication_source, replication_store, replication_key,
+         timeout: 120_000,
+         source_identity: "rehearsal:mirror-replication"
+       ) do
+    {:ok, %{generation: 1, ref_count: ref_count, file_count: file_count}}
+    when ref_count > 0 and file_count > 0 ->
+      {:ok, "generation=1 refs=#{ref_count} files=#{file_count}"}
+
+    other ->
+      {:fail, inspect(other)}
+  end
+end)
+
+Rehearsal.check("restore generation 1 as an ordinary bare mirror", fn ->
+  case Mirror.restore(replication_store, replication_key, replication_restored, timeout: 120_000) do
+    {:ok, %{generation: 1, ref_count: ref_count}} when ref_count > 0 ->
+      {:ok, "generation=1 refs=#{ref_count}"}
+
+    other ->
+      {:fail, inspect(other)}
+  end
+end)
+
+Rehearsal.check("restored mirror has Flow A query parity", fn ->
+  source_refs =
+    replication_source
+    |> Rehearsal.git_lines!(["for-each-ref", "--format=%(refname) %(objectname)"])
+    |> MapSet.new()
+
+  restored_refs =
+    replication_restored
+    |> Rehearsal.git_lines!(["for-each-ref", "--format=%(refname) %(objectname)"])
+    |> MapSet.new()
+
+  with true <- source_refs == restored_refs,
+       {:ok, restored_repo} <- Repository.open(replication_restored, require_bare: true),
+       {:ok, restored_snapshot} <- Repository.snapshot(restored_repo, {:oid, OID.parse!(head)}),
+       {:ok, file} <- Gitility.read_file(restored_snapshot, "README.md"),
+       {:ok, tree} <- Gitility.list_tree(restored_snapshot, "lib/phoenix", limit: 20) do
+    expected = Rehearsal.git!(source, ["show", "#{head}:README.md"])
+
+    if file.data == expected and tree.items != [] do
+      {:ok, "#{MapSet.size(restored_refs)} refs; README and tree match"}
+    else
+      {:fail, "restored Flow A query content differs"}
+    end
+  else
+    false -> {:fail, "restored refs differ from the fetched replication source"}
+    other -> {:fail, inspect(other)}
+  end
+end)
+
+Rehearsal.check("incremental fetch then conditional republish converges", fn ->
+  before_refs =
+    replication_restored
+    |> Rehearsal.git_lines!(["for-each-ref", "--format=%(refname) %(objectname)"])
+    |> MapSet.new()
+
+  with {:ok, fetch_result} <-
+         Fetch.fetch(replication_restored, fetch_url, replication_refspecs, timeout_ms: 120_000),
+       after_refs =
+         replication_restored
+         |> Rehearsal.git_lines!(["for-each-ref", "--format=%(refname) %(objectname)"])
+         |> MapSet.new(),
+       publish_result <-
+         Mirror.publish(replication_restored, replication_store, replication_key,
+           timeout: 120_000,
+           source_identity: "rehearsal:mirror-replication"
+         ) do
+    moved = before_refs != after_refs or fetch_result.updated_refs != []
+
+    case {moved, publish_result} do
+      {false, {:ok, :not_newer}} ->
+        {:ok, "remote unchanged; :not_newer"}
+
+      {true, {:ok, %{generation: 2}}} ->
+        {:ok, "remote moved; generation=2"}
+
+      other ->
+        {:fail, "incremental publish disagreed with remote movement: #{inspect(other)}"}
     end
   else
     other -> {:fail, inspect(other)}

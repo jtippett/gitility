@@ -24,6 +24,8 @@ defmodule Gitility.Native do
   def runtime_shutdown(_runtime), do: :erlang.nif_error(:nif_not_loaded)
   def runtime_stats(_runtime), do: :erlang.nif_error(:nif_not_loaded)
   def open_local(_path, _opts), do: :erlang.nif_error(:nif_not_loaded)
+  def repo_init_bare(_path, _hash), do: :erlang.nif_error(:nif_not_loaded)
+  def repo_write_refs(_path, _refs, _head), do: :erlang.nif_error(:nif_not_loaded)
   def static_from_objects(_objects, _hash), do: :erlang.nif_error(:nif_not_loaded)
   def provider_store_new(_hash, _opts), do: :erlang.nif_error(:nif_not_loaded)
   def ref_provider_store_new(_opts), do: :erlang.nif_error(:nif_not_loaded)

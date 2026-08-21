@@ -17,6 +17,15 @@ jobs:
   test:
     name: Test & lint (Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
     runs-on: ubuntu-latest
+    services:
+      minio:
+        image: quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z@sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0
+        command: server /data
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: gitility-ci-access
+          MINIO_ROOT_PASSWORD: gitility-ci-secret-2025-07-23
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +41,10 @@ jobs:
     env:
       MIX_ENV: test
       GITILITY_BUILD: "1"
+      GITILITY_MINIO_URL: http://127.0.0.1:9000
+      GITILITY_MINIO_KEY: gitility-ci-access
+      GITILITY_MINIO_SECRET: gitility-ci-secret-2025-07-23
+      GITILITY_MINIO_BUCKET: gitility-test
     steps:
       - uses: actions/checkout@v7
 
@@ -127,6 +140,22 @@ jobs:
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
+
+      - name: Prepare required MinIO conformance bucket
+        run: |
+          ready=0
+          for attempt in $(seq 1 120); do
+            if curl -fsS "$GITILITY_MINIO_URL/minio/health/live" >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "MinIO failed readiness" >&2
+            exit 1
+          fi
+          mix run --no-compile -e 'Gitility.TestSupport.MinioHelper.create_bucket_from_env!()'
 
       - name: Clippy (workspace)
         run: cargo clippy --workspace --all-targets -- -D warnings

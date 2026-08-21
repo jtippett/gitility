@@ -86,6 +86,46 @@ Fetches are single-flight per expanded destination path and use a dedicated
 two-worker runtime by default. Query APIs remain snapshot-pinned and read-only;
 fetch is the sole path that writes refs and objects in a real Git directory.
 
+## Replicating mirrors
+
+`Gitility.Mirror` replicates ordinary bare repositories through conditional
+object-store writes. The scheduler loop is **restore on a cold node → fetch
+from the remote → publish**. The result on disk is still a normal bare
+repository, so existing snapshot and query code does not change.
+
+```elixir
+mirror = "/srv/git/acme/widgets.git"
+key = "mirrors/acme/widgets.bundle"
+store = {Gitility.ObjectStore.Local, [root: "/srv/gitility-replication"]}
+
+# Run restore only when the local mirror is absent or empty.
+case Gitility.Mirror.restore(store, key, mirror) do
+  {:ok, _restore} -> :ok
+  {:error, %Gitility.Error{code: :not_found}} -> :ok
+end
+
+{:ok, _fetch} =
+  Gitility.Fetch.fetch(
+    mirror,
+    "https://github.com/acme/widgets.git",
+    ["+refs/heads/*:refs/remotes/origin/*"]
+  )
+
+{:ok, _receipt_or_not_newer} = Gitility.Mirror.publish(mirror, store, key)
+```
+
+`ObjectStore.Local` coordinates one VM and is useful for a local volume or
+tests. `ObjectStore.S3` targets AWS S3, MinIO, R2, and Tigris; it requires the
+optional `{:req, "~> 0.5.8"}` dependency and a store with conditional writes.
+Stored bundles are transport artifacts: restore them instead of opening them
+as a shared filesystem. A contended local lease returns `:busy`, a lost
+conditional-write race returns `:conflict`, and an unchanged publication
+returns `:not_newer`, so the caller's scheduler owns retry policy.
+
+The recorded M4 rehearsal corpus was 26 MB. In a fresh process, budget roughly
+700 ms for the first query while the native runtime warms; later queries reuse
+it. No additional consumer-specific timing is claimed here.
+
 ## Bundles: a repository in one file
 
 `Gitility.Bundle` clones a repository into **one flat file** — packs,

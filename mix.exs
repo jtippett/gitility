@@ -39,6 +39,7 @@ defmodule Gitility.MixProject do
       {:rustler_precompiled, "~> 0.9"},
       {:jason, "~> 1.4"},
       {:postgrex, "~> 0.22.4", optional: true},
+      {:req, "~> 0.5.8", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
@@ -55,6 +56,7 @@ defmodule Gitility.MixProject do
       },
       files: ~w(lib Cargo.toml Cargo.lock native/gitility/Cargo.toml native/gitility/src
            crates/gitility-core/Cargo.toml crates/gitility-core/src crates/gitility-core/vendor
+           crates/gitility-core/benches/verify_tax.rs
            checksum-Elixir.Gitility.Native.exs .formatter.exs mix.exs
            README.md CHANGELOG.md LICENSE docs/format/bundle-v1.md)
     ]
@@ -69,7 +71,18 @@ defmodule Gitility.MixProject do
         "CHANGELOG.md": []
       ],
       source_url: @source_url,
-      source_ref: "v#{@version}"
+      source_ref: "v#{@version}",
+      groups_for_modules: [
+        "Mirror replication": [
+          Gitility.Mirror,
+          Gitility.Mirror.Receipt,
+          Gitility.Mirror.Restore,
+          Gitility.ObjectStore,
+          Gitility.ObjectStore.Conformance,
+          Gitility.ObjectStore.Local,
+          Gitility.ObjectStore.S3
+        ]
+      ]
     ]
   end
 end

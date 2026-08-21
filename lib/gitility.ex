@@ -179,6 +179,10 @@ defmodule Gitility do
   @doc """
   Searches blob contents across the snapshot.
 
+  Use the `**/glob` idiom for matches at any depth: for example,
+  `pathspecs: ["**/*.ex"]` matches Elixir files both at the repository root
+  and below it, while `"*.ex"` does not cross `/`.
+
   The scan walks the tree, deduplicates match spans by object ID, and scans
   within strict budgets. Duplicate paths may physically re-read a payload to
   materialize results without retaining blob-sized cache entries. (A
@@ -312,19 +316,24 @@ defmodule Gitility do
     * `:follow_renames` — follow the path across renames (default `true`).
     * `:limit`, `:cursor` — pagination.
     * `:limits` — a `Gitility.Limits` override.
+
+  `:since` and `:until` are `log/2` options, not path-history options.
+  Passing either returns a typed `:invalid_argument` error naming the option.
   """
   @spec history(Snapshot.t(), binary(), keyword()) ::
           {:ok, Page.t(Gitility.Commit.t())} | {:error, Error.t()}
   def history(snapshot, path, opts \\ [])
 
   def history(%Snapshot{} = snapshot, path, opts) do
-    {opts, limits} = history_options!(opts)
+    with :ok <- reject_history_time_options(opts) do
+      {opts, limits} = history_options!(opts)
 
-    NativeSupport.await_sync(
-      fn -> submit_history(snapshot, path, opts, limits, false) end,
-      limits.timeout_ms,
-      :history
-    )
+      NativeSupport.await_sync(
+        fn -> submit_history(snapshot, path, opts, limits, false) end,
+        limits.timeout_ms,
+        :history
+      )
+    end
   end
 
   def history(_snapshot, _path, _opts) do
@@ -357,6 +366,9 @@ defmodule Gitility do
       opt-in because it reads candidate payloads. It buffers and scores
       `O(changes)` candidates before the first record; diff ceilings bound
       output, not this detection phase (timeouts and byte limits still apply).
+      The similarity threshold is 50%; on tiny files, even a small edit can
+      put a move below that threshold so it appears as a deletion plus an
+      addition, matching Git.
     * `:copies` — retained in the API surface, but only `false` is accepted in
       0.x. `true` returns `:unsupported_operation` because the current upstream
       tracker can score a post-image blob and suppress the modified source
@@ -862,6 +874,27 @@ defmodule Gitility do
     {opts, limits}
   end
 
+  defp reject_history_time_options(opts) do
+    case history_time_option(opts) do
+      nil ->
+        :ok
+
+      option ->
+        {:error,
+         Error.new(
+           :invalid_argument,
+           ":#{option} is not supported by history/3; use log/2 for commit-time bounds",
+           operation: :history,
+           details: %{option: option}
+         )}
+    end
+  end
+
+  defp history_time_option([{:since, _value} | _rest]), do: :since
+  defp history_time_option([{:until, _value} | _rest]), do: :until
+  defp history_time_option([_option | rest]), do: history_time_option(rest)
+  defp history_time_option(_opts), do: nil
+
   defp blame_options!(opts) do
     opts = Keyword.validate!(opts, lines: nil, follow_renames: true, limits: nil)
     limits = opts[:limits] || Limits.new()
@@ -1257,18 +1290,20 @@ defmodule Gitility do
   def async_history(snapshot, path, opts \\ [])
 
   def async_history(%Snapshot{} = snapshot, path, opts) do
-    opts =
-      Keyword.validate!(opts,
-        follow_renames: true,
-        limit: 1_000,
-        cursor: nil,
-        limits: nil,
-        detach: false
-      )
+    with :ok <- reject_history_time_options(opts) do
+      opts =
+        Keyword.validate!(opts,
+          follow_renames: true,
+          limit: 1_000,
+          cursor: nil,
+          limits: nil,
+          detach: false
+        )
 
-    detach = NativeSupport.boolean_option!(opts, :detach)
-    {opts, limits} = opts |> Keyword.delete(:detach) |> history_options!()
-    submit_history(snapshot, path, opts, limits, detach)
+      detach = NativeSupport.boolean_option!(opts, :detach)
+      {opts, limits} = opts |> Keyword.delete(:detach) |> history_options!()
+      submit_history(snapshot, path, opts, limits, detach)
+    end
   end
 
   def async_history(_snapshot, _path, _opts) do

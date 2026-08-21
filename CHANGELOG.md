@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `Gitility.Mirror.publish/4` and `restore/4` for conditional, generation-aware
+  replication of bare mirrors through object stores.
+- `Gitility.ObjectStore`, the `Local` and optional-Req `S3` adapters, and the
+  reusable `Gitility.ObjectStore.Conformance` suite.
+- `Gitility.Repository.init_bare/2` for failure-atomic creation of gc-safe bare
+  repositories.
+- `Gitility.Bundle.write/2` options `:generation`, `:strict_refs`, and `:mode`.
+
+### Changed
+
+- Every bare repository created by Gitility is gc-safe: automatic gc,
+  maintenance, and receive autogc are disabled. Existing repositories are
+  never reconfigured.
+- Added stable error codes `:not_found`, `:conflict`, and `:malformed_bundle`.
+
+### Fixed
+
+- `Gitility.history/3` and `async_history/3` now return typed
+  `:invalid_argument` errors naming unsupported `:since` or `:until` options
+  instead of raising for an unknown option.
+
 ## 0.4.0 - 2026-08-20
 
 ### Added

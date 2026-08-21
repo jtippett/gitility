@@ -36,6 +36,8 @@ pub mod pathspec;
 pub mod provider_odb;
 pub mod provider_refs;
 pub mod refs;
+#[cfg(feature = "fetch")]
+pub mod repo_admin;
 mod rewrite;
 pub mod runtime;
 pub mod search;
@@ -92,6 +94,8 @@ pub use refs::{
     resolve_symbolic, validate_full_ref_name, LocalRefDb, RefDb, RefPage, RefQuery, RefTarget,
     RefWarning, MAX_REF_NAME_BYTES, MAX_SYMBOLIC_REF_HOPS,
 };
+#[cfg(feature = "fetch")]
+pub use repo_admin::{init_bare, write_refs};
 pub use runtime::{
     BusyReason, Job, JobObserver, JobOutput, JobSpec, JobState, JobTask, OwnerKey, ReadManyOutput,
     Runtime, RuntimeConfig, RuntimeCounters, SubmitError, TestObserver,

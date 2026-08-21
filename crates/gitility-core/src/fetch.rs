@@ -5,6 +5,7 @@
 //! runtime worker and reserves the dependency threads it may create from the
 //! same process-wide thread budget as Gitility's own runtime threads.
 
+use crate::repo_admin::init_bare_repo;
 use crate::runtime::thread_budget;
 use crate::{Budget, Error, ErrorCode};
 use bstr::{BStr, BString, ByteSlice};
@@ -252,19 +253,7 @@ fn open_or_init_bare(path: &Path) -> Result<gix::Repository, Error> {
     };
 
     let repo = if initialize {
-        gix::ThreadSafeRepository::init_opts(
-            path,
-            gix::create::Kind::Bare,
-            gix::create::Options::default(),
-            gix::open::Options::isolated(),
-        )
-        .map(|repo| repo.to_thread_local())
-        .map_err(|_| {
-            Error::new(
-                ErrorCode::InvalidArgument,
-                "fetch destination could not be initialized as a bare repository",
-            )
-        })?
+        init_bare_repo(path)?
     } else {
         gix::open_opts(path, gix::open::Options::isolated()).map_err(map_open_error)?
     };

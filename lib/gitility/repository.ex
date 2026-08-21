@@ -7,6 +7,15 @@ defmodule Gitility.Repository do
   every query takes a snapshot, and a snapshot needs only an ODB and a
   commit ID.
 
+  `init_bare/2` creates a SHA-1 bare repository with automatic garbage
+  collection and maintenance disabled. Every bare directory created by
+  Gitility has that gc-safe configuration; Gitility does not retrofit or
+  otherwise change repositories it did not create.
+
+  Opening is intentionally cheap. The first query in a fresh process also
+  starts and warms the native runtime and may take roughly 700 ms; subsequent
+  queries reuse it.
+
   ## Selectors
 
   Safe selectors resolve a name through the repository's stores:
@@ -41,6 +50,28 @@ defmodule Gitility.Repository do
           | {:tag, binary()}
           | :head
           | {:revspec, String.t()}
+
+  @doc """
+  Creates a gc-safe bare SHA-1 repository.
+
+  The destination must be absent or an empty directory. Creation is not
+  idempotent: a non-empty destination is rejected and never modified. Parent
+  directories are created as needed. `hash: :sha256` is reported as
+  `:unsupported_hash` before the filesystem is touched.
+  """
+  @spec init_bare(Path.t(), keyword()) :: :ok | {:error, Error.t()}
+  def init_bare(path, opts \\ []) do
+    with :ok <- validate_init_path(path),
+         {:ok, options} <- validate_init_options(opts),
+         :ok <- validate_init_hash(options.hash),
+         expanded <- Path.expand(path),
+         :ok <- validate_init_destination(expanded) do
+      case Native.repo_init_bare(expanded, options.hash) do
+        :ok -> :ok
+        {:error, error} -> {:error, NativeSupport.nif_error(error, :repository_init_bare)}
+      end
+    end
+  end
 
   @doc """
   Opens a local repository directory — bare or normal, though queries never
@@ -244,5 +275,80 @@ defmodule Gitility.Repository do
       {:error, %Error{} = error} ->
         {:error, error}
     end
+  end
+
+  defp validate_init_path(path) when is_binary(path) and byte_size(path) > 0 do
+    if String.valid?(path) and not String.contains?(path, <<0>>) do
+      :ok
+    else
+      init_invalid("repository path must be valid UTF-8 without NUL bytes")
+    end
+  end
+
+  defp validate_init_path(_path), do: init_invalid("repository path must be a non-empty binary")
+
+  defp validate_init_options(opts) when is_list(opts) do
+    if proper_list?(opts) do
+      Enum.reduce_while(opts, {:ok, %{hash: :sha1}}, fn
+        {:hash, value}, {:ok, options} when value in [:sha1, :sha256] ->
+          {:cont, {:ok, %{options | hash: value}}}
+
+        {key, _value}, _acc when is_atom(key) ->
+          {:halt, init_invalid("unknown or invalid init_bare option: #{inspect(key)}")}
+
+        _malformed, _acc ->
+          {:halt, init_invalid("init_bare options must be a keyword list")}
+      end)
+    else
+      init_invalid("init_bare options must be a keyword list")
+    end
+  end
+
+  defp validate_init_options(_opts), do: init_invalid("init_bare options must be a keyword list")
+
+  defp validate_init_hash(:sha1), do: :ok
+
+  defp validate_init_hash(:sha256) do
+    {:error,
+     Error.new(:unsupported_hash, "SHA-256 bare repositories are not supported",
+       operation: :repository_init_bare
+     )}
+  end
+
+  defp validate_init_destination(path) do
+    case File.lstat(path) do
+      {:error, :enoent} ->
+        :ok
+
+      {:ok, %{type: :directory}} ->
+        case File.ls(path) do
+          {:ok, []} -> :ok
+          {:ok, _entries} -> init_invalid("repository path must not exist or must be empty")
+          {:error, reason} -> init_io_error("could not inspect repository directory", reason)
+        end
+
+      {:ok, _stat} ->
+        init_invalid("repository path must not exist or must be an empty directory")
+
+      {:error, reason} ->
+        init_io_error("could not inspect repository path", reason)
+    end
+  end
+
+  defp proper_list?([]), do: true
+  defp proper_list?([_head | tail]), do: proper_list?(tail)
+  defp proper_list?(_tail), do: false
+
+  defp init_invalid(message) do
+    {:error, Error.new(:invalid_argument, message, operation: :repository_init_bare)}
+  end
+
+  defp init_io_error(message, reason) do
+    {:error,
+     Error.new(:backend_error, message,
+       operation: :repository_init_bare,
+       retryable: reason in [:eagain, :eintr, :eio, :emfile, :enfile, :estale],
+       details: %{reason: reason}
+     )}
   end
 end

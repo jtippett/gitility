@@ -13,6 +13,7 @@ defmodule Gitility.Bundle.Writer do
     metadata = Keyword.fetch!(opts, :metadata)
     refs = Keyword.fetch!(opts, :refs)
     warnings = Keyword.get(opts, :warnings, [])
+    mode = Keyword.get(opts, :mode)
     directory = Path.dirname(path)
     suffix = System.unique_integer([:positive, :monotonic])
     temp = Path.join(directory, ".#{Path.basename(path)}.tmp-#{suffix}")
@@ -22,7 +23,8 @@ defmodule Gitility.Bundle.Writer do
            {:ok, output} <- File.open(temp, [:write, :binary, :exclusive]) do
         result =
           try do
-            with :ok <- IO.binwrite(output, Format.encode_header()),
+            with :ok <- apply_mode(temp, mode),
+                 :ok <- IO.binwrite(output, Format.encode_header()),
                  {:ok, files, toc_offset} <- stream_pairs(pairs, output, 16, []),
                  toc <-
                    Format.encode_toc(%{
@@ -71,6 +73,15 @@ defmodule Gitility.Bundle.Writer do
       :ok
     else
       {:error, {:toc_too_large, byte_size(toc), Format.max_toc_len()}}
+    end
+  end
+
+  defp apply_mode(_temp, nil), do: :ok
+
+  defp apply_mode(temp, mode) do
+    case File.chmod(temp, mode) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:temp_chmod_failed, reason}}
     end
   end
 

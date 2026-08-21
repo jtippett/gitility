@@ -19,7 +19,10 @@
 #   postgres install/start PostgreSQL, create the peer-auth test role/database
 #            used by M2e's optional reference-backend conformance suite
 #   mix      GITILITY_BUILD=1 mix test (differential gate included, needs
-#            the pinned git 2.55.0 the provisioning step built)
+#            the pinned git 2.55.0 the provisioning step built); starts the
+#            pinned, checksum-verified MinIO required by M6
+#   rehearsal run all real-world flows, including M6 restore/fetch/publish
+#            Flow D, against ~/rehearsal/phoenix.git
 #   soak     GITILITY_BUILD=1 mix test --only soak (the 30s runtime soak)
 #   smoke    prove the thread cap wraps a trivial command (not in default set)
 #
@@ -38,7 +41,7 @@ SPRITE_NAME="${SPRITE:-gitility-test-2}"
 REMOTE_DIR="${GITILITY_REMOTE_DIR:-\$HOME/gitility}"
 PIDS_MAX="${GITILITY_REMOTE_PIDS_MAX:-2000}"
 STAGES=("$@")
-[ ${#STAGES[@]} -eq 0 ] && STAGES=(sync rust loom postgres mix soak)
+[ ${#STAGES[@]} -eq 0 ] && STAGES=(sync rust loom postgres mix rehearsal soak)
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
@@ -158,6 +161,173 @@ run_stage() {
 capped bash -c '$cmd'"
 }
 
+stage_mix() {
+  local command
+  command=$(cat <<'GITILITY_MIX_STAGE'
+set -euo pipefail
+
+minio_release="RELEASE.2025-07-23T15-54-02Z"
+minio_name="minio.${minio_release}"
+minio_cache="$HOME/minio"
+minio_binary="$minio_cache/$minio_name"
+minio_download="$minio_binary.download"
+checksum_file="$(pwd)/scripts/minio.sha256"
+
+mkdir -p "$minio_cache"
+
+verify_minio() {
+  (cd "$minio_cache" && sha256sum --check "$checksum_file")
+}
+
+if ! verify_minio >/dev/null 2>&1; then
+  rm -f -- "$minio_binary" "$minio_download"
+  curl -fsSL --retry 8 --retry-all-errors --connect-timeout 20 \
+    -o "$minio_download" \
+    "https://dl.min.io/server/minio/release/linux-amd64/archive/$minio_name"
+  chmod 0755 "$minio_download"
+  mv "$minio_download" "$minio_binary"
+fi
+
+if ! verify_minio; then
+  rm -f -- "$minio_binary"
+  echo "[remote] pinned MinIO checksum verification failed" >&2
+  exit 1
+fi
+
+chmod 0755 "$minio_binary"
+
+minio_scratch="$(mktemp -d "${TMPDIR:-/tmp}/gitility-minio.XXXXXX")"
+minio_data="$minio_scratch/data"
+minio_log="$minio_scratch/minio.log"
+minio_pid=""
+mkdir -p "$minio_data"
+
+cleanup_minio() {
+  if [ -n "$minio_pid" ] && kill -0 "$minio_pid" 2>/dev/null; then
+    kill "$minio_pid" 2>/dev/null || true
+    wait "$minio_pid" 2>/dev/null || true
+  fi
+  rm -rf -- "$minio_scratch"
+}
+trap cleanup_minio EXIT INT TERM
+
+minio_port=$(python3 - <<'PYTHON'
+import socket
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.bind(("127.0.0.1", 0))
+print(listener.getsockname()[1])
+listener.close()
+PYTHON
+)
+
+random_hex() {
+  od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'
+}
+
+export MINIO_ROOT_USER="gitility$(random_hex 8)"
+export MINIO_ROOT_PASSWORD="gitility$(random_hex 24)"
+export GITILITY_MINIO_URL="http://127.0.0.1:${minio_port}"
+export GITILITY_MINIO_KEY="$MINIO_ROOT_USER"
+export GITILITY_MINIO_SECRET="$MINIO_ROOT_PASSWORD"
+export GITILITY_MINIO_BUCKET="gitility-test"
+
+"$minio_binary" server "$minio_data" --address "127.0.0.1:${minio_port}" \
+  >"$minio_log" 2>&1 &
+minio_pid=$!
+
+minio_ready=0
+for _attempt in $(seq 1 120); do
+  if curl -fsS "$GITILITY_MINIO_URL/minio/health/live" >/dev/null; then
+    minio_ready=1
+    break
+  fi
+
+  if ! kill -0 "$minio_pid" 2>/dev/null; then
+    break
+  fi
+
+  sleep 0.25
+done
+
+if [ "$minio_ready" -ne 1 ]; then
+  echo "[remote] required pinned MinIO failed readiness" >&2
+  exit 1
+fi
+echo "[remote] MinIO $minio_release ready on 127.0.0.1:${minio_port}"
+
+export MIX_ENV=test
+mix local.hex --force >/dev/null
+mix local.rebar --force >/dev/null
+mix deps.get >/dev/null
+mix compile --warnings-as-errors
+mix run --no-compile -e 'Gitility.TestSupport.MinioHelper.create_bucket_from_env!()'
+echo "[remote] MinIO bucket $GITILITY_MINIO_BUCKET ready"
+
+status=0
+out=$(mix test 2>&1) || status=$?
+echo "$out" | grep -B 2 -A 25 "^  *[0-9][0-9]*[)] test" || true
+echo "$out" | tail -15
+[ "$status" -eq 0 ] || exit "$status"
+
+repeat_file() {
+  local label="$1" file="$2"
+
+  if [ ! -f "$file" ]; then
+    echo "[remote] required repetition file is missing: $file" >&2
+    exit 1
+  fi
+
+  for run in $(seq 1 12); do
+    echo "[remote] $label repetition $run/12"
+    mix test "$file"
+  done
+}
+
+repeat_file "M5a" "test/milestone_5a_fetch_test.exs"
+repeat_file "M6" "test/milestone_6_mirror_test.exs"
+repeat_file "ObjectStore.Local conformance" "test/object_store_local_conformance_test.exs"
+repeat_file "ObjectStore.S3 conformance" "test/object_store_s3_conformance_test.exs"
+
+(
+  unset GITILITY_MINIO_URL GITILITY_MINIO_KEY GITILITY_MINIO_SECRET GITILITY_MINIO_BUCKET
+  bash scripts/consumer-smoke.sh
+)
+GITILITY_MIX_STAGE
+)
+
+  echo "==> mix"
+  rexec "$REMOTE_PRELUDE
+capped bash -s <<'GITILITY_MIX_REMOTE'
+$command
+GITILITY_MIX_REMOTE"
+}
+
+stage_rehearsal() {
+  local command
+  command=$(cat <<'GITILITY_REHEARSAL_STAGE'
+set -euo pipefail
+
+source_repository="$HOME/rehearsal/phoenix.git"
+workdir="$HOME/rehearsal/gitility-m6"
+
+if [ ! -d "$source_repository" ]; then
+  echo "[remote] required rehearsal corpus is missing: $source_repository" >&2
+  exit 1
+fi
+
+MIX_ENV=dev mix deps.get >/dev/null
+MIX_ENV=dev mix run bench/dress_rehearsal.exs "$source_repository" "$workdir"
+GITILITY_REHEARSAL_STAGE
+)
+
+  echo "==> rehearsal"
+  rexec "$REMOTE_PRELUDE
+capped bash -s <<'GITILITY_REHEARSAL_REMOTE'
+$command
+GITILITY_REHEARSAL_REMOTE"
+}
+
 for s in "${STAGES[@]}"; do
   case "$s" in
     sync) stage_sync ;;
@@ -168,7 +338,8 @@ for s in "${STAGES[@]}"; do
     # Failure blocks must survive the log: keep every ExUnit failure section
     # plus the tail summary (a bare tail -15 once swallowed the only failure
     # of a run — 2026-08-17).
-    mix)  run_stage mix "mix local.hex --force >/dev/null && mix local.rebar --force >/dev/null && mix deps.get >/dev/null && status=0; out=\$(mix test 2>&1) || status=\$?; echo \"\$out\" | grep -B 2 -A 25 \"^  *[0-9][0-9]*[)] test\" || true; echo \"\$out\" | tail -15; [ \$status -eq 0 ] || exit \$status; for run in \$(seq 1 12); do echo \"[remote] M5a repetition \$run/12\"; mix test test/milestone_5a_fetch_test.exs; done" ;;
+    mix) stage_mix ;;
+    rehearsal) stage_rehearsal ;;
     soak) run_stage soak "status=0; out=\$(mix test --only soak 2>&1) || status=\$?; echo \"\$out\" | grep -B 2 -A 25 \"^  *[0-9][0-9]*[)] test\" || true; echo \"\$out\" | tail -15; exit \$status" ;;
     *) echo "unknown stage: $s" >&2; exit 2 ;;
   esac

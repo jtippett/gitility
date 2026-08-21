@@ -9,17 +9,17 @@
 use gitility_core::runtime::thread_budget;
 use gitility_core::{
     blame as core_blame, diff as core_diff, fetch as core_fetch, history as core_history,
-    is_ancestor as core_is_ancestor, list_tree as core_list_tree, log as core_log,
-    merge_base as core_merge_base, peel as core_peel, read_file as core_read_file,
-    search as core_search, submodules as core_submodules, BlameOptions, Budget, BudgetLimits,
-    BusyReason, ByteRange as CoreByteRange, CacheOptions, CacheStats, CallbackRangeTransport,
-    DiffFormat, DiffLineOrigin, DiffOptions, DiffStatus, DiffWarningCode, Error, ErrorCode,
-    FetchAction, FetchRejection, FetchRequest, FileKind, FileOptions, HashKind, HistoryOptions,
-    HydrationStats, Job as CoreJob, JobObserver, JobOutput, JobSpec, JobState, LayeredOdb,
-    LocalOdb, LocalOdbOptions, LocalRefDb, LogIdentity, LogOptions, LogOrder, ObjectDb,
-    ObjectHeader, ObjectKind, ObjectReadResult, Oid, PackDescriptor, PackFetchOdb,
-    PackFetchOptions, PackManifest, PeelTarget, PendingTable, ProviderCacheOptions, ProviderKind,
-    ProviderOdb, ProviderOptions, ProviderPayload, ProviderRefDb, ProviderReplyValue,
+    init_bare as core_init_bare, is_ancestor as core_is_ancestor, list_tree as core_list_tree,
+    log as core_log, merge_base as core_merge_base, peel as core_peel, read_file as core_read_file,
+    search as core_search, submodules as core_submodules, write_refs as core_write_refs,
+    BlameOptions, Budget, BudgetLimits, BusyReason, ByteRange as CoreByteRange, CacheOptions,
+    CacheStats, CallbackRangeTransport, DiffFormat, DiffLineOrigin, DiffOptions, DiffStatus,
+    DiffWarningCode, Error, ErrorCode, FetchAction, FetchRejection, FetchRequest, FileKind,
+    FileOptions, HashKind, HistoryOptions, HydrationStats, Job as CoreJob, JobObserver, JobOutput,
+    JobSpec, JobState, LayeredOdb, LocalOdb, LocalOdbOptions, LocalRefDb, LogIdentity, LogOptions,
+    LogOrder, ObjectDb, ObjectHeader, ObjectKind, ObjectReadResult, Oid, PackDescriptor,
+    PackFetchOdb, PackFetchOptions, PackManifest, PeelTarget, PendingTable, ProviderCacheOptions,
+    ProviderKind, ProviderOdb, ProviderOptions, ProviderPayload, ProviderRefDb, ProviderReplyValue,
     ProviderRequest, ProviderTransport, QueryStats, RangePayload, RangePendingTable, RangeRequest,
     RangeRequestKind, RangeRequestSender, ReadManyBudget, RefDb, RefPage, RefPendingTable,
     RefProviderKind, RefProviderOptions, RefProviderPayload, RefProviderRequest,
@@ -1340,6 +1340,41 @@ fn runtime_stats(runtime: ResourceArc<RuntimeResource>) -> RuntimeStatsMap {
         thread_budget_used: thread_budget::global().used() as u64,
         thread_budget_limit: thread_budget::global().limit() as u64,
     }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn repo_init_bare<'a>(env: Env<'a>, path: Binary<'a>, hash: Atom) -> NifResult<Term<'a>> {
+    let path = Path::new(OsStr::from_bytes(path.as_slice()));
+    let result = parse_hash(hash).and_then(|hash| core_init_bare(path, hash));
+    Ok(match result {
+        Ok(()) => atoms::ok().encode(env),
+        Err(error) => Result::<(), _>::Err(error_map(env, error)?).encode(env),
+    })
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn repo_write_refs<'a>(
+    env: Env<'a>,
+    path: Binary<'a>,
+    refs: Vec<(Binary<'a>, Binary<'a>)>,
+    head: Option<(Option<Binary<'a>>, Option<Binary<'a>>)>,
+) -> NifResult<Term<'a>> {
+    let path = Path::new(OsStr::from_bytes(path.as_slice()));
+    let refs = refs
+        .into_iter()
+        .map(|(name, oid)| (name.as_slice().to_vec(), oid.as_slice().to_vec()))
+        .collect();
+    let head = head.map(|(oid, symref)| {
+        (
+            oid.map(|oid| oid.as_slice().to_vec()),
+            symref.map(|symref| symref.as_slice().to_vec()),
+        )
+    });
+    let result = core_write_refs(path, refs, head);
+    Ok(match result {
+        Ok(count) => Result::<_, ErrorMap>::Ok(count).encode(env),
+        Err(error) => Result::<u64, _>::Err(error_map(env, error)?).encode(env),
+    })
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]

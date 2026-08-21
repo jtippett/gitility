@@ -22,6 +22,7 @@ defmodule Gitility.Bundle do
     Bundle.Receipt,
     Bundle.Writer,
     Error,
+    Limits,
     ODB,
     OID,
     RefDB,
@@ -33,6 +34,9 @@ defmodule Gitility.Bundle do
   @copy_chunk_bytes 8 * 1024 * 1024
   @default_hydration_bytes 4 * 1024 * 1024 * 1024
   @default_memory_bytes 256 * 1024 * 1024
+  @maximum_generation 18_446_744_073_709_551_615
+  @strict_peel_object_bytes 64 * 1024 * 1024
+  @strict_peel_total_bytes 256 * 1024 * 1024
 
   @doc """
   Publishes a complete local repository as one deterministic bundle file.
@@ -41,27 +45,21 @@ defmodule Gitility.Bundle do
   with `:source_identity`, `:publisher`, and `:created_at`; timestamps are
   never synthesized. `:git_executable` selects the executable used to pack
   loose objects and to peel SHA-256 tags while the engine cannot do so.
+
+  `:generation` may explicitly select a value from 1 through `2^64 - 1`; when
+  replacing a bundle it must be greater than the existing generation.
+  `strict_refs: true` turns every degraded reference snapshot into an error
+  and guarantees an empty warning list on success. `:mode` applies Unix
+  permission bits to the writer's temporary file before any bundle bytes are
+  written; `nil` retains the process umask behavior.
   """
   @spec write(Path.t(), keyword()) :: {:ok, Receipt.t()} | {:error, Error.t()}
-  def write(path, opts) when is_binary(path) and is_list(opts) do
-    opts =
-      Keyword.validate!(opts,
-        source: nil,
-        source_identity: nil,
-        publisher: nil,
-        created_at: nil,
-        git_executable: nil
-      )
-
-    write_validated(path, opts)
+  def write(path, opts) do
+    with :ok <- validate_write_path(path),
+         {:ok, validated} <- validate_write_options(opts) do
+      write_validated(path, validated)
+    end
   end
-
-  def write(_path, _opts),
-    do:
-      {:error,
-       Error.new(:invalid_argument, "bundle path and options are invalid",
-         operation: :bundle_write
-       )}
 
   @doc false
   @spec classify_destination(Path.t(), atom()) ::
@@ -97,7 +95,7 @@ defmodule Gitility.Bundle do
 
     with {:ok, source} <- source_path(opts[:source]),
          :ok <- refuse_shallow_source(source),
-         {:ok, generation} <- next_generation(path),
+         {:ok, generation} <- next_generation(path, opts[:generation]),
          {:ok, metadata} <- metadata(source, opts),
          {:ok, repository} <- Repository.open(source) do
       publish(path, source, repository, generation, metadata, opts)
@@ -281,7 +279,8 @@ defmodule Gitility.Bundle do
                generation: generation,
                metadata: Map.merge(metadata, ref_metadata),
                refs: refs,
-               warnings: warnings
+               warnings: warnings,
+               mode: opts[:mode]
              ) do
         {:ok, receipt}
       else
@@ -308,6 +307,10 @@ defmodule Gitility.Bundle do
     end
   end
 
+  defp snapshot_refs(%Repository{refs: nil}, source, %{strict_refs: true}) do
+    strict_ref_error("source reference store is unavailable for #{source}")
+  end
+
   defp snapshot_refs(%Repository{refs: nil, ref_error: ref_error}, source, _opts) do
     warning =
       warning("source reference store is unavailable for #{source}: #{inspect(ref_error)}")
@@ -317,12 +320,29 @@ defmodule Gitility.Bundle do
 
   defp snapshot_refs(%Repository{} = repository, source, opts) do
     git = opts[:git_executable] || Application.get_env(:gitility, :git_executable, "git")
+    strict? = opts[:strict_refs]
 
     with {:ok, listed, warnings} <- collect_ref_pages(repository.refs, nil, [], []),
+         :ok <- reject_snapshot_warnings(warnings, strict?),
          {:ok, rows, warnings} <-
-           snapshot_listed_refs(listed, repository, source, git, warnings),
-         {head, head_metadata, warnings} <-
-           snapshot_head(repository, source, git, warnings) do
+           snapshot_listed_refs(
+             Enum.reject(listed, &(&1.name == "HEAD")),
+             repository,
+             source,
+             git,
+             warnings,
+             strict?
+           ),
+         {:ok, head, head_metadata, warnings} <-
+           snapshot_head(
+             repository,
+             source,
+             git,
+             Enum.reject(listed, &(&1.name == "HEAD")),
+             rows,
+             warnings,
+             strict?
+           ) do
       rows =
         rows
         |> maybe_add_head(head)
@@ -331,6 +351,15 @@ defmodule Gitility.Bundle do
 
       {:ok, rows, head_metadata, warnings}
     end
+  end
+
+  defp reject_snapshot_warnings([], _strict?), do: :ok
+  defp reject_snapshot_warnings(_warnings, false), do: :ok
+
+  defp reject_snapshot_warnings([first | _rest], true) do
+    strict_ref_error("reference listing produced a degraded snapshot",
+      snapshot_warning: Map.get(first, :code, :malformed_ref)
+    )
   end
 
   defp collect_ref_pages(refs, cursor, items, warnings) do
@@ -357,13 +386,13 @@ defmodule Gitility.Bundle do
     end
   end
 
-  defp snapshot_listed_refs(refs, repository, source, git, warnings) do
+  defp snapshot_listed_refs(refs, repository, source, git, warnings, strict?) do
     Enum.reduce_while(refs, {:ok, [], warnings}, fn ref, {:ok, rows, accumulated_warnings} ->
       case RefDB.resolve(repository.refs, ref.name) do
         {:ok, target} when target != :not_found ->
-          case ref_row(ref.name, target, repository.odb, source, git) do
-            {:ok, row} ->
-              {:cont, {:ok, [row | rows], accumulated_warnings}}
+          case ref_row(ref.name, target, repository.odb, source, git, strict?) do
+            {:ok, row, row_warnings} ->
+              {:cont, {:ok, [row | rows], accumulated_warnings ++ row_warnings}}
 
             {:skip, message} ->
               {:cont, {:ok, rows, accumulated_warnings ++ [warning(message)]}}
@@ -372,10 +401,19 @@ defmodule Gitility.Bundle do
               {:halt, {:error, error}}
           end
 
+        {:ok, :not_found} when strict? ->
+          {:halt, strict_ref_error("ref #{inspect(ref.name)} became unresolved")}
+
         {:ok, :not_found} ->
           {:cont,
            {:ok, rows,
             accumulated_warnings ++ [warning("ref #{inspect(ref.name)} became unresolved")]}}
+
+        {:error, %Error{} = error} when strict? ->
+          {:halt,
+           strict_ref_error("ref #{inspect(ref.name)} could not be resolved",
+             resolve_error: error.code
+           )}
 
         {:error, %Error{} = error} ->
           {:cont,
@@ -385,64 +423,204 @@ defmodule Gitility.Bundle do
     end)
   end
 
-  defp snapshot_head(repository, source, git, warnings) do
+  defp snapshot_head(repository, source, git, _listed, _rows, warnings, false) do
     case RefDB.resolve(repository.refs, "HEAD") do
       {:ok, target} when target != :not_found ->
-        case ref_row("HEAD", target, repository.odb, source, git) do
-          {:ok, row} ->
+        case ref_row("HEAD", target, repository.odb, source, git, false) do
+          {:ok, row, row_warnings} ->
+            warnings = warnings ++ row_warnings
+
             case head_symref(source) do
-              {:ok, nil} -> {row, %{}, warnings}
-              {:ok, symref} -> {row, %{"head_symref" => symref}, warnings}
-              {:error, message} -> {row, %{}, warnings ++ [warning(message)]}
+              {:ok, nil} -> {:ok, row, %{}, warnings}
+              {:ok, symref} -> {:ok, row, %{"head_symref" => symref}, warnings}
+              {:error, message} -> {:ok, row, %{}, warnings ++ [warning(message)]}
             end
 
           {:skip, message} ->
-            {nil, %{}, warnings ++ [warning("HEAD: #{message}")]}
+            {:ok, nil, %{}, warnings ++ [warning("HEAD: #{message}")]}
 
           {:error, %Error{} = error} ->
-            {nil, %{}, warnings ++ [warning("HEAD: #{error.message}")]}
+            {:ok, nil, %{}, warnings ++ [warning("HEAD: #{error.message}")]}
         end
 
       {:ok, :not_found} ->
-        {nil, %{}, warnings ++ [warning("HEAD is unresolved and was omitted")]}
+        {:ok, nil, %{}, warnings ++ [warning("HEAD is unresolved and was omitted")]}
 
       {:error, %Error{} = error} ->
-        {nil, %{}, warnings ++ [warning("HEAD is unresolved: #{error.message}")]}
+        {:ok, nil, %{}, warnings ++ [warning("HEAD is unresolved: #{error.message}")]}
     end
   end
 
-  defp ref_row(name, target, odb, source, git) do
+  defp snapshot_head(repository, source, git, listed, rows, warnings, true) do
+    with {:ok, symref} <- strict_head_symref(source) do
+      case RefDB.resolve(repository.refs, "HEAD") do
+        {:ok, target} when target != :not_found ->
+          with :ok <- validate_strict_head_symref(symref),
+               {:ok, row, []} <- ref_row("HEAD", target, repository.odb, source, git, true),
+               :ok <- validate_resolved_head(row, symref, rows) do
+            metadata = if is_binary(symref), do: %{"head_symref" => symref}, else: %{}
+            {:ok, row, metadata, warnings}
+          end
+
+        {:ok, :not_found} ->
+          validate_unborn_head(symref, listed, warnings)
+
+        {:error, %Error{} = error} ->
+          strict_ref_error("HEAD could not be resolved", resolve_error: error.code)
+      end
+    end
+  end
+
+  defp strict_head_symref(source) do
+    case head_symref(source) do
+      {:ok, symref} -> {:ok, symref}
+      {:error, _message} -> strict_ref_error("HEAD symbolic target could not be read")
+    end
+  end
+
+  defp validate_strict_head_symref(nil), do: :ok
+
+  defp validate_strict_head_symref(symref) do
+    if valid_branch_symref?(symref) do
+      :ok
+    else
+      strict_ref_error("HEAD symbolic target must be a valid name under refs/heads/")
+    end
+  end
+
+  defp validate_resolved_head(_head, nil, _rows), do: :ok
+
+  defp validate_resolved_head(head, symref, rows) do
+    case Enum.find(rows, &(&1.name == symref)) do
+      %{target: target} when target == head.target ->
+        :ok
+
+      %{target: _other} ->
+        strict_ref_error("HEAD symbolic target disagrees with the resolved HEAD row")
+
+      nil ->
+        strict_ref_error("HEAD symbolic target is absent from the source refs")
+    end
+  end
+
+  defp validate_unborn_head(symref, listed, warnings) when is_binary(symref) do
+    with :ok <- validate_strict_head_symref(symref),
+         false <- Enum.any?(listed, &(&1.name == symref)) do
+      {:ok, nil, %{"head_symref" => symref}, warnings}
+    else
+      true -> strict_ref_error("unborn HEAD symbolic target is present in the source refs")
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp validate_unborn_head(nil, _listed, _warnings) do
+    strict_ref_error("HEAD is unresolved and has no symbolic branch target")
+  end
+
+  defp valid_branch_symref?(<<"refs/heads/", suffix::binary>> = symref)
+       when byte_size(suffix) > 0 and byte_size(symref) <= 4096 do
+    String.valid?(symref) and valid_ref_name_bytes?(symref)
+  end
+
+  defp valid_branch_symref?(_symref), do: false
+
+  defp valid_ref_name_bytes?(name) do
+    components = :binary.split(name, "/", [:global])
+
+    name != "@" and not String.contains?(name, "@{") and not String.ends_with?(name, ".") and
+      Enum.all?(components, fn component ->
+        valid_component? =
+          component != "" and component != "." and component != ".." and
+            not String.starts_with?(component, ".") and
+            not String.ends_with?(component, ".lock") and
+            not String.contains?(component, "..")
+
+        valid_component? and
+          Enum.all?(:binary.bin_to_list(component), fn byte ->
+            byte > 0x20 and byte != 0x7F and
+              byte not in [0x7E, 0x5E, 0x3A, 0x3F, 0x2A, 0x5B, 0x5C]
+          end)
+      end)
+  end
+
+  defp ref_row(name, target, odb, source, git, strict?) do
     case object_kind(odb, target.oid) do
       {:ok, header} ->
-        {:ok,
-         %{
-           name: name,
-           target: target.oid,
-           kind: header.type,
-           peeled: peeled_commit(odb, target, header.type, source, git)
-         }}
+        with {:ok, peeled, peel_warnings} <-
+               peeled_commit(odb, target, header.type, source, git, name, strict?) do
+          {:ok,
+           %{
+             name: name,
+             target: target.oid,
+             kind: header.type,
+             peeled: peeled
+           }, peel_warnings}
+        end
+
+      {:error, %Error{code: :missing_object}} when strict? ->
+        {:error,
+         Error.new(
+           :missing_object,
+           "ref #{inspect(name)} targets an object missing from the source ODB",
+           operation: :bundle_write,
+           details: %{ref: name}
+         )}
 
       {:error, %Error{code: :missing_object}} ->
         {:skip, "ref #{inspect(name)} targets an object missing from the source ODB"}
+
+      {:error, %Error{} = error} when strict? ->
+        strict_ref_error("ref #{inspect(name)} targets an unreadable object",
+          ref: name,
+          object_error: error.code
+        )
 
       {:error, %Error{} = error} ->
         {:error, error}
     end
   end
 
-  defp peeled_commit(odb, target, :tag, source, git) do
+  defp peeled_commit(odb, target, :tag, source, git, name, true) do
+    peel_commit_with_policy(odb, target.oid, source, git, name, true)
+  end
+
+  defp peeled_commit(odb, target, :tag, source, git, name, false) do
     with nil <- existing_commit_peel(odb, target.peeled, source, git),
-         {:ok, peeled} <- peel_to_commit(odb, target.oid, source, git),
-         {:ok, %{type: :commit}} <- object_kind(odb, peeled) do
-      peeled
+         {:ok, peeled, warnings} <-
+           peel_commit_with_policy(odb, target.oid, source, git, name, false) do
+      {:ok, peeled, warnings}
     else
-      %Gitility.OID{} = peeled -> peeled
-      _unavailable -> nil
+      %OID{} = peeled -> {:ok, peeled, []}
+      {:error, %Error{} = error} -> {:error, error}
     end
   end
 
-  defp peeled_commit(odb, target, _kind, source, git),
-    do: existing_commit_peel(odb, target.peeled, source, git)
+  defp peeled_commit(odb, target, _kind, source, git, _name, _strict?),
+    do: {:ok, existing_commit_peel(odb, target.peeled, source, git), []}
+
+  defp peel_commit_with_policy(odb, oid, source, git, name, strict?) do
+    with {:ok, peeled} <- peel_to_commit(odb, oid, source, git, strict?),
+         {:ok, %{type: :commit}} <- object_kind(odb, peeled) do
+      {:ok, peeled, []}
+    else
+      {:ok, %{type: type}} -> peel_failure(name, {:kind, type}, strict?)
+      {:error, reason} -> peel_failure(name, reason, strict?)
+    end
+  end
+
+  defp peel_failure(name, reason, true) do
+    peel_error = if match?(%Error{}, reason), do: reason.code, else: reason
+
+    {:error,
+     Error.new(:malformed_ref, "ref #{inspect(name)} could not be peeled to a commit",
+       operation: :bundle_write,
+       details: %{ref: name, peel_error: peel_error}
+     )}
+  end
+
+  defp peel_failure(name, _reason, false) do
+    {:ok, nil, [warning("ref #{inspect(name)} could not be peeled to a commit")]}
+  end
 
   defp existing_commit_peel(_odb, nil, _source, _git), do: nil
 
@@ -455,8 +633,21 @@ defmodule Gitility.Bundle do
 
   defp object_kind(odb, oid), do: ODB.header(odb, oid)
 
-  defp peel_to_commit(odb, oid, source, git) do
-    case Gitility.peel(odb, oid) do
+  defp peel_to_commit(odb, oid, source, git, strict?) do
+    opts =
+      if strict? do
+        [
+          limits: %Limits{
+            timeout_ms: Limits.new().timeout_ms,
+            max_object_bytes: @strict_peel_object_bytes,
+            max_total_object_bytes: @strict_peel_total_bytes
+          }
+        ]
+      else
+        []
+      end
+
+    case Gitility.peel(odb, oid, opts) do
       {:ok, peeled} ->
         {:ok, peeled}
 
@@ -543,7 +734,80 @@ defmodule Gitility.Bundle do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
-  defp source_path({:repository, source}) when is_binary(source), do: {:ok, Path.expand(source)}
+  defp validate_write_path(path) when is_binary(path) and byte_size(path) > 0 do
+    if String.valid?(path) and not String.contains?(path, <<0>>) do
+      :ok
+    else
+      invalid_write("bundle path must be valid UTF-8 without NUL bytes")
+    end
+  end
+
+  defp validate_write_path(_path),
+    do: invalid_write("bundle path must be a non-empty binary")
+
+  defp validate_write_options(opts) when is_list(opts) do
+    defaults = %{
+      source: nil,
+      source_identity: nil,
+      publisher: nil,
+      created_at: nil,
+      git_executable: nil,
+      generation: nil,
+      strict_refs: false,
+      mode: nil
+    }
+
+    if proper_list?(opts) do
+      Enum.reduce_while(opts, {:ok, defaults}, fn
+        {:source, value}, {:ok, options} ->
+          {:cont, {:ok, %{options | source: value}}}
+
+        {key, value}, {:ok, options}
+        when key in [:source_identity, :publisher, :created_at, :git_executable] ->
+          if is_nil(value) or (is_binary(value) and String.valid?(value)) do
+            {:cont, {:ok, Map.put(options, key, value)}}
+          else
+            {:halt, invalid_write("unknown or invalid bundle write option: #{inspect(key)}")}
+          end
+
+        {:generation, value}, {:ok, options}
+        when is_nil(value) or
+               (is_integer(value) and value >= 1 and value <= @maximum_generation) ->
+          {:cont, {:ok, %{options | generation: value}}}
+
+        {:strict_refs, value}, {:ok, options} when is_boolean(value) ->
+          {:cont, {:ok, %{options | strict_refs: value}}}
+
+        {:mode, value}, {:ok, options}
+        when is_nil(value) or (is_integer(value) and value >= 0 and value <= 0o777) ->
+          {:cont, {:ok, %{options | mode: value}}}
+
+        {key, _value}, _acc when is_atom(key) ->
+          {:halt, invalid_write("unknown or invalid bundle write option: #{inspect(key)}")}
+
+        _malformed, _acc ->
+          {:halt, invalid_write("bundle write options must be a keyword list")}
+      end)
+    else
+      invalid_write("bundle write options must be a keyword list")
+    end
+  end
+
+  defp validate_write_options(_opts),
+    do: invalid_write("bundle write options must be a keyword list")
+
+  defp proper_list?([]), do: true
+  defp proper_list?([_head | tail]), do: proper_list?(tail)
+  defp proper_list?(_tail), do: false
+
+  defp source_path({:repository, source}) when is_binary(source) and byte_size(source) > 0 do
+    if String.valid?(source) and not String.contains?(source, <<0>>) do
+      {:ok, Path.expand(source)}
+    else
+      invalid_write(":source path must be valid UTF-8 without NUL bytes")
+    end
+  end
+
   defp source_path(_source), do: invalid_write(":source must be {:repository, directory}")
 
   defp refuse_shallow_source(source) do
@@ -578,13 +842,28 @@ defmodule Gitility.Bundle do
   defp required_path(_path),
     do: invalid_argument(":path is required and must be a non-empty binary", :bundle_start_link)
 
-  defp next_generation(path) do
+  defp next_generation(path, requested) do
     case classify_destination(path, :bundle_write) do
       :missing ->
-        {:ok, 1}
+        {:ok, requested || 1}
+
+      {:ok, %{generation: @maximum_generation}} when is_nil(requested) ->
+        {:error,
+         Error.new(:unsupported_operation, "bundle generation space exhausted",
+           operation: :bundle_write
+         )}
 
       {:ok, toc} ->
-        {:ok, toc.generation + 1}
+        cond do
+          is_nil(requested) ->
+            {:ok, toc.generation + 1}
+
+          requested > toc.generation ->
+            {:ok, requested}
+
+          true ->
+            invalid_write(":generation must be greater than the existing bundle generation")
+        end
 
       {:error, %Error{} = error} ->
         {:error, error}
@@ -681,6 +960,14 @@ defmodule Gitility.Bundle do
   end
 
   defp warning(message), do: %{code: :malformed_ref, message: message}
+
+  defp strict_ref_error(message, details \\ []) do
+    {:error,
+     Error.new(:malformed_ref, message,
+       operation: :bundle_write,
+       details: Map.new(details)
+     )}
+  end
 
   defp destination_io_error(message, path, reason, operation) do
     {:error,

@@ -8,10 +8,10 @@ defmodule Gitility.ErrorTest do
       invalid_argument invalid_oid invalid_path invalid_cursor
       unsupported_hash unsupported_operation unsupported_regex
       not_a_commit not_a_tree not_a_blob ref_not_found ambiguous_prefix
-      missing_object shallow_boundary malformed_object malformed_ref
+      not_found missing_object shallow_boundary malformed_object malformed_bundle malformed_ref
       hash_mismatch pack_checksum_mismatch index_checksum_mismatch
       object_too_large budget_exceeded result_too_large
-      timeout await_timeout cancelled busy
+      timeout await_timeout cancelled busy conflict
       authentication_failed network_error cleanup_failed credentials_unavailable
       provider_down provider_timeout provider_protocol_error backend_error
       runtime_mismatch internal_error

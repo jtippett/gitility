@@ -4,6 +4,8 @@ defmodule Gitility.Fetch do
   HTTP. This is Gitility's only write path into a real Git directory; the
   snapshot and query APIs remain read-only.
 
+  ## Credential helpers never run
+
   Production callers should use `https://`. The `http://` scheme exists for
   trusted local fixtures. Authorization values go straight to the in-process
   rustls HTTP client, are never stored or logged, and Git's credential-helper
@@ -21,6 +23,20 @@ defmodule Gitility.Fetch do
   secrets are copied into the error. `retry_unauthorized: true` invokes a
   provider once more after the first 401 and never loops. The static
   `:authorization` option is mutually exclusive with a provider.
+
+  ## Bare destination contract
+
+  A missing or empty destination is initialized as a bare SHA-1 repository.
+  Every bare directory Gitility creates is gc-safe without further action:
+  `gc.auto=0`, `maintenance.auto=false`, and `receive.autogc=false`. Gitility
+  never changes the config of a repository it did not create.
+
+  Fetch is append-only: packs are never rewritten or deleted; prune deletes
+  refs only. Gitility never runs gc or repack. This preserves the object bytes
+  used by already-pinned snapshots across later fetches.
+
+  A wildcard refspec that matches nothing on an empty remote is a successful
+  fetch with `remote_ref_count: 0`, no updated refs, and no received pack.
 
   Fetches are single-flight per `Path.expand/1` destination within one VM.
   Symlink aliases are not resolved and can defeat that key; cross-process

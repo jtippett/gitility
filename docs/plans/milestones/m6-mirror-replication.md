@@ -1,10 +1,12 @@
 # M6 — Mirror replication (`Gitility.Mirror`, `Gitility.ObjectStore`, `Repository.init_bare`)
 
-Status: SPEC v4 (2026-08-21; v1 → v2 after codex review round 1: 12
+Status: SPEC v6 — FROZEN FOR DISPATCH (2026-08-21; v1 → v2 after codex review round 1: 12
 blockers, 14 highs, 7 mediums, 2 lows; v2 → v3 after round 2: 6
 blockers, 11 highs, 7 mediums, 1 low; v3 → v4 after round 3: 5
 blockers, 5 highs, 6 mediums, 1 low; v4 → v5 after round 4: 3
-blockers, 3 highs, 5 mediums). Design:
+blockers, 3 highs, 5 mediums; v5 → v6 after round 5: 0 blockers, 3
+highs, 4 mediums, 3 lows — round 5 cleared of blockers; v6 folds the
+rest and records one pushback, D10). Design:
 `docs/plans/2026-08-21-mirror-replication-design.md`. Bundle format is
 FROZEN at 1.0 (`docs/format/bundle-v1.md`); this milestone does not
 change it.
@@ -40,6 +42,20 @@ change it.
   telemetry are outside our boundary and documented as such ("do not
   attach Finch telemetry handlers that log requests for the gitility
   pool").
+- D10. Restore's deep check is NOT `git fsck`. It guarantees: the
+  container verified (every section sha256), every pack/idx pair is a
+  real pair (idx trailer's pack checksum == pack trailer), the
+  store's pack/idx checksum scan passed, every ref row's target
+  exists with the frozen `kind`, peels are true, HEAD is coherent.
+  It does NOT walk reachability (a commit whose tree is missing
+  restores). Closure is the PUBLISHER's responsibility: strict
+  `Bundle.write` from a gix-fetched mirror produces closed packs by
+  construction, and a hostile publisher can only hurt itself (the
+  store key is the consumer's). Documented in `Mirror` moduledoc under
+  "What restore verifies". (Codex round 5 asked for fsck-grade
+  verification; declined as disproportionate — a restored mirror is
+  immediately re-fetched against the remote in the consumer's loop,
+  which heals any missing closure.)
 - D9. `Bundle.write` gains a strict mode (`strict_refs: true`) used by
   publish: any ref-snapshot degradation that today becomes a warning
   (ref store unavailable, unresolvable NAMED ref, missing target, peel
@@ -371,11 +387,18 @@ Every bare directory gitility CREATES — via `init_bare/2`, via
 	autogc = false
 ```
 
-Written natively: open the repository's local config as
-`gix::config::File` (`repo.config_snapshot_mut()` / or load the
-`config` file with `gix::config::File::from_path_no_includes`),
-`set_raw_value` ×3, serialise with `write_to` into `config.tmp`, then
-rename over `config`. gitility never touches the config of a directory
+Written natively and FAILURE-ATOMICALLY: `init_bare(path)` creates
+the repository in a sibling staging dir `"#{path}.init-<random hex>"`
+(gix init there), opens the staged repo's local `config` with
+`gix::config::File::from_path_no_includes`, `set_raw_value` ×3,
+`write_to` into `config.tmp` + rename over `config`, and only then
+`rename(2)`s the staging dir onto `path` (which is absent or an empty
+dir — rename over an empty dir is atomic on Linux/macOS). Any failure
+removes the staging dir; a VM death leaves only a `*.init-*` sibling,
+which `init_bare`/fetch auto-init/restore sweep on their next call
+(exact shape `\A<basename>\.init-[0-9a-f]{32}\z`). A directory that
+exists non-empty at `path` is never "fixed up" — so an existing repo
+without the keys can only be one gitility did not create. gitility never touches the config of a directory
 it did not create; the `Fetch` moduledoc states both halves. Test: on
 each of the three creation paths `git config --get gc.auto` == `0`,
 `maintenance.auto` == `false`, `receive.autogc` == `false`, and `git
@@ -431,7 +454,8 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
   HEAD): `name` MUST start with `refs/heads/`, pass name validation,
   and be ABSENT from `refs` → write `HEAD` symbolic to it; otherwise
   `InvalidArgument`. With `(Some(oid), None)`: detached HEAD →
-  `Target::Object(oid)`. `(None, None)` → `InvalidArgument`. A bundle
+  `Target::Object(oid)`. `(None, None)` and `head == None` →
+  `InvalidArgument` (the Elixir side never sends them; D10/§5.6). A bundle
   cannot restore a HEAD different from the one in its digest. Builds ONE transaction via `repo.edit_references(edits)`
   with the exact gix 0.86 shape:
   ```rust
@@ -463,7 +487,16 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
   (`bundle.ex:311`, `:360`, `:388`: ref store unavailable, unresolvable
   ref, missing/unreadable target, peel failure) returns `{:error,
   %Error{code: :malformed_ref | :missing_object, ...}}` instead, and
-  `Receipt.warnings` is guaranteed `[]` on success. `mode: 0o600`
+  `Receipt.warnings` is guaranteed `[]` on success — including the
+  ref-LIST page warnings that paging carries forward today (e.g. a
+  >4096-byte ref name skipped by `RefDB`): in strict mode ANY warning
+  produced anywhere in the ref snapshot is fatal (`:malformed_ref`).
+  Strict mode also passes explicit limits to `Gitility.peel/3`
+  (`%Limits{timeout_ms: remaining_or_default, max_object_bytes: 64
+  MiB, max_total_object_bytes: 256 MiB}`), the same per-object/aggregate
+  ceilings restore uses (below), so publish and restore agree on what
+  a "too large" tag/commit is; exceeding them is `:malformed_ref`
+  with `details.peel_error`. `mode: 0o600`
   (default nil = umask) — applied by `Writer` to ITS OWN temp file
   (`writer.ex:16`, `.<basename>.tmp-<n>`) via `File.chmod/2` right
   after the exclusive `File.open` and before any content is written;
@@ -488,23 +521,32 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
 3. Sweep crash leftovers from THIS mirror's previous calls. No
    globs: list the parent directory with `File.ls/1` and match each
    entry EXACTLY against the owned shapes (`Regex.escape(basename)`):
-   - `^#{b}\.publish-[0-9a-f]{32}\.tmp$` (our tmp file),
-   - `^\.#{b}\.publish-[0-9a-f]{32}\.tmp\.tmp-\d+$` (Writer's hidden temp,
-     `writer.ex:16`),
-   - `^\.#{b}\.publish-[0-9a-f]{32}\.tmp\.staging-\d+$` (Bundle's
-     staging dir, `bundle.ex:261`);
-   and inside the mirror, `objects/.gitility-publish-\d+` directories
-   (pack-inventory scratch, `pack_inventory.ex:163`). Matching
-   entries are removed (`rm_rf` for the dirs) regardless of age — we
+   - `\A#{b}\.publish-[0-9a-f]{32}\.tmp\z` (our tmp file, regular file),
+   - `\A\.#{b}\.publish-[0-9a-f]{32}\.tmp\.tmp-[1-9][0-9]*\z` (Writer's
+     hidden temp, `writer.ex:16`, regular file),
+   - `\A\.#{b}\.publish-[0-9a-f]{32}\.tmp\.staging-[1-9][0-9]*\z`
+     (Bundle's staging dir, `bundle.ex:261`, directory);
+   and inside the mirror, `objects/.gitility-publish-[1-9][0-9]*`
+   directories (pack-inventory scratch, `pack_inventory.ex:163`).
+   `\A…\z` anchors (not `^…$`, which admits a trailing newline) and an
+   `lstat` type check (regular file vs directory, never a symlink)
+   precede every deletion. Matching entries are removed (`rm_rf` for
+   the dirs) regardless of age — we
    hold the lease for `expanded`, so no live publish on this mirror
    can own them (same-VM), and cross-process publishers are outside
    the contract. A sibling like `repo.git.publish-backup` does not
    match and is never touched.
 4. `module.init(init_arg)` → state (normalise per §1.4 table).
 5. `head(state, key, timeout: remaining)`:
-   - `{:ok, h}`: metadata MUST contain `"generation"` parsing as an
-     integer `1..2^64-1` and `"tips_digest"` as 64 lowercase hex; if
-     either is missing/malformed → `{:error, %Error{code:
+   - `{:ok, h}`: metadata MUST validate via
+     `Mirror.validate_remote_metadata/1` (`@doc false`): `"format" ==
+     "gitility-bundle/1.0"`, `"generation"` canonical decimal (no
+     leading zeros/sign) in `1..2^64-1`, `"tips_digest"` 64 lowercase
+     hex, `"ref_count"`/`"file_count"` canonical non-negative
+     decimals. Every HEAD result in publish (initial and both
+     reconciliations) goes through it; a reconciliation HEAD that
+     fails validation → `:backend_error` non-retryable, cause
+     `{:adapter, :foreign_object}`. If the initial HEAD fails → `{:error, %Error{code:
      :backend_error, retryable: false, message: "object at key is not
      a gitility mirror bundle (missing or malformed metadata)", cause:
      {:adapter, :foreign_object}}}` — we never overwrite something we
@@ -592,8 +634,9 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
    returning; a VM death between mkdir and rmdir leaves empty dirs,
    which D7 accepts), and all temps stay siblings of the mirror so
    the sweep finds them. `expanded`, lease, then sweep — exact shapes, no globs, same
-   reasoning as §4.3: `^#{b}\.restore-[0-9a-f]{32}\.tmp(\.part)?$` files
-   and `^#{b}\.restore-[0-9a-f]{32}\.stage$` dirs.
+   reasoning as §4.3: `\A#{b}\.restore-[0-9a-f]{32}\.tmp(\.part)?\z`
+   regular files, `\A#{b}\.restore-[0-9a-f]{32}\.stage\z` directories,
+   and `\A#{b}\.init-[0-9a-f]{32}\z` directories (§2), lstat-checked.
 2. `init`; `tmp = "#{expanded}.restore-#{rand}.tmp"` (adapter creates
    it 0600 via sibling temp + rename); `get(state, key, tmp, timeout:)`.
    `:not_found` → `{:error, %Error{code: :not_found}}`; nothing created.
@@ -637,9 +680,13 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
    `toc.metadata["head_symref"]` is present (an unborn HEAD, D9: the
    native side writes `HEAD` as `Target::Symbolic(symref)` with
    `PreviousValue::Any` and does not require the symref to exist),
-   and `nil` when neither exists (HEAD stays as gix init left it). A
-   `HEAD` row whose `head_symref` names a missing row, or a symref
-   whose row oid ≠ `head_oid`, is rejected natively (§3). Zero rows is
+   and when NEITHER a `HEAD` row nor `head_symref` exists →
+   `:malformed_bundle` (`verify_code: :missing_head`): strict
+   `Bundle.write` always emits one of the two, and restore must never
+   inherit gix's initialiser HEAD (`refs/heads/main`), which would
+   invent a HEAD relationship absent from the digest. A `HEAD` row
+   whose `head_symref` names a missing row, or a symref whose row oid
+   ≠ `head_oid`, is rejected natively (§3). Zero rows is
    fine (D3).
 7. Deep check: `Repository.open(stage, require_bare: true,
    verify_pack_checksums: true)` — the checksum pass is LAZY (it runs
@@ -647,7 +694,16 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
    `local_odb.rs:150`), so force it with ONE probe:
    `Gitility.ODB.header(repo.odb, sentinel, limits: probe_limits)`
    with `sentinel = Gitility.OID.new!(toc.hash_algorithm, <<0::size(
-   oid_bytes * 8)>>)` — either `{:ok, _}` or `{:error, %Error{code:
+   OID.digest_size(toc.hash_algorithm) * 8)>>)`. BEFORE the probe,
+   pair association: for each pair, the idx's trailer holds the pack
+   checksum followed by the idx's own checksum (last `2 * digest_size`
+   bytes); the pack's trailer is its checksum (last `digest_size`
+   bytes). `idx.pack_checksum` MUST equal `pack.checksum` AND equal
+   the hex in the pair's basename → else `:malformed_bundle`
+   (`verify_code: :pack_index_mismatch`). Two `pread`s per pair;
+   without this a valid idx from a different pack is silently
+   skipped by gitoxide's index loader and the sentinel probe cannot
+   tell (D10). — either `{:ok, _}` or `{:error, %Error{code:
    :missing_object}}` proves the whole-store integrity pass ran and
    passed; a checksum code → `:malformed_bundle`. (Zero-object packs
    are valid, so no "first idx entry" probing.) `probe_limits =
@@ -670,11 +726,11 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
    be commits. `step_limits = %Limits{timeout_ms: remaining}` (refresh
    `remaining` before every call; `remaining <= 0` → `:timeout`
    without calling); `peel_limits = %Limits{timeout_ms: remaining,
-   max_object_bytes: 64 MiB}` (annotated-tag payloads above the 4 MiB
-   default are rare but valid; 64 MiB is the documented restore
-   ceiling for a tag object — a larger tag → `:malformed_bundle`
-   `:peel_mismatch` with the budget error as `details.peel_error`,
-   documented). Any violation → `:malformed_bundle`
+   max_object_bytes: 64 MiB, max_total_object_bytes: 256 MiB}` —
+   per-object and aggregate ceilings for every object the peel loads
+   (tag chain + terminal commit); identical to strict write's, so a
+   bundle that published can always peel on restore. Exceeding →
+   `:malformed_bundle` `:peel_mismatch` with `details.peel_error`. Any violation → `:malformed_bundle`
    (`details.verify_code: :dangling_ref | :kind_mismatch |
    :peel_mismatch`). Bounded by ref count and the deadline.
 8. Commit: `File.rename(stage, expanded)`. POSIX `rename(2)` replaces
@@ -828,7 +884,12 @@ Run against `Local` (always) and `S3` (when env set).
     publish records `head_symref = "refs/heads/trunk"`, restore's HEAD
     is symbolic to exactly that. Crafted bundles with no HEAD row and
     `head_symref` naming an existing row, a tag, or `HEAD` →
-    `:malformed_bundle`.
+    `:malformed_bundle`; a crafted bundle with `refs/heads/main` but
+    NEITHER a HEAD row nor `head_symref` → `:malformed_bundle`
+    `:missing_head` (never inherits the initialiser's HEAD). Strict
+    WRITE mirrors of the same shapes (source HEAD symbolic to a tag,
+    to an existing branch is fine, to an invalid name, to `HEAD`) →
+    `:malformed_ref` / ok / `:malformed_ref` / `:malformed_ref`.
 19. hand-crafted bundle with a ref to a missing object →
     `:malformed_bundle` (`:dangling_ref`); with a bad idx checksum →
     `:malformed_bundle`; with conflicting names `refs/heads/a` +
@@ -864,7 +925,8 @@ Run against `Local` (always) and `S3` (when env set).
 27. zero-ref bundle with an internally corrupt pack (section hash
     recomputed so `verify` passes) → restore `:malformed_bundle` via
     the sentinel probe.
-28. crafted bundle with a tag row pointing at a blob → `:kind_mismatch`;
+28. crafted bundle with a valid idx from a DIFFERENT pack →
+    `:pack_index_mismatch`; tag row pointing at a blob → `:kind_mismatch`;
     tag row with a wrong `peeled` → `:peel_mismatch`; a >256 MiB valid
     mirror (generated: one big blob) restores successfully (probe
     limits sized from the TOC, not the defaults).
@@ -875,6 +937,15 @@ Run against `Local` (always) and `S3` (when env set).
     dir in place and `current` consistent.
 30. `Bundle.write` default generation on a file at `2^64 - 1` →
     `:unsupported_operation`.
+31. strict_refs with a >4096-byte ref name in the source (created via
+    the oracle git) → `:malformed_ref`; lenient mode → ok + warning.
+32. init_bare: a pre-seeded `<path>.init-<hex>` orphan is swept; a
+    forced failure in the config write (test hook on the Elixir side
+    is impossible — use an unwritable staging parent via chmod 0500 on
+    a scratch dir, skipped when running as root) leaves no `path`.
+33. metadata validation: HEAD with `format` missing, generation
+    `"01"`, `"+1"`, `"0"`, `"18446744073709551616"`, or non-decimal
+    counts → `:foreign_object`, remote untouched.
 
 Oracle: pinned git 2.55 as in M5a.
 

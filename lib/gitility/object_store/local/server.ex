@@ -111,6 +111,29 @@ defmodule Gitility.ObjectStore.Local.Server do
     {:reply, {:error, {:adapter, :bad_return}}, state, state.idle_timeout}
   end
 
+  def handle_call({:claim, ref, version}, {holder, _tag}, state)
+      when is_reference(ref) and is_binary(version) do
+    if valid_pointer?(version) do
+      case state.holds do
+        %{^ref => {^holder, nil}} ->
+          holds = Map.put(state.holds, ref, {holder, version})
+          {:reply, :ok, %{state | holds: holds}, state.idle_timeout}
+
+        %{^ref => {^holder, ^version}} ->
+          {:reply, :ok, state, state.idle_timeout}
+
+        _other ->
+          {:reply, {:error, {:adapter, :bad_return}}, state, state.idle_timeout}
+      end
+    else
+      {:reply, {:error, {:adapter, :bad_return}}, state, state.idle_timeout}
+    end
+  end
+
+  def handle_call({:claim, _ref, _version}, _from, state) do
+    {:reply, {:error, {:adapter, :bad_return}}, state, state.idle_timeout}
+  end
+
   def handle_call({:release, ref}, {holder, _tag}, state) when is_reference(ref) do
     {:reply, :ok, remove_hold(state, ref, holder), state.idle_timeout}
   end
@@ -154,10 +177,20 @@ defmodule Gitility.ObjectStore.Local.Server do
         {version, %{count: Enum.sum(Map.values(holders)), holders: holders}}
       end)
 
+    claimed_versions =
+      state.holds
+      |> Enum.flat_map(fn
+        {_ref, {_holder, nil}} -> []
+        {_ref, {_holder, version}} -> [version]
+      end)
+      |> Enum.sort()
+
     debug = %{
+      claimed_versions: claimed_versions,
       pins: pins,
       pin_count: total_pins(state),
       hold_count: map_size(state.holds),
+      idle_timeout: state.idle_timeout,
       monitored_pids: Map.keys(state.monitors)
     }
 
@@ -195,7 +228,7 @@ defmodule Gitility.ObjectStore.Local.Server do
           end)
 
         holds =
-          Map.reject(state.holds, fn {_ref, hold_holder} -> hold_holder == holder end)
+          Map.reject(state.holds, fn {_ref, {hold_holder, _version}} -> hold_holder == holder end)
 
         state = %{
           state
@@ -210,6 +243,8 @@ defmodule Gitility.ObjectStore.Local.Server do
         {:noreply, state, state.idle_timeout}
     end
   end
+
+  def handle_info(_message, state), do: {:noreply, state, state.idle_timeout}
 
   defp commit(objects, hash, if_match, version) do
     with :ok <- validate_hash_and_version(hash, version),
@@ -380,14 +415,14 @@ defmodule Gitility.ObjectStore.Local.Server do
 
   defp add_hold(state, ref, holder) do
     state
-    |> Map.put(:holds, Map.put(state.holds, ref, holder))
+    |> Map.put(:holds, Map.put(state.holds, ref, {holder, nil}))
     |> monitor_holder(holder)
   end
 
   defp remove_hold(state, ref, holder) do
     state =
       case state.holds do
-        %{^ref => ^holder} -> Map.put(state, :holds, Map.delete(state.holds, ref))
+        %{^ref => {^holder, _version}} -> Map.put(state, :holds, Map.delete(state.holds, ref))
         _other -> state
       end
 
@@ -419,7 +454,7 @@ defmodule Gitility.ObjectStore.Local.Server do
 
   defp holder_active?(state, holder) do
     Enum.any?(state.pins, fn {_version, holders} -> Map.has_key?(holders, holder) end) or
-      Enum.any?(state.holds, fn {_ref, hold_holder} -> hold_holder == holder end)
+      Enum.any?(state.holds, fn {_ref, {hold_holder, _version}} -> hold_holder == holder end)
   end
 
   defp total_pins(state) do
@@ -444,6 +479,7 @@ defmodule Gitility.ObjectStore.Local.Server do
     with true <- valid_pointer?(version),
          false <- version == current,
          false <- Map.has_key?(state.pins, version),
+         false <- version_claimed?(state.holds, version),
          path = Path.join(directory, entry),
          {:ok, stat} <- File.lstat(path, time: :posix),
          true <- stat.type == :directory,
@@ -464,6 +500,10 @@ defmodule Gitility.ObjectStore.Local.Server do
     else
       _other -> :ok
     end
+  end
+
+  defp version_claimed?(holds, version) do
+    Enum.any?(holds, fn {_ref, {_holder, claimed_version}} -> claimed_version == version end)
   end
 
   defp random_temp?(entry) do

@@ -143,8 +143,13 @@ defmodule Gitility.ObjectStore.Local do
   @spec with_test_hooks(t(), map()) :: t()
   def with_test_hooks(%__MODULE__{} = state, hooks) when is_map(hooks) do
     case validate_hooks(hooks) do
-      :ok -> %{state | test_hooks: hooks}
-      {:error, _reason} -> state
+      :ok ->
+        # The idle timeout is fixed when the per-root server starts; changing
+        # callback hooks must not pretend to reconfigure an existing server.
+        if Map.has_key?(hooks, :idle_timeout), do: state, else: %{state | test_hooks: hooks}
+
+      {:error, _reason} ->
+        state
     end
   end
 
@@ -223,12 +228,41 @@ defmodule Gitility.ObjectStore.Local do
              :ok <- remaining_ok(deadline),
              {:ok, version, directory} <- create_version(state, key),
              result <-
-               prepare_and_commit(state, src_path, key, version, directory, opts, deadline) do
+               claim_prepare_and_commit(
+                 state,
+                 ref,
+                 src_path,
+                 key,
+                 version,
+                 directory,
+                 opts,
+                 deadline
+               ) do
           result
         end
       after
         release_hold(state.server, ref, deadline)
       end
+    end
+  end
+
+  defp claim_prepare_and_commit(
+         state,
+         ref,
+         src_path,
+         key,
+         version,
+         directory,
+         opts,
+         deadline
+       ) do
+    case claim(state, ref, version, deadline) do
+      :ok ->
+        prepare_and_commit(state, src_path, key, version, directory, opts, deadline)
+
+      {:error, _reason} = error ->
+        remove_version_directory(directory)
+        error
     end
   end
 
@@ -515,8 +549,14 @@ defmodule Gitility.ObjectStore.Local do
     end
   end
 
+  defp claim(state, ref, version, deadline) do
+    server_call(state.server, {:claim, ref, version}, remaining(deadline))
+  end
+
   defp release_hold(server, ref, deadline) do
-    _result = server_call(server, {:release, ref}, remaining(deadline))
+    # The holder is the short-lived run_with_timeout task. Give its explicit
+    # cleanup call a grace period even when the operation budget has expired.
+    _result = server_call(server, {:release, ref}, max(remaining(deadline), 1_000))
     :ok
   end
 

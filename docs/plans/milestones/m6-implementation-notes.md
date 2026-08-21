@@ -116,6 +116,28 @@ Frozen specification: `m6-mirror-replication.md`, SPEC v7
   the existing S3 stalled-PUT row's budget was widened from 100 ms to 500 ms
   so it reliably reaches the intended PUT before its five-second stub stall.
 
+## Review round 3
+
+- R3-1: each Local put claims its newly created version on the existing
+  caller-monitored hold before copying begins. Sweeps preserve versions
+  claimed by live holds just like pinned versions, while release or holder
+  `:DOWN` removes the claim with its hold. A regression ages a claimed
+  version, proves a forced per-key sweep preserves it, then releases the hold
+  and proves the next sweep removes it.
+- R3-2: explicit hold release uses at least a 1,000 ms cleanup budget even
+  after the operation deadline expires. The holder is the short-lived
+  `run_with_timeout` task, so this gives its `after` cleanup a chance to reach
+  the server before task exit and monitored `:DOWN` remains the backstop.
+- R3-3: the Local server ignores unknown process messages while renewing its
+  idle timeout. The claimed-version regression sends a stray message and
+  proves the same server and live hold still protect the aged version.
+- R3-4: Local server debug state exposes the effective `idle_timeout`; the
+  held-put regression now proves the server surviving a 350 ms preparation
+  pause is actually configured for 100 ms. `with_test_hooks/2` rejects
+  `:idle_timeout`, because that option is fixed when the per-root server is
+  first started, and a focused regression proves the running value is
+  unchanged.
+
 ## Req streamed SigV4 verification
 
 The resolved and locked `req 0.5.18` implementation (satisfying `~> 0.5.8`)
@@ -167,7 +189,7 @@ HTTP integration tests:          3 passed; 0 failed
 doc tests:                        0 passed; 0 failed
 
 $ cargo clippy --workspace --all-targets -- -D warnings
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s
 
 $ cargo fmt --all -- --check
 (success; no output)
@@ -179,16 +201,17 @@ $ bash scripts/check-gix-features.sh
 check-gix-features: gix-pack is single-threaded on normal/build edges
 
 $ RUSTFLAGS="--cfg loom" cargo build -p gitility-core --no-default-features
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.19s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s
 ```
 
 ### Linux sprite gate
 
-The final command was `./scripts/remote-test.sh`, whose default stages are
-`sync rust loom postgres mix rehearsal soak`. Summary lines:
+The required preflight `./scripts/remote-test.sh sync rust mix` completed
+green. The final command was `./scripts/remote-test.sh`, whose default stages
+are `sync rust loom postgres mix rehearsal soak`. Summary lines:
 
 ```text
-==> sync: done (content-verified ea89b6eb094c743a8035ad1d7dbd58bc98b9b6e0)
+==> sync: done (content-verified 06f706744debd966648582493de2a17cd006b003)
 gitility NIF tests:                 2 passed; 0 failed
 gitility-core unit tests (Linux): 268 passed; 0 failed
 HTTP integration tests:            3 passed; 0 failed
@@ -197,13 +220,13 @@ Verified exactly two allowlisted, budgeted native thread spawn sites.
 loom: 233 passed; 0 failed
 [remote] PostgreSQL database=sprite_gitility_test role=sprite ready
 mix format --check-formatted: passed
-3 doctests, 466 tests, 0 failures, 2 skipped (1 excluded)
+3 doctests, 468 tests, 0 failures, 2 skipped (1 excluded)
 M5a: 12 repetitions × 23 tests, 0 failures
 M6: 12 repetitions × 37 tests, 0 failures
-ObjectStore.Local: 12 repetitions × 19 tests, 0 failures
+ObjectStore.Local: 12 repetitions × 21 tests, 0 failures
 ObjectStore.S3/MinIO: 12 repetitions × 13 tests, 0 failures
 consumer-smoke: COMPILE WITHOUT REQ + RESTORE -> FETCH -> PUBLISH PARITY OK
 DRESS REHEARSAL: ALL CHECKS PASSED
-soak: 1 test, 0 failures (457 excluded)
+soak: 1 test, 0 failures (459 excluded)
 ==> all requested stages finished
 ```

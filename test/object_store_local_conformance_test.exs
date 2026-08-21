@@ -118,6 +118,39 @@ defmodule Gitility.ObjectStoreLocalConformanceTest do
     assert File.dir?(aged_directory)
   end
 
+  test "sweep preserves an aged claimed version through stray messages until release" do
+    scratch = Gitility.ObjectStore.Conformance.scratch_directory()
+    on_exit(fn -> File.rm_rf(scratch) end)
+
+    root = Path.join(scratch, "store")
+    assert {:ok, state} = Local.init(root: root)
+    key = "sweep/claimed-version"
+    version = String.duplicate("a", 64)
+    version_path = Local.version_path(state, key, version)
+    File.mkdir_p!(version_path)
+    age_path!(version_path)
+
+    server = GenServer.whereis(Local.server(state))
+    assert is_pid(server)
+    ref = make_ref()
+    assert :ok = GenServer.call(server, {:hold, ref})
+    assert :ok = GenServer.call(server, {:claim, ref, version})
+
+    send(server, {:stray, make_ref()})
+
+    assert %{claimed_versions: [^version], hold_count: 1} =
+             LocalServer.debug_state(server)
+
+    assert GenServer.whereis(Local.server(state)) == server
+
+    assert :ok = Local.force_sweep(state, key)
+    assert File.dir?(version_path)
+
+    assert :ok = GenServer.call(server, {:release, ref})
+    assert :ok = Local.force_sweep(state, key)
+    refute File.exists?(version_path)
+  end
+
   test "sweep aborts a key when current is incomplete or unreadable" do
     scratch = Gitility.ObjectStore.Conformance.scratch_directory()
     on_exit(fn -> File.rm_rf(scratch) end)
@@ -231,7 +264,7 @@ defmodule Gitility.ObjectStoreLocalConformanceTest do
 
       send(
         parent,
-        {:put_server, :before_commit, server, LocalServer.debug_state(server).hold_count}
+        {:put_server, :before_commit, server, LocalServer.debug_state(server)}
       )
 
       Process.sleep(350)
@@ -239,7 +272,7 @@ defmodule Gitility.ObjectStoreLocalConformanceTest do
 
       send(
         parent,
-        {:put_server, :after_sleep, server, LocalServer.debug_state(server).hold_count}
+        {:put_server, :after_sleep, server, LocalServer.debug_state(server)}
       )
 
       :ok
@@ -271,9 +304,30 @@ defmodule Gitility.ObjectStoreLocalConformanceTest do
 
     assert_receive {:put_server, :before_put, server}
     assert is_pid(server)
-    assert_receive {:put_server, :before_commit, ^server, 1}
-    assert_receive {:put_server, :after_sleep, ^server, 1}
+
+    assert_receive {:put_server, :before_commit, ^server,
+                    %{claimed_versions: [version], hold_count: 1, idle_timeout: 100}}
+
+    assert File.dir?(Local.version_path(state, "idle/held-put", version))
+
+    assert_receive {:put_server, :after_sleep, ^server,
+                    %{claimed_versions: [^version], hold_count: 1, idle_timeout: 100}}
+
     assert_receive {:put_server, :after_commit, ^server}
+  end
+
+  test "with_test_hooks rejects an idle timeout for an existing server" do
+    scratch = Gitility.ObjectStore.Conformance.scratch_directory()
+    on_exit(fn -> File.rm_rf(scratch) end)
+
+    root = Path.join(scratch, "store")
+    assert {:ok, state} = Local.init(root: root, test_hooks: %{idle_timeout: 5_000})
+    server = GenServer.whereis(Local.server(state))
+    assert is_pid(server)
+    assert %{idle_timeout: 5_000} = LocalServer.debug_state(server)
+
+    assert Local.with_test_hooks(state, %{idle_timeout: 1}) == state
+    assert %{idle_timeout: 5_000} = LocalServer.debug_state(server)
   end
 
   test "put caller death releases its monitored server hold" do

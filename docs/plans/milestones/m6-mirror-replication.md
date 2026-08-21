@@ -1,7 +1,8 @@
 # M6 — Mirror replication (`Gitility.Mirror`, `Gitility.ObjectStore`, `Repository.init_bare`)
 
-Status: SPEC v2 (2026-08-21; v1 → v2 after codex review round 1: 12
-blockers, 14 highs, 7 mediums, 2 lows). Design:
+Status: SPEC v3 (2026-08-21; v1 → v2 after codex review round 1: 12
+blockers, 14 highs, 7 mediums, 2 lows; v2 → v3 after round 2: 6
+blockers, 11 highs, 7 mediums, 1 low). Design:
 `docs/plans/2026-08-21-mirror-replication-design.md`. Bundle format is
 FROZEN at 1.0 (`docs/format/bundle-v1.md`); this milestone does not
 change it.
@@ -26,6 +27,22 @@ change it.
   not by the network). Stated in docs. §4.10/§5.9.
 - D6. Lease: contended publish/restore return `:busy` IMMEDIATELY, like
   fetch. No waiting acquire. The consumer owns scheduling.
+- D7. Crash-safety is scoped to PROCESS/VM death (what the consumer's
+  deploy model produces). No fsync anywhere in M6; power-loss
+  durability is the object store's job (the frozen writer contract
+  makes the same distinction, `bundle-v1.md` "durability").
+- D8. The credential-hygiene guarantee is scoped to GITILITY-OWNED
+  terms: our structs, errors, `cause`, `details`, `Inspect` of our
+  state, and our log lines. Req's own request inspection and Finch
+  telemetry are outside our boundary and documented as such ("do not
+  attach Finch telemetry handlers that log requests for the gitility
+  pool").
+- D9. `Bundle.write` gains a strict mode (`strict_refs: true`) used by
+  publish: any ref-snapshot degradation that today becomes a warning
+  (ref store unavailable, unresolvable ref, missing target, peel
+  failure) is an ERROR, so a zero-ref bundle can only mean a genuinely
+  empty mirror. Default stays lenient for the existing `write/2`
+  callers.
 
 ## 0. Ground rules (unchanged from M5a, load-bearing)
 
@@ -35,15 +52,16 @@ change it.
   must pass UNCHANGED. Object-store I/O is Elixir (Finch pools are
   BEAM-side).
 - Credentials (S3 keys, session tokens, signatures) are radioactive:
-  never in `Inspect`, error structs, result structs, `cause`, log
-  lines, or crash reports. §6 has the tests.
-- No new REQUIRED dependencies. `req ~> 0.5` is `optional: true`
+  never in gitility-owned `Inspect`, error structs, result structs,
+  `cause`, `details`, or log lines (D8). §6 has the tests.
+- No new REQUIRED dependencies. `req ~> 0.5.2` (Req added
+  `aws_sigv4[:token]` in 0.5.2) is `optional: true`
   exactly like `postgrex`. `Gitility.ObjectStore.S3` contains NO
   `%Req.*{}` struct literals or pattern matches (they would not compile
   without the dep): it calls `Req.new/1`, `Req.request/2` via
   `apply/3`-free but fully-qualified dynamic calls guarded by
   `Code.ensure_loaded?(Req)` in `init/1` (→ `:unsupported_operation`
-  "add {:req, \"~> 0.5\"} to deps"), and matches responses as plain maps
+  "add {:req, \"~> 0.5.2\"} to deps"), and matches responses as plain maps
   (`%{status: s, headers: h, body: b}`), exceptions via
   `Exception.message/1` on `is_exception/1`. `@compile {:no_warn_undefined,
   Req}` on top. Test §7.4 compiles a scratch consumer WITHOUT req.
@@ -95,13 +113,19 @@ trailing `/`. Violations → `:invalid_argument` from Mirror;
 `opts` for every callback: `timeout: pos_integer` (ms remaining —
 adapters MUST bound the call; `Mirror` additionally hard-bounds it,
 §4.10) and, for `put`: `if_match: etag | :none` (`:none` = create-only),
-`metadata: metadata` (keys `[a-z0-9_-]+`, ≤ 32 keys, values ≤ 256
-bytes, header-safe: no CR/LF/control bytes), `content_type: binary`
-(always `"application/vnd.gitility.bundle"`).
+`metadata: metadata` (keys `[a-z0-9_-]+`, ≤ 8 keys, values printable
+ASCII `0x20..0x7E` only, ≤ 128 bytes each, ≤ 1 KiB total incl. keys —
+inside AWS's 2 KiB user-metadata ceiling with room for the
+`x-amz-meta-` prefixes), `content_type: binary` (always
+`"application/vnd.gitility.bundle"`). Mirror is the only producer of
+metadata and validates these limits before calling `put`; adapters
+may re-validate.
 
-MUSTs: `get` streams to `dest_path` through a sibling temp + rename (a
-partial download never occupies `dest_path`); `put` is old-or-new from
-any reader's view; `head`/`get` metadata is exactly what `put` stored.
+MUSTs: `get` streams into exactly `dest_path <> ".part"` and renames
+to `dest_path` on success (a partial download never occupies
+`dest_path`; the caller owns both names and cleans them up); `put` is
+old-or-new from any reader's view; `head`/`get` metadata is exactly
+what `put` stored.
 
 ### 1.2 `Gitility.ObjectStore.Local`
 
@@ -133,12 +157,29 @@ the application tree) and registered in a `Registry` keyed by root.
 if_match, version})` — the server reads `current`, checks the
 precondition, writes `current.tmp` + `rename` → `current`, replies;
 (3) on `:precondition_failed` the caller deletes its version dir.
-`get`/`head`: read `current` (absent → `:not_found`), then the version
-files — immutable versions give old-or-new. Sweep: every commit deletes
-version dirs not referenced by `current` and older than 1 h. Calls
-carry `opts[:timeout]` as the `GenServer.call` timeout; a timeout →
-`{:transport, :timeout}`. Keys in test mode: the adapter supports a
-`test_hooks: %{before_commit: (-> :ok)}` init option (used by §7.2.10).
+`get`/`head`: `GenServer.call(server, {:pin, hash})` returns the
+current version name AND an open fd to its `data`, opened under the
+server — so a reader always holds the version it read from `current`
+before any sweep can unlink it (unlinked-but-open files stay readable
+on POSIX). The copy to `dest_path <> ".part"` happens outside the
+server in 8 MiB chunks with a deadline check per chunk; on deadline
+the reader closes the fd, deletes `.part`, and returns
+`{:transport, :timeout}`. Sweep (at commit, inside the server): delete
+version dirs not referenced by `current` and older than 1 h; open fds
+make early deletion harmless anyway. `put`'s copy into the version dir
+is chunked with the same per-chunk deadline check; the commit call
+uses the remaining budget as the `GenServer.call` timeout (the commit
+is a few syscalls; if the call times out the caller deletes its
+version dir and returns `{:transport, :timeout}` — if the server had
+already renamed `current`, the put is in fact committed, which is the
+same indeterminacy S3 has and Mirror reconciles it the same way,
+§4.9). Meta validation: `etag` non-empty binary, `size` non-negative
+integer, `metadata` binary→binary map; anything else
+`{:adapter, :corrupt_meta}`. Test mode: `test_hooks: %{before_commit:
+(-> :ok), before_head: (-> :ok), before_get: (-> :ok), before_put:
+(-> :ok)}` init option — each hook runs in the caller process right
+before the phase and is how timeout/race tests make phases block
+deterministically (§7.1.7–9, §7.2.10, §7.2.23).
 
 ### 1.3 `Gitility.ObjectStore.S3`
 
@@ -151,9 +192,19 @@ carry `opts[:timeout]` as the `GenServer.call` timeout; a timeout →
   credentials: map | (-> map),     # required; %{access_key_id, secret_access_key, session_token (optional)}
   endpoint_url: binary | nil,      # optional; scheme+host[:port] ONLY — userinfo/path/query/fragment → :invalid_argument
   addressing: :virtual_host | :path,   # default :virtual_host; :path required for minio/most self-hosted
-  finch: atom | nil                # optional Finch pool name
+  finch: atom | nil                # optional Finch pool name (consumer-supervised)
 ]
 ```
+
+Transport: when `finch:` is given, Req uses that pool and we pass NO
+`connect_options` (Req raises if both are set); the consumer owns the
+pool's connect timeout. When absent, we start ONE Finch pool
+`Gitility.ObjectStore.S3.Finch` under gitility's application
+supervisor (only if `Code.ensure_loaded?(Finch)`; Finch is Req's own
+dependency) with `conn_opts: [transport_opts: [timeout: 20_000]]`,
+and always pass `finch: Gitility.ObjectStore.S3.Finch`. We NEVER pass
+`connect_options` — that is what would make Req spin up a pool per
+distinct option set.
 
 No `req_options` escape hatch (rejected by review: it let a caller
 re-enable redirects or logging). `state` = `%S3{bucket, region, host,
@@ -184,18 +235,17 @@ Requests, all via `Req.new/1` + `Req.request/2` with EXACTLY these
 options, applied by us last so nothing can override them:
 `redirect: false`, `retry: false`, `decode_body: false`,
 `compressed: false`, `receive_timeout: remaining`, `pool_timeout:
-min(remaining, 5_000)`, `connect_options: [timeout: min(remaining,
-20_000)]`, `aws_sigv4: [service: "s3", region:, access_key_id:,
+min(remaining, 5_000)`, `aws_sigv4: [service: "s3", region:, access_key_id:,
 secret_access_key:, token: session_token]` (Req's key for the session
-token is `token`), `finch:` when given, and the `x-amz-content-sha256`
-header Req computes for sigv4 (unsigned payload for streamed PUT is
-NOT used — we pass `body: File.stream!(src, 1_048_576)` and Req sigv4
-signs with `UNSIGNED-PAYLOAD` for enumerable bodies; the implementer
-verifies in `deps/req/lib/req/steps.ex` `put_aws_sigv4` that streaming
-bodies are supported by the pinned version and, if not, falls back to
-reading the file in 8 MiB chunks via `Req`'s `body: {:stream, ...}`
-equivalent or documents the limit — this is the ONE open
-implementation check; record the answer in the implementation notes).
+token is `token`), and `finch:` (above). Streamed PUT: `body:
+File.stream!(src_path, 1_048_576)` with an explicit `Content-Length`
+header; Req ≥ 0.5.2's `put_aws_sigv4` signs enumerable bodies with
+`x-amz-content-sha256: UNSIGNED-PAYLOAD` (the implementer confirms the
+exact line in `deps/req/lib/req/steps.ex` and records it in the
+implementation notes — if the pinned Req does NOT support streamed
+bodies under sigv4, the adapter reads the file fully into a binary
+for objects ≤ 256 MiB and returns `{:unsupported_operation, "..."}`
+above that; no Finch-internal `{:stream, _}` shapes).
 A 3xx response is an error `{:http, status, nil}` (never followed).
 Every call is additionally wrapped in the deadline task of §4.10, so a
 slow-drip server cannot exceed the budget.
@@ -258,8 +308,8 @@ Normalisation table (phase → adapter reason → `%Error{}`):
 
 | phase | reason | code | retryable | cause |
 |---|---|---|---|---|
-| init | `{:unsupported_operation, m}` | `:unsupported_operation` (message m) | false | nil |
-| init | anything else | `:invalid_argument` "object store init failed" | false | `{:adapter, :init}` |
+| any | `{:unsupported_operation, m}` | `:unsupported_operation` (message m) | false | nil |
+| init | any reason not matched by a row below | `:invalid_argument` "object store init failed" | false | `{:adapter, :init}` |
 | any | `{:invalid_key, _}` | `:invalid_argument` | false | nil |
 | any | `{:transport, a}` | `:backend_error` | true | `{:transport, a}` |
 | any | `{:http, s, c}` 5xx/429/408 | `:backend_error` | true | `{:http, s, c}` |
@@ -270,8 +320,11 @@ Normalisation table (phase → adapter reason → `%Error{}`):
 | get | `:not_found` | `:not_found` | false | nil |
 | put | `:precondition_failed` | handled (§4.8) | | |
 
-`cause` is therefore always one of: nil, `{:transport, atom}`,
-`{:http, int, binary | nil}`, `{:adapter, atom}`. Nothing else, ever.
+Rows are matched top-down; the first matching row wins. For Mirror's
+OWN errors `cause` is always one of: nil, `{:transport, atom}`,
+`{:http, int, binary | nil}`, `{:adapter, atom}`. Errors PROPAGATED
+unchanged from `Bundle.write`/`Bundle.verify`/`Fetch` keep their own
+(already sanitised) `cause` shapes — Mirror only sets `operation:`.
 
 ### 1.5 `Gitility.Repository.init_bare/2`
 
@@ -308,47 +361,79 @@ gc --auto` exits 0 with the pack count unchanged.
 
 ## 3. Native surface (Rust, `crates/gitility-core` + NIF crate)
 
-Two synchronous NIFs, both `#[rustler::nif(schedule = "DirtyIo")]`
-(pattern: the existing blocking NIFs in the NIF crate `lib.rs`), both
-behind `#[cfg(feature = "fetch")]` in core because they use gix (loom
-builds are `--no-default-features`); the Elixir side returns
-`:unsupported_operation` "native fetch feature disabled" when the NIF
-is absent (same mechanism fetch uses). Raw NIF error maps go through
-`NativeSupport.nif_error/2` (`lib/gitility/native_support.ex:105`).
-Core helpers are `pub(crate)` where they return `gix` types (the core
-boundary rule in `core/lib.rs`).
+Two synchronous NIFs in `native/gitility/src/lib.rs`, both
+`#[rustler::nif(schedule = "DirtyIo")]` (pattern: `lib.rs:1295`),
+returning `NifResult<Term>` built the way `open_local` does
+(`lib.rs:1345`): `Ok(())`/`Ok(u64)` encoded as `:ok`/`{:ok, n}`, and
+`gitility_core::Error` converted through the existing `ErrorMap`
+encoding so `NativeSupport.nif_error/2` applies. Core exposes PUBLIC,
+engine-neutral functions `pub fn init_bare(path: &Path, hash:
+HashKind) -> Result<(), Error>` and `pub fn write_refs(path: &Path,
+refs: Vec<(Vec<u8>, Vec<u8>)>, head: Option<(Vec<u8>, Option<Vec<u8>>)>)
+-> Result<u64, Error>` in a new `crates/gitility-core/src/repo_admin.rs`;
+the gix-returning `init_bare_repo(path) -> Result<gix::Repository,
+Error>` stays `pub(crate)` and is shared with `fetch.rs`. The module
+is `#[cfg(feature = "fetch")]` in core (it uses gix; loom builds are
+`--no-default-features`); the NIF crate compiles core with its
+default features, so the NIFs always exist in the NIF crate — there
+is no feature-disabled Elixir fallback (the v2 claim was wrong:
+`Gitility.Native` stubs raise `:nif_not_loaded`, nothing maps them).
+Ref NAMES cross the NIF as raw `Binary` (frozen format: ref names are
+bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
 
-- `repo_init_bare(path: String, hash: Atom) -> Result<(), Error>`:
-  core `repo_init::init_bare(path) -> Result<gix::Repository, Error>`
-  (`pub(crate)`) = the initialise branch currently inline in
+- `repo_init_bare(path: Binary, hash: Atom)`: core
+  `repo_admin::init_bare_repo(path)` (`pub(crate)`) = the initialise
+  branch currently inline in
   `fetch.rs::open_or_init_bare` (`gix::ThreadSafeRepository::init_opts(
   path, Kind::Bare, create::Options::default(), open::Options::isolated())`)
   followed by the §2 config write. `open_or_init_bare` calls it, so
   fetch auto-init gets the config. `hash != sha1` → `UnsupportedHash`.
   Non-empty/non-dir path → `InvalidArgument`.
-- `repo_write_refs(path: String, refs: Vec<(String, Binary)>, head: Option<(Binary /*oid*/, Option<String> /*symref*/)>) -> Result<u64, Error>`:
-  NEW helper `refs::write_refs` (there is no existing create/update
-  transaction to factor — fetch's updates happen inside gix's
-  `prepared.receive`; only prune's delete transaction is ours).
-  Validates every name with `gix::validate::reference::name` (gix
-  re-exports gix-validate; do NOT add a direct dep) → `MalformedRef`;
-  oid length must match the repo's hash → `InvalidOid`; duplicate names
-  → `InvalidArgument`; D/F conflicts surface from gix-ref as
-  `MalformedRef`. Builds ONE `gix_ref::transaction` via
-  `repo.edit_references(edits)`: each non-HEAD ref
-  `Change::Update{ expected: PreviousValue::MustNotExist, new:
-  Target::Object(oid), log: only-if-ref-exists-off }`; `HEAD` (gix init
-  ALWAYS writes a symbolic HEAD, so `MustNotExist` would fail):
-  `expected: PreviousValue::Any`, `new: Target::Symbolic(symref)` when
-  `symref` is `Some` AND that name is among `refs`, else
-  `Target::Object(oid)`. Returns the number of edits committed. Reflogs
-  disabled (bare mirror; `core.logAllRefUpdates` is false by default for
-  bare repos — assert in a test). Bound: `refs.len()` ≤ the frozen TOC
-  cap; the NIF is DirtyIo and not cancellable (D5).
-- `Bundle.write` gains `generation: pos_integer` (Elixir-side option,
-  no native change): must be `1..(2^64 - 1)`; when a file exists at
-  `path`, must be ≥ existing + 1 → else `:invalid_argument`. Default
-  unchanged (next generation of any file at `path`).
+- `repo_write_refs(path: Binary, refs: Vec<(Binary, Binary)>, head: Option<(Binary /*oid*/, Option<Binary> /*symref*/)>)`:
+  NEW core helper `repo_admin::write_refs` (there is no existing
+  create/update transaction to factor — fetch's updates happen inside
+  gix's `prepared.receive`; only prune's delete transaction is ours,
+  `fetch.rs:468`, whose `RefEdit` shape is the model). Validates every
+  name with `gix::validate::reference::name` (gix re-exports
+  gix-validate; do NOT add a direct dep) → `MalformedRef`; oid length
+  must match the repo's hash → `InvalidOid`; duplicate names →
+  `InvalidArgument`; D/F conflicts surface from gix-ref's transaction
+  as `MalformedRef`. HEAD consistency: when `symref` is `Some(name)`,
+  `name` MUST be among `refs` AND that row's oid MUST equal `head_oid`,
+  else `InvalidArgument` ("HEAD symref target disagrees with HEAD
+  row") — a bundle cannot restore a HEAD different from the one in its
+  digest. Builds ONE transaction via `repo.edit_references(edits)`
+  with the exact gix 0.86 shape:
+  ```rust
+  // every non-HEAD ref
+  RefEdit { change: Change::Update { log: LogChange { mode: RefLog::Only, force_create_reflog: false, message: "".into() },
+                                     expected: PreviousValue::MustNotExist,
+                                     new: Target::Object(oid) },
+            name: full_name, deref: false }
+  // HEAD (gix init always writes a symbolic HEAD, so MustNotExist would fail)
+  RefEdit { change: Change::Update { log: <same>, expected: PreviousValue::Any,
+                                     new: Target::Symbolic(symref) /* or Target::Object(head_oid) */ },
+            name: "HEAD", deref: false }   // deref: false — never follow the init-time symref
+  ```
+  Returns the number of edits committed. `RefLog::Only` + bare repo
+  (`core.logAllRefUpdates` defaults false for bare) → no reflog files
+  are created; asserted in §7.2.12. Bound: `refs.len()` ≤ the frozen
+  TOC cap; DirtyIo, not cancellable (D5).
+- `Bundle.write` gains three Elixir-side options (no native change):
+  `generation: pos_integer` — `1..(2^64 - 1)`; when a file exists at
+  `path`, must be ≥ existing + 1 → else `:invalid_argument`; default
+  unchanged. `strict_refs: boolean` (default false) — D9: every
+  condition that today appends a warning in `snapshot_refs`/`ref_row`
+  (`bundle.ex:311`, `:360`, `:388`: ref store unavailable, unresolvable
+  ref, missing/unreadable target, peel failure) returns `{:error,
+  %Error{code: :malformed_ref | :missing_object, ...}}` instead, and
+  `Receipt.warnings` is guaranteed `[]` on success. `mode: 0o600`
+  (default nil = umask) — applied by `Writer` to ITS OWN temp file
+  (`writer.ex:16`, `.<basename>.tmp-<n>`) via `File.chmod/2` right
+  after the exclusive `File.open` and before any content is written;
+  the rename then carries the mode to `path`. (v2's touch+chmod of
+  `path` was wrong: `classify_destination` rejects an existing
+  zero-byte file, and Writer never writes to `path` directly.)
 
 ## 4. publish/4 algorithm (Elixir, `lib/gitility/mirror.ex`)
 
@@ -364,7 +449,12 @@ boundary rule in `core/lib.rs`).
    no `Gitility.Job`, holder death releases the lease at once (the only
    in-flight native work is `Bundle.write` into a temp file, which is
    never uploaded if the caller died; documented).
-3. Sweep `#{expanded}.publish-*.tmp` older than 1 h (crash leftovers).
+3. Sweep crash leftovers from THIS mirror's previous calls: every
+   `#{expanded}.publish-*` and `.#{basename}.publish-*.tmp-*` (Writer's
+   hidden temp for our tmp name) in the parent directory is removed
+   regardless of age — we hold the lease for `expanded`, so no live
+   publish on this mirror can own them (same-VM), and cross-process
+   publishers are outside the contract. The 1 h rule is gone.
 4. `module.init(init_arg)` → state (normalise per §1.4 table).
 5. `head(state, key, timeout: remaining)`:
    - `{:ok, h}`: metadata MUST contain `"generation"` parsing as an
@@ -377,14 +467,14 @@ boundary rule in `core/lib.rs`).
    - `:not_found` → `remote_gen = 0`, `remote_digest = nil`, `if_match = :none`.
    - `remote_gen == 2^64 - 1` → `:unsupported_operation` "generation
      space exhausted for key".
-6. `tmp = "#{expanded}.publish-#{random_hex(16)}.tmp"`: `File.touch!`
-   then `File.chmod!(tmp, 0o600)` BEFORE `Bundle.write(tmp, source:
-   {:repository, mirror_dir}, generation: remote_gen + 1,
+6. `tmp = "#{expanded}.publish-#{random_hex(16)}.tmp"` (must not
+   exist): `Bundle.write(tmp, source: {:repository, mirror_dir},
+   generation: remote_gen + 1, strict_refs: true, mode: 0o600,
    source_identity:, publisher: "gitility #{vsn}", created_at:,
-   git_executable:)` (Writer opens with `File.open/2` which keeps the
-   mode of an existing file). Write errors propagate unchanged
-   (`:unsupported_operation` for shallow sources, etc.), with
-   `operation: :publish`.
+   git_executable:)`. Write errors propagate unchanged
+   (`:unsupported_operation` for shallow sources, `:malformed_ref`/
+   `:missing_object` from strict mode, …) with `operation: :publish`;
+   `Receipt.warnings` is asserted empty (strict mode guarantees it).
 7. `{:ok, toc} = Bundle.Format.parse(tmp)`; `tips_digest =
    Mirror.tips_digest(toc.refs, toc.metadata["head_symref"])` =
    lowercase hex sha256 over the concatenation of the sorted lines
@@ -398,23 +488,38 @@ boundary rule in `core/lib.rs`).
    "gitility-bundle/1.0", "ref_count" => ..., "file_count" => ...},
    content_type: ..., timeout: remaining)`:
    - `{:ok, %{etag}}` → `{:ok, %Receipt{...}}`.
-   - `:precondition_failed` → ONE re-`head`: `{:ok, h2}` with
-     `h2.metadata["tips_digest"] == digest` → `{:ok, :not_newer}`;
-     anything else → `:conflict` (retryable: true).
-   - `{:transport, :timeout}` / `{:transport, :closed}` AFTER the body
-     started streaming (the PUT may have committed): ONE bounded
-     re-`head` (5 s, outside the main budget): etag changed AND digest
-     == ours → `{:ok, %Receipt{etag: h.etag, ...}}` (it committed);
-     etag unchanged → `:backend_error` retryable (`{:transport,
-     :timeout}`); head fails → `:backend_error` retryable with cause
-     `{:adapter, :indeterminate}`. Documented as "publish may report
-     indeterminate; re-running is safe because the next run's HEAD
-     reconciles".
+   - `:precondition_failed` → ONE reconciliation `head` (within the
+     main budget; if the budget is exhausted → `:timeout`):
+     `{:ok, h2}` with `h2.metadata["tips_digest"] == digest` →
+     `{:ok, :not_newer}`; `{:ok, h2}` with a different digest or
+     `:not_found` → `:conflict` (retryable: true); any error → that
+     error per the table (NOT collapsed into `:conflict`).
+   - `{:transport, _}` of ANY kind from `put` (the adapter cannot tell
+     us whether bytes left; the PUT may have committed) → the same
+     single reconciliation `head` within the budget (if no budget is
+     left, return `:timeout` with `details.indeterminate: true`):
+     * `{:ok, h2}` and `h2.metadata["tips_digest"] == digest` and
+       `h2.etag != if_match` (or `if_match == :none`) → it committed:
+       `{:ok, %Receipt{etag: h2.etag, ...}}`;
+     * `{:ok, h2}` and `h2.etag == if_match` (unchanged) → not
+       committed: `:backend_error` retryable, cause the transport reason;
+     * `{:ok, h2}` with changed etag AND a different digest → someone
+       else won: `:conflict`;
+     * `:not_found` with `if_match == :none` → not committed:
+       `:backend_error` retryable;
+     * head error → `:backend_error` retryable, cause `{:adapter,
+       :indeterminate}`, `details.indeterminate: true`.
+     Documented: "publish can report an indeterminate failure;
+     re-running is always safe because the next run's HEAD reconciles."
    - other errors → table.
-10. Deadline: every adapter call runs inside `Task.async` + `Task.yield(
-    task, remaining) || Task.shutdown(task, :brutal_kill)` so a
-    callback that ignores `opts[:timeout]` is still hard-bounded;
-    kill → `:timeout` naming the phase in `details`. The local phases
+10. Deadline: every adapter call runs inside `Task.async` +
+    `Task.yield(task, remaining) || Task.shutdown(task, :brutal_kill)`
+    so a callback that ignores `opts[:timeout]` is still hard-bounded;
+    kill → `:timeout` naming the phase in `details`. Because a killed
+    adapter cannot clean up, adapters write ONLY to paths Mirror hands
+    them: `get` MUST use `dest_path <> ".part"` as its temp (§1.1,
+    conformance row 7); Mirror removes both `dest_path` and the
+    `.part` in its `after`. `put` reads only. The local phases
     (`Bundle.write`, `Format.parse`) are not bounded (D5) — the
     deadline is re-checked after them and the upload is skipped with
     `:timeout` if already exceeded.
@@ -424,9 +529,12 @@ boundary rule in `core/lib.rs`).
 
 1. Validate as §4.1 except `mirror_dir` must NOT exist or must be an
    empty directory (else `:invalid_argument`). Parent directory is
-   created with `mkdir_p` up front (so a later rename cannot fail on a
-   missing parent). `expanded`, lease, sweep of `#{expanded}.restore-*`
-   (both `.tmp` files and `.stage` dirs) older than 1 h.
+   created with `mkdir_p` only AFTER the `get` succeeds (so a missing
+   object creates nothing — the design's "no side effects" promise;
+   the download temp lives in the system temp dir when the parent
+   does not exist yet, else beside the mirror). `expanded`, lease,
+   then sweep `#{expanded}.restore-*` (`.tmp`, `.tmp.part`, `.stage`)
+   regardless of age, same reasoning as §4.3.
 2. `init`; `tmp = "#{expanded}.restore-#{rand}.tmp"` (adapter creates
    it 0600 via sibling temp + rename); `get(state, key, tmp, timeout:)`.
    `:not_found` → `{:error, %Error{code: :not_found}}`; nothing created.
@@ -436,7 +544,16 @@ boundary rule in `core/lib.rs`).
    meaning); any other code (structural/integrity: `:malformed_object`,
    `:hash_mismatch`, `:pack_checksum_mismatch`,
    `:index_checksum_mismatch`, …) → `:malformed_bundle` with the
-   original code as `details.verify_code`. Then `Format.parse(tmp)` →
+   original code as `details.verify_code`. The SAME mapping applies to
+   every later integrity failure in steps 6–7 (`:malformed_ref` /
+   `:invalid_argument` from the ref transaction incl. D/F conflicts
+   and HEAD disagreement → `:malformed_bundle` with `verify_code:
+   :malformed_ref`; checksum codes from the deep check →
+   `:malformed_bundle`): once the object has passed `verify`, any
+   further rejection means the bundle's CONTENT is unusable as a
+   repository, which is what `:malformed_bundle` means to a scheduler.
+   Only `:timeout`, `:backend_error` (I/O) and `:internal_error` pass
+   through. Then `Format.parse(tmp)` →
    `toc`. `toc.hash_algorithm != :sha1` → `:unsupported_hash`. If the
    `get` metadata carries `"generation"`/`"tips_digest"`, they MUST
    equal `toc.generation` / `tips_digest(toc)` → else
@@ -459,14 +576,21 @@ boundary rule in `core/lib.rs`).
    `{head_oid, toc.metadata["head_symref"]}` when a `HEAD` row exists,
    `nil` otherwise (then HEAD stays as gix init left it — symbolic to
    the init default — which is the correct representation of a source
-   whose HEAD was unborn). Zero rows is fine (D3).
+   whose HEAD was unborn). The native side enforces `head_symref`'s
+   row oid == `head_oid` (§3). Zero rows is fine (D3).
 7. Deep check: `Repository.open(stage, require_bare: true,
-   verify_pack_checksums: true)`; then for every restored ref, resolve
-   via `Gitility.RefDB.resolve(repo.refs, name)` and read the target
-   object's header through the snapshot/ODB API (`Gitility.ODB`
-   header read — type + size, no payload) → missing object or wrong
-   type for `HEAD`/`refs/heads/*` (must be commit) → `:malformed_bundle`
-   (`details.verify_code: :dangling_ref`). Bounded by ref count.
+   verify_pack_checksums: true)` — the checksum pass is LAZY (runs
+   before the first object read, `repository.ex:53`), so force it:
+   for every pack pair in `toc.files` read the header of the FIRST
+   object of that pack (`Gitility.ODB` header read of the oid at idx
+   entry 0; a pack with zero objects is impossible in a valid idx →
+   `:malformed_bundle`). Then for every restored ref, resolve via
+   `Gitility.RefDB.resolve(repo.refs, name)` and read the target's
+   header (type + size, no payload) → missing object or wrong type
+   for `HEAD`/`refs/heads/*` (must be commit) → `:malformed_bundle`
+   (`details.verify_code: :dangling_ref`). Zero refs → only the
+   per-pack probe runs, which is exactly the corruption case D3 left
+   open. Bounded by ref count + pack count.
 8. Commit: `File.rename(stage, expanded)`. POSIX `rename(2)` replaces
    an EMPTY target directory atomically, which covers the
    "pre-existing empty dir" case; if the target was created by
@@ -486,6 +610,9 @@ behave exactly as into a mirror fetched from scratch (§7.2.5).
 ## 6. Credential and key hygiene (tests required for each)
 
 - `inspect(state)` of `ObjectStore.S3` shows no key material.
+- S3 requests are built inside the adapter function and never stored
+  in state, returned, or put in errors (a `%Req.Request{}` would carry
+  the token in its options); the adapter's own `Logger` usage is nil.
 - With a sentinel secret (`"SENTINEL_SECRET_…"`) and sentinel session
   token: forced transport failure, 403, 412, 3xx, timeout, and
   credentials-fun raise: the `%Gitility.Error{}` (`inspect`,
@@ -533,13 +660,18 @@ shared minio bucket is fine), optional `store_setup/0` /
 3. create-only on existing → `:precondition_failed`.
 4. if_match current etag → ok, etag changes (content differs).
 5. if_match stale → `:precondition_failed`.
-6. 64 MiB object put + get; during the transfer, a sampler process
-   polls `Process.info(pid, :memory)` of the calling process every 10
-   ms and asserts peak < 32 MiB above baseline (streaming proof, not
-   before/after).
-7. timeout 1 ms on get of the 64 MiB object → `{:transport, :timeout}`
-   within 1 s; no file at `dest_path`, no leftover sibling temp.
-8. timeout 1 ms on head and on put → `{:transport, :timeout}` within 1 s.
+6. 64 MiB object put + get; during the transfer, a sampler polls
+   `:erlang.memory(:total)` every 10 ms and asserts peak < baseline +
+   48 MiB (VM-wide, so worker processes count; the suite runs this
+   row serially with `async: false`).
+7. get of the 64 MiB object with the adapter's blocking hook
+   (`before_get` for Local; for S3 a slow local HTTP stub that drips
+   1 byte/s — the conformance module accepts a `slow_store_init_arg/0`
+   hook for this) and `timeout: 50` → `{:transport, :timeout}` within
+   1 s; no file at `dest_path` and none at `dest_path <> ".part"`.
+8. head and put under the same blocking mechanism with `timeout: 50` →
+   `{:transport, :timeout}` within 1 s (bounded completion is the
+   requirement, not "fails in 1 ms").
 9. 8-process concurrent create-only race → exactly one `:ok`, seven
    `:precondition_failed`.
 10. concurrent overwrite while a reader gets → reader's bytes are
@@ -549,8 +681,8 @@ shared minio bucket is fine), optional `store_setup/0` /
 12. key encoding vectors (S3 only, via the URL builder): `"a b"`,
     `"a%b"`, `"a?b"`, `"a#b"`, `"a+b"`, `"ü/ß"`, `"x/y/z"` → expected
     percent-encoded paths; round-trip through put/head.
-13. metadata with 32 keys/256-byte values round-trips; CR/LF value →
-    rejected by Mirror validation (not an adapter row).
+13. metadata at the §1.1 maximum (8 keys, 128-byte printable-ASCII
+    values, ≤ 1 KiB total) round-trips through put/head/get.
 Run against `Local` (always) and `S3` (when env set).
 
 ### 7.2 `test/milestone_6_mirror_test.exs`
@@ -564,9 +696,13 @@ Run against `Local` (always) and `S3` (when env set).
 4. restore into a fresh path → `git fsck --strict` clean;
    `git for-each-ref` identical to the source; `HEAD` symbolic to the
    same target; §2 config keys; pack/idx byte-identical to the source.
-5. restored mirror + incremental `Fetch.fetch` → result (refs,
-   updated_refs, rejected_refs) equal to a from-scratch fetch at the
-   same remote state.
+5. restored mirror + incremental `Fetch.fetch` → the RESULTING
+   repository (`git for-each-ref`, object set via `git cat-file
+   --batch-all-objects --batch-check`) equals a from-scratch fetch at
+   the same remote state; `updated_refs` names the same refs with the
+   same new oids (modes differ by construction: `:fast_forward` vs
+   `:created`, so compare names + new oids only); `rejected_refs ==
+   []` in both.
 6. restore into a non-empty dir → `:invalid_argument`, untouched; into
    an EXISTING EMPTY dir → succeeds (rename-over-empty).
 7. restore missing key → `:not_found`, no dir, no siblings.
@@ -609,12 +745,24 @@ Run against `Local` (always) and `S3` (when env set).
     `:backend_error` retryable.
 22. credentials fun raising / returning garbage →
     `:credentials_unavailable`, sentinel absent.
-23. caller killed mid-publish (Task + `Process.exit(:kill)` while the
-    fake adapter blocks in put) → lease released (a second publish is
-    not `:busy`), tmp swept by the next call.
+23. caller killed mid-publish (`Process.exit(pid, :kill)` while the
+    Local `before_put` hook blocks) → lease released (a second publish
+    is not `:busy`); that second publish's entry sweep removes the
+    orphaned `*.publish-*` tmp and any `.<basename>.publish-*.tmp-*`
+    Writer temp (assert both absent after it returns).
 24. publish/restore option validation: unknown key, improper list,
     timeout out of range, store module missing a callback → typed
     `:invalid_argument`, nothing raised.
+25. strict_refs: a mirror with a ref pointing at a missing object →
+    `Bundle.write(strict_refs: true)` returns `:missing_object`;
+    default mode returns ok with a warning; publish of that mirror
+    fails (never uploads a degraded snapshot).
+26. HEAD disagreement: a crafted bundle whose `head_symref` names a
+    row with a different oid than the HEAD row → restore
+    `:malformed_bundle` (`verify_code: :malformed_ref`), stage removed.
+27. zero-ref bundle with an internally corrupt pack (section hash
+    recomputed so `verify` passes) → restore `:malformed_bundle` via
+    the per-pack probe.
 
 Oracle: pinned git 2.55 as in M5a.
 
@@ -657,12 +805,14 @@ returns `:unsupported_operation`; `Gitility.ObjectStore.Local` and
   naming the option (code change).
 - README: "Replicating mirrors" section; consumer live-fire numbers.
 - CHANGELOG [Unreleased]: Added (Mirror, ObjectStore + S3 + Local +
-  Conformance, `Repository.init_bare/2`, `Bundle.write` `:generation`),
+  Conformance, `Repository.init_bare/2`, `Bundle.write` `:generation`,
+  `:strict_refs`, `:mode`),
   Changed (gitility-created bare dirs are gc-safe; new error codes
   `not_found`/`conflict`/`malformed_bundle`), Fixed (history typed
   error).
-- `mix.exs`: `{:req, "~> 0.5", optional: true}`; hexdocs groups;
-  `Gitility.ObjectStore.Local.Supervisor` + `Registry` in
+- `mix.exs`: `{:req, "~> 0.5.2", optional: true}`; hexdocs groups;
+  `Gitility.ObjectStore.Local.Supervisor` + `Registry` and the
+  conditional `Gitility.ObjectStore.S3.Finch` child in
   `application.ex`.
 - `mix docs --warnings-as-errors` clean.
 

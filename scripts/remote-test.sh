@@ -260,6 +260,7 @@ export MIX_ENV=test
 mix local.hex --force >/dev/null
 mix local.rebar --force >/dev/null
 mix deps.get >/dev/null
+mix format --check-formatted
 mix compile --warnings-as-errors
 mix run --no-compile -e 'Gitility.TestSupport.MinioHelper.create_bucket_from_env!()'
 echo "[remote] MinIO bucket $GITILITY_MINIO_BUCKET ready"

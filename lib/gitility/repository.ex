@@ -62,7 +62,10 @@ defmodule Gitility.Repository do
   The destination must be absent or an empty directory. Creation is not
   idempotent: a non-empty destination is rejected and never modified. Parent
   directories are created as needed. `hash: :sha256` is reported as
-  `:unsupported_hash` before the filesystem is touched.
+  `:unsupported_hash` before the filesystem is touched. The `:gitility`
+  application must be started so creation can acquire the shared
+  `Gitility.Fetch.Locks` lease; if that process is not running, creation
+  returns a non-retryable `:backend_error`.
   """
   @spec init_bare(Path.t(), keyword()) :: :ok | {:error, Error.t()}
   def init_bare(path, opts \\ []) do
@@ -364,6 +367,8 @@ defmodule Gitility.Repository do
     rescue
       _exception -> init_lock_error()
     catch
+      :exit, {:noproc, _details} -> init_application_not_started_error()
+      :exit, :noproc -> init_application_not_started_error()
       :exit, _reason -> init_lock_error()
       _kind, _reason -> init_lock_error()
     end
@@ -385,6 +390,16 @@ defmodule Gitility.Repository do
      Error.new(:backend_error, "fetch lock manager is unavailable",
        operation: :repository_init_bare,
        retryable: true
+     )}
+  end
+
+  defp init_application_not_started_error do
+    {:error,
+     Error.new(
+       :backend_error,
+       "the :gitility application must be started (Gitility.Fetch.Locks is not running)",
+       operation: :repository_init_bare,
+       retryable: false
      )}
   end
 

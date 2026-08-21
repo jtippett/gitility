@@ -177,13 +177,36 @@ defmodule Gitility.M6.BundleRepositoryTest do
     assert :ok = Locks.acquire(expanded, 5_000)
 
     try do
-      assert {:error,
-              %Error{code: :busy, operation: :repository_init_bare, retryable: true}} =
+      assert {:error, %Error{code: :busy, operation: :repository_init_bare, retryable: true}} =
                Repository.init_bare(destination)
 
       refute File.exists?(destination)
     after
       Locks.release(expanded)
+    end
+  end
+
+  test "init_bare reports a stopped application lock manager as non-retryable", context do
+    destination = Path.join(context.directory, "locks-not-running.git")
+    assert :ok = Supervisor.terminate_child(Gitility.Supervisor, Gitility.Fetch.Supervisor)
+
+    try do
+      assert {:error,
+              %Error{
+                code: :backend_error,
+                message:
+                  "the :gitility application must be started (Gitility.Fetch.Locks is not running)",
+                operation: :repository_init_bare,
+                retryable: false
+              }} = Repository.init_bare(destination)
+
+      refute File.exists?(destination)
+    after
+      case Supervisor.restart_child(Gitility.Supervisor, Gitility.Fetch.Supervisor) do
+        {:ok, _pid} -> :ok
+        {:ok, _pid, _info} -> :ok
+        other -> flunk("could not restart fetch supervisor: #{inspect(other)}")
+      end
     end
   end
 

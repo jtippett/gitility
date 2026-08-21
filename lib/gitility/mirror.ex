@@ -56,6 +56,7 @@ defmodule Gitility.Mirror do
     RefName,
     RefTarget
   }
+
   alias Gitility.Bundle.Format
   alias Gitility.Fetch.Locks
   alias Gitility.Mirror.{Receipt, Restore}
@@ -241,7 +242,7 @@ defmodule Gitility.Mirror do
         adapter_error(reason, :head, :publish)
 
       :deadline_timeout ->
-        timeout_error(:publish, :head)
+        timeout_error(:publish, :head, %{indeterminate: false})
     end
   end
 
@@ -276,11 +277,21 @@ defmodule Gitility.Mirror do
     opts = maybe_keyword(opts, :created_at, request.created_at)
     opts = maybe_keyword(opts, :git_executable, request.git_executable)
 
-    with {:ok, receipt} <- rewrite_result(Bundle.write(tmp, opts), :publish),
+    with :ok <-
+           deadline_check(request.deadline, :publish, :bundle_write, %{
+             indeterminate: false
+           }),
+         {:ok, receipt} <- rewrite_result(Bundle.write(tmp, opts), :publish),
          true <- receipt.warnings == [] || strict_warning_error(),
-         :ok <- deadline_check(request.deadline, :publish, :bundle_write),
+         :ok <-
+           deadline_check(request.deadline, :publish, :bundle_write, %{
+             indeterminate: false
+           }),
          {:ok, toc} <- rewrite_result(Format.parse(tmp), :publish),
-         :ok <- deadline_check(request.deadline, :publish, :bundle_parse) do
+         :ok <-
+           deadline_check(request.deadline, :publish, :bundle_parse, %{
+             indeterminate: false
+           }) do
       {:ok, toc, tips_digest(toc.refs, toc.metadata["head_symref"])}
     else
       {:error, %Error{} = error} -> {:error, error}
@@ -1039,9 +1050,12 @@ defmodule Gitility.Mirror do
     case adapter_init(request.module, request.init_arg, request.deadline, operation) do
       {:ok, state} -> {:ok, state}
       {:error, reason} -> adapter_error(reason, :init, operation)
-      :deadline_timeout -> timeout_error(operation, :init)
+      :deadline_timeout -> timeout_error(operation, :init, pre_put_timeout_details(operation))
     end
   end
+
+  defp pre_put_timeout_details(:publish), do: %{indeterminate: false}
+  defp pre_put_timeout_details(_operation), do: %{}
 
   defp adapter_init(module, init_arg, deadline, operation) do
     with {:ok, time_left} <- raw_time_left(deadline) do
@@ -1496,9 +1510,7 @@ defmodule Gitility.Mirror do
       {Regex.compile!("\\A#{basename}\\.publish-[0-9a-f]{32}\\.tmp\\z"), :regular},
       {Regex.compile!("\\A\\.#{basename}\\.publish-[0-9a-f]{32}\\.tmp\\.tmp-[0-9a-f]{32}\\z"),
        :regular},
-      {Regex.compile!(
-         "\\A\\.#{basename}\\.publish-[0-9a-f]{32}\\.tmp\\.staging-[0-9a-f]{32}\\z"
-       ),
+      {Regex.compile!("\\A\\.#{basename}\\.publish-[0-9a-f]{32}\\.tmp\\.staging-[0-9a-f]{32}\\z"),
        :directory}
     ]
 

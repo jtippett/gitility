@@ -7,19 +7,27 @@ defmodule Gitility.ObjectStore.Local.Server do
   @idle_timeout 60_000
   @version_age_seconds 60 * 60
   @pointer_regex ~r/\A[0-9a-f]{64}\z/
+  @current_temp_regex ~r/\Acurrent\.tmp-[0-9a-f]{32}\z/
+  @key_temp_regex ~r/\Akey\.tmp-[0-9a-f]{32}\z/
 
   def start_link(root) when is_binary(root) do
-    GenServer.start_link(__MODULE__, root, name: name(root))
+    start_link({root, []})
+  end
+
+  def start_link({root, opts}) when is_binary(root) and is_list(opts) do
+    GenServer.start_link(__MODULE__, {root, opts}, name: name(root))
   end
 
   @doc false
   @spec name(Path.t()) :: {:via, Registry, {module(), Path.t()}}
   def name(root), do: {:via, Registry, {@registry, root}}
 
-  def child_spec(root) do
+  def child_spec(root) when is_binary(root), do: child_spec({root, []})
+
+  def child_spec({root, _opts} = start_arg) when is_binary(root) do
     %{
       id: {__MODULE__, root},
-      start: {__MODULE__, :start_link, [root]},
+      start: {__MODULE__, :start_link, [start_arg]},
       restart: :transient,
       type: :worker
     }
@@ -48,11 +56,23 @@ defmodule Gitility.ObjectStore.Local.Server do
   def unpin(server, version), do: GenServer.call(server, {:unpin, version})
 
   @impl GenServer
-  def init(root) do
+  def init(root) when is_binary(root), do: init({root, []})
+
+  def init({root, opts}) do
     objects = Path.join(root, "objects")
 
-    with :ok <- ensure_objects_directory(objects) do
-      {:ok, %{root: root, objects: objects, pins: %{}, monitors: %{}}, @idle_timeout}
+    with {:ok, idle_timeout} <- idle_timeout(opts),
+         :ok <- ensure_objects_directory(objects) do
+      state = %{
+        root: root,
+        objects: objects,
+        pins: %{},
+        holds: %{},
+        monitors: %{},
+        idle_timeout: idle_timeout
+      }
+
+      {:ok, state, idle_timeout}
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -64,18 +84,39 @@ defmodule Gitility.ObjectStore.Local.Server do
       case read_current(state.objects, hash) do
         {:ok, version, meta} ->
           state = add_pin(state, version, holder)
-          {:reply, {:ok, {version, meta}}, state, @idle_timeout}
+          {:reply, {:ok, {version, meta}}, state, state.idle_timeout}
 
         {:error, reason} ->
-          {:reply, {:error, reason}, state, @idle_timeout}
+          {:reply, {:error, reason}, state, state.idle_timeout}
       end
     else
-      {:reply, {:error, {:adapter, :bad_return}}, state, @idle_timeout}
+      {:reply, {:error, {:adapter, :bad_return}}, state, state.idle_timeout}
     end
   end
 
   def handle_call({:unpin, version}, {holder, _tag}, state) do
-    {:reply, :ok, remove_pin(state, version, holder), @idle_timeout}
+    {:reply, :ok, remove_pin(state, version, holder), state.idle_timeout}
+  end
+
+  def handle_call({:hold, ref}, {holder, _tag}, state) when is_reference(ref) do
+    if Map.has_key?(state.holds, ref) do
+      {:reply, {:error, {:adapter, :bad_return}}, state, state.idle_timeout}
+    else
+      state = add_hold(state, ref, holder)
+      {:reply, :ok, state, state.idle_timeout}
+    end
+  end
+
+  def handle_call({:hold, _ref}, _from, state) do
+    {:reply, {:error, {:adapter, :bad_return}}, state, state.idle_timeout}
+  end
+
+  def handle_call({:release, ref}, {holder, _tag}, state) when is_reference(ref) do
+    {:reply, :ok, remove_hold(state, ref, holder), state.idle_timeout}
+  end
+
+  def handle_call({:release, _ref}, _from, state) do
+    {:reply, :ok, state, state.idle_timeout}
   end
 
   def handle_call({:commit, hash, if_match, version, after_commit}, _from, state) do
@@ -85,7 +126,7 @@ defmodule Gitility.ObjectStore.Local.Server do
         {:reply, reply, state, {:continue, {:sweep, hash}}}
 
       {:error, reason} ->
-        {:reply, {:error, reason}, state, @idle_timeout}
+        {:reply, {:error, reason}, state, state.idle_timeout}
     end
   end
 
@@ -94,16 +135,16 @@ defmodule Gitility.ObjectStore.Local.Server do
     |> object_hashes()
     |> Enum.each(&sweep_hash(state, &1))
 
-    {:reply, :ok, state, @idle_timeout}
+    {:reply, :ok, state, state.idle_timeout}
   end
 
   def handle_call({:force_sweep, hash}, _from, state)
       when is_binary(hash) do
     if valid_pointer?(hash) do
       sweep_hash(state, hash)
-      {:reply, :ok, state, @idle_timeout}
+      {:reply, :ok, state, state.idle_timeout}
     else
-      {:reply, {:error, {:adapter, :bad_return}}, state, @idle_timeout}
+      {:reply, {:error, {:adapter, :bad_return}}, state, state.idle_timeout}
     end
   end
 
@@ -113,25 +154,33 @@ defmodule Gitility.ObjectStore.Local.Server do
         {version, %{count: Enum.sum(Map.values(holders)), holders: holders}}
       end)
 
-    {:reply,
-     %{pins: pins, pin_count: total_pins(state), monitored_pids: Map.keys(state.monitors)}, state,
-     @idle_timeout}
+    debug = %{
+      pins: pins,
+      pin_count: total_pins(state),
+      hold_count: map_size(state.holds),
+      monitored_pids: Map.keys(state.monitors)
+    }
+
+    {:reply, debug, state, state.idle_timeout}
   end
 
   def handle_call(:pin_count, _from, state),
-    do: {:reply, total_pins(state), state, @idle_timeout}
+    do: {:reply, total_pins(state), state, state.idle_timeout}
 
   @impl GenServer
   def handle_continue({:sweep, hash}, state) do
     sweep_hash(state, hash)
-    {:noreply, state, @idle_timeout}
+    {:noreply, state, state.idle_timeout}
   end
 
   @impl GenServer
-  def handle_info(:timeout, %{pins: pins} = state) when map_size(pins) == 0,
-    do: {:stop, :normal, state}
-
-  def handle_info(:timeout, state), do: {:noreply, state, @idle_timeout}
+  def handle_info(:timeout, state) do
+    if map_size(state.pins) == 0 and map_size(state.holds) == 0 do
+      {:stop, :normal, state}
+    else
+      {:noreply, state, state.idle_timeout}
+    end
+  end
 
   def handle_info({:DOWN, monitor, :process, holder, _reason}, state) do
     case state.monitors do
@@ -145,11 +194,20 @@ defmodule Gitility.ObjectStore.Local.Server do
             end
           end)
 
-        {:noreply, %{state | pins: pins, monitors: Map.delete(state.monitors, holder)},
-         @idle_timeout}
+        holds =
+          Map.reject(state.holds, fn {_ref, hold_holder} -> hold_holder == holder end)
+
+        state = %{
+          state
+          | pins: pins,
+            holds: holds,
+            monitors: Map.delete(state.monitors, holder)
+        }
+
+        {:noreply, state, state.idle_timeout}
 
       _other ->
-        {:noreply, state, @idle_timeout}
+        {:noreply, state, state.idle_timeout}
     end
   end
 
@@ -297,15 +355,7 @@ defmodule Gitility.ObjectStore.Local.Server do
   defp add_pin(state, version, holder) do
     holders = Map.get(state.pins, version, %{})
     pins = Map.put(state.pins, version, Map.update(holders, holder, 1, &(&1 + 1)))
-
-    monitors =
-      if Map.has_key?(state.monitors, holder) do
-        state.monitors
-      else
-        Map.put(state.monitors, holder, Process.monitor(holder))
-      end
-
-    %{state | pins: pins, monitors: monitors}
+    state |> Map.put(:pins, pins) |> monitor_holder(holder)
   end
 
   defp remove_pin(state, version, holder) do
@@ -325,25 +375,51 @@ defmodule Gitility.ObjectStore.Local.Server do
           state.pins
       end
 
-    monitors =
-      if holder_pinned?(pins, holder) do
-        state.monitors
-      else
-        case Map.pop(state.monitors, holder) do
-          {nil, monitors} ->
-            monitors
-
-          {monitor, monitors} ->
-            Process.demonitor(monitor, [:flush])
-            monitors
-        end
-      end
-
-    %{state | pins: pins, monitors: monitors}
+    state |> Map.put(:pins, pins) |> demonitor_inactive_holder(holder)
   end
 
-  defp holder_pinned?(pins, holder) do
-    Enum.any?(pins, fn {_version, holders} -> Map.has_key?(holders, holder) end)
+  defp add_hold(state, ref, holder) do
+    state
+    |> Map.put(:holds, Map.put(state.holds, ref, holder))
+    |> monitor_holder(holder)
+  end
+
+  defp remove_hold(state, ref, holder) do
+    state =
+      case state.holds do
+        %{^ref => ^holder} -> Map.put(state, :holds, Map.delete(state.holds, ref))
+        _other -> state
+      end
+
+    demonitor_inactive_holder(state, holder)
+  end
+
+  defp monitor_holder(state, holder) do
+    if Map.has_key?(state.monitors, holder) do
+      state
+    else
+      %{state | monitors: Map.put(state.monitors, holder, Process.monitor(holder))}
+    end
+  end
+
+  defp demonitor_inactive_holder(state, holder) do
+    if holder_active?(state, holder) do
+      state
+    else
+      case Map.pop(state.monitors, holder) do
+        {nil, _monitors} ->
+          state
+
+        {monitor, monitors} ->
+          Process.demonitor(monitor, [:flush])
+          %{state | monitors: monitors}
+      end
+    end
+  end
+
+  defp holder_active?(state, holder) do
+    Enum.any?(state.pins, fn {_version, holders} -> Map.has_key?(holders, holder) end) or
+      Enum.any?(state.holds, fn {_ref, hold_holder} -> hold_holder == holder end)
   end
 
   defp total_pins(state) do
@@ -358,23 +434,40 @@ defmodule Gitility.ObjectStore.Local.Server do
     with {:ok, %{type: :directory}} <- File.lstat(directory),
          {:ok, current} <- current_for_sweep(directory),
          {:ok, entries} <- File.ls(directory) do
-      Enum.each(entries, fn entry ->
-        with "v-" <> version <- entry,
-             true <- valid_pointer?(version),
-             false <- version == current,
-             false <- Map.has_key?(state.pins, version),
-             path = Path.join(directory, entry),
-             {:ok, stat} <- File.lstat(path, time: :posix),
-             true <- stat.type == :directory,
-             true <- old_enough?(stat.mtime) do
-          File.rm_rf(path)
-        else
-          _other -> :ok
-        end
-      end)
+      Enum.each(entries, &sweep_entry(state, directory, current, &1))
     else
       _error -> :ok
     end
+  end
+
+  defp sweep_entry(state, directory, current, "v-" <> version = entry) do
+    with true <- valid_pointer?(version),
+         false <- version == current,
+         false <- Map.has_key?(state.pins, version),
+         path = Path.join(directory, entry),
+         {:ok, stat} <- File.lstat(path, time: :posix),
+         true <- stat.type == :directory,
+         true <- old_enough?(stat.mtime) do
+      File.rm_rf(path)
+    else
+      _other -> :ok
+    end
+  end
+
+  defp sweep_entry(_state, directory, _current, entry) do
+    with true <- random_temp?(entry),
+         path = Path.join(directory, entry),
+         {:ok, stat} <- File.lstat(path, time: :posix),
+         true <- stat.type == :regular,
+         true <- old_enough?(stat.mtime) do
+      File.rm(path)
+    else
+      _other -> :ok
+    end
+  end
+
+  defp random_temp?(entry) do
+    Regex.match?(@current_temp_regex, entry) or Regex.match?(@key_temp_regex, entry)
   end
 
   defp current_for_sweep(directory) do
@@ -409,6 +502,13 @@ defmodule Gitility.ObjectStore.Local.Server do
   end
 
   defp old_enough?(_mtime), do: false
+
+  defp idle_timeout([]), do: {:ok, @idle_timeout}
+
+  defp idle_timeout(idle_timeout: timeout) when is_integer(timeout) and timeout > 0,
+    do: {:ok, timeout}
+
+  defp idle_timeout(_opts), do: {:error, :invalid_options}
 
   defp validate_hash_and_version(hash, version) do
     if valid_pointer?(hash) and valid_pointer?(version) do

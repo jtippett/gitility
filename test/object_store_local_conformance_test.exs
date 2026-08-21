@@ -90,6 +90,34 @@ defmodule Gitility.ObjectStoreLocalConformanceTest do
     assert Path.wildcard(Path.join(object_directory, "key.tmp-*")) == []
   end
 
+  test "sweep removes aged random current and key temps but preserves fresh ones" do
+    scratch = Gitility.ObjectStore.Conformance.scratch_directory()
+    on_exit(fn -> File.rm_rf(scratch) end)
+
+    root = Path.join(scratch, "store")
+    assert {:ok, state} = Local.init(root: root)
+    key = "sweep/random-temps"
+    object_directory = Path.join([root, "objects", Local.key_hash(key)])
+    File.mkdir!(object_directory)
+
+    aged_current = Path.join(object_directory, "current.tmp-#{String.duplicate("a", 32)}")
+    aged_key = Path.join(object_directory, "key.tmp-#{String.duplicate("b", 32)}")
+    fresh_current = Path.join(object_directory, "current.tmp-#{String.duplicate("c", 32)}")
+    fresh_key = Path.join(object_directory, "key.tmp-#{String.duplicate("d", 32)}")
+    aged_directory = Path.join(object_directory, "current.tmp-#{String.duplicate("e", 32)}")
+
+    Enum.each([aged_current, aged_key, fresh_current, fresh_key], &File.write!(&1, "temp"))
+    File.mkdir!(aged_directory)
+    Enum.each([aged_current, aged_key, aged_directory], &age_path!/1)
+
+    assert :ok = Local.force_sweep(state, key)
+    refute File.exists?(aged_current)
+    refute File.exists?(aged_key)
+    assert File.regular?(fresh_current)
+    assert File.regular?(fresh_key)
+    assert File.dir?(aged_directory)
+  end
+
   test "sweep aborts a key when current is incomplete or unreadable" do
     scratch = Gitility.ObjectStore.Conformance.scratch_directory()
     on_exit(fn -> File.rm_rf(scratch) end)
@@ -181,6 +209,123 @@ defmodule Gitility.ObjectStoreLocalConformanceTest do
     assert is_pid(revived)
     refute revived == server
     assert File.read!(destination) == "survives revival"
+  end
+
+  test "put holds a short-idle server through slow preparation" do
+    scratch = Gitility.ObjectStore.Conformance.scratch_directory()
+    on_exit(fn -> File.rm_rf(scratch) end)
+
+    root = Path.join(scratch, "store")
+    source = Path.join(scratch, "source")
+    File.write!(source, "slow preparation")
+    parent = self()
+    server_name = LocalServer.name(Path.expand(root))
+
+    before_put = fn ->
+      send(parent, {:put_server, :before_put, GenServer.whereis(server_name)})
+      :ok
+    end
+
+    before_commit = fn ->
+      server = GenServer.whereis(server_name)
+
+      send(
+        parent,
+        {:put_server, :before_commit, server, LocalServer.debug_state(server).hold_count}
+      )
+
+      Process.sleep(350)
+      server = GenServer.whereis(server_name)
+
+      send(
+        parent,
+        {:put_server, :after_sleep, server, LocalServer.debug_state(server).hold_count}
+      )
+
+      :ok
+    end
+
+    after_commit = fn ->
+      send(parent, {:put_server, :after_commit, self()})
+      :ok
+    end
+
+    assert {:ok, state} =
+             Local.init(
+               root: root,
+               test_hooks: %{
+                 idle_timeout: 100,
+                 before_put: before_put,
+                 before_commit: before_commit,
+                 after_commit: after_commit
+               }
+             )
+
+    assert {:ok, %{etag: _etag}} =
+             Local.put(state, source, "idle/held-put",
+               timeout: 5_000,
+               if_match: :none,
+               metadata: %{},
+               content_type: @content_type
+             )
+
+    assert_receive {:put_server, :before_put, server}
+    assert is_pid(server)
+    assert_receive {:put_server, :before_commit, ^server, 1}
+    assert_receive {:put_server, :after_sleep, ^server, 1}
+    assert_receive {:put_server, :after_commit, ^server}
+  end
+
+  test "put caller death releases its monitored server hold" do
+    scratch = Gitility.ObjectStore.Conformance.scratch_directory()
+    on_exit(fn -> File.rm_rf(scratch) end)
+
+    root = Path.join(scratch, "store")
+    source = Path.join(scratch, "source")
+    File.write!(source, "killed preparation")
+    parent = self()
+    server_name = LocalServer.name(Path.expand(root))
+
+    before_commit = fn ->
+      server = GenServer.whereis(server_name)
+      send(parent, {:held_put, self(), server})
+      receive do: (:never -> :ok)
+    end
+
+    assert {:ok, state} =
+             Local.init(
+               root: root,
+               test_hooks: %{idle_timeout: 100, before_commit: before_commit}
+             )
+
+    caller =
+      spawn(fn ->
+        result =
+          Local.put(state, source, "idle/killed-put",
+            timeout: 5_000,
+            if_match: :none,
+            metadata: %{},
+            content_type: @content_type
+          )
+
+        send(parent, {:killed_put_result, result})
+      end)
+
+    caller_monitor = Process.monitor(caller)
+    assert_receive {:held_put, holder, server}, 1_000
+    assert is_pid(holder)
+    assert is_pid(server)
+
+    assert %{hold_count: 1, monitored_pids: monitored_pids} =
+             LocalServer.debug_state(server)
+
+    assert holder in monitored_pids
+    server_monitor = Process.monitor(server)
+    Process.exit(caller, :kill)
+
+    assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}, 1_000
+    assert_receive {:DOWN, ^server_monitor, :process, ^server, :normal}, 1_000
+    refute_receive {:killed_put_result, _result}
   end
 
   defp age_path!(path) do

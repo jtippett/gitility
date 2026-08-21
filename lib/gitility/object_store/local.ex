@@ -45,13 +45,14 @@ defmodule Gitility.ObjectStore.Local do
   def init(opts) do
     with :ok <- validate_init_options(opts),
          root <- opts |> Keyword.fetch!(:root) |> Path.expand(),
+         test_hooks <- Keyword.get(opts, :test_hooks, %{}),
          :ok <- ensure_root(root),
-         {:ok, _server} <- start_server(root) do
+         {:ok, _server} <- start_server(root, test_hooks) do
       {:ok,
        %__MODULE__{
          root: root,
          server: Server.name(root),
-         test_hooks: Keyword.get(opts, :test_hooks, %{})
+         test_hooks: test_hooks
        }}
     else
       {:error, {:unsupported_operation, _message}} = error -> error
@@ -170,7 +171,7 @@ defmodule Gitility.ObjectStore.Local do
     do: :sha256 |> :crypto.hash(key) |> Base.encode16(case: :lower)
 
   defp do_head(state, key, deadline) do
-    with {:ok, _server} <- start_server(state.root),
+    with {:ok, _server} <- start_server(state.root, state.test_hooks),
          :ok <- run_hook(state, :before_head),
          {:ok, {version, meta}} <- pin(state, key, deadline) do
       try do
@@ -187,7 +188,7 @@ defmodule Gitility.ObjectStore.Local do
   end
 
   defp do_get(state, key, part, deadline) do
-    with {:ok, _server} <- start_server(state.root),
+    with {:ok, _server} <- start_server(state.root, state.test_hooks),
          {:ok, {version, meta}} <- pin(state, key, deadline) do
       try do
         source = version_path(state, key, version) |> Path.join("data")
@@ -214,12 +215,20 @@ defmodule Gitility.ObjectStore.Local do
   end
 
   defp do_put(state, src_path, key, opts, deadline) do
-    with {:ok, _server} <- start_server(state.root),
-         :ok <- run_hook(state, :before_put),
-         :ok <- remaining_ok(deadline),
-         {:ok, version, directory} <- create_version(state, key),
-         result <- prepare_and_commit(state, src_path, key, version, directory, opts, deadline) do
-      result
+    with {:ok, _server} <- start_server(state.root, state.test_hooks),
+         ref = make_ref(),
+         :ok <- hold(state, ref, deadline) do
+      try do
+        with :ok <- run_hook(state, :before_put),
+             :ok <- remaining_ok(deadline),
+             {:ok, version, directory} <- create_version(state, key),
+             result <-
+               prepare_and_commit(state, src_path, key, version, directory, opts, deadline) do
+          result
+        end
+      after
+        release_hold(state.server, ref, deadline)
+      end
     end
   end
 
@@ -479,7 +488,7 @@ defmodule Gitility.ObjectStore.Local do
       {:error, {:transport, :closed}} when retries_left > 0 ->
         Process.sleep(1)
 
-        case start_server(state.root) do
+        case start_server(state.root, state.test_hooks) do
           {:ok, _server} -> pin(state, key, deadline, retries_left - 1)
           {:error, _reason} = error -> error
         end
@@ -487,6 +496,28 @@ defmodule Gitility.ObjectStore.Local do
       result ->
         result
     end
+  end
+
+  defp hold(state, ref, deadline), do: hold(state, ref, deadline, 3)
+
+  defp hold(state, ref, deadline, retries_left) do
+    case server_call(state.server, {:hold, ref}, remaining(deadline)) do
+      {:error, {:transport, :closed}} when retries_left > 0 ->
+        Process.sleep(1)
+
+        case start_server(state.root, state.test_hooks) do
+          {:ok, _server} -> hold(state, ref, deadline, retries_left - 1)
+          {:error, _reason} = error -> error
+        end
+
+      result ->
+        result
+    end
+  end
+
+  defp release_hold(server, ref, deadline) do
+    _result = server_call(server, {:release, ref}, remaining(deadline))
+    :ok
   end
 
   defp unpin(server, version, deadline) do
@@ -564,8 +595,9 @@ defmodule Gitility.ObjectStore.Local do
   end
 
   defp validate_hooks(hooks) when is_map(hooks) do
-    if Enum.all?(hooks, fn {name, hook} ->
-         name in @hook_names and is_function(hook, 0)
+    if Enum.all?(hooks, fn
+         {:idle_timeout, timeout} -> is_integer(timeout) and timeout > 0
+         {name, hook} -> name in @hook_names and is_function(hook, 0)
        end) do
       :ok
     else
@@ -656,9 +688,9 @@ defmodule Gitility.ObjectStore.Local do
     end
   end
 
-  defp start_server(root) do
+  defp start_server(root, test_hooks) do
     try do
-      case Supervisor.server(root) do
+      case Supervisor.server(root, server_options(test_hooks)) do
         {:ok, _server} = ok -> ok
         {:error, _reason} -> {:error, {:adapter, :server_unavailable}}
       end
@@ -666,6 +698,9 @@ defmodule Gitility.ObjectStore.Local do
       :exit, _reason -> {:error, {:adapter, :server_unavailable}}
     end
   end
+
+  defp server_options(%{idle_timeout: idle_timeout}), do: [idle_timeout: idle_timeout]
+  defp server_options(_test_hooks), do: []
 
   defp timeout_options(opts) do
     with :ok <- keyword_options(opts, [:timeout]),

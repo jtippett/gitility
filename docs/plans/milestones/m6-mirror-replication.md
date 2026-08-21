@@ -188,8 +188,9 @@ expanded root, started on demand under
 the application tree) and registered in a `Registry` keyed by root.
 `put`: (1) outside the server, write `v-<rand>/data` (from `src_path`,
 0600) and `meta`; (2) `GenServer.call(server, {:commit, hash,
-if_match, version})` — the server reads `current`, checks the
-precondition, writes an exclusive `current.tmp-<32hex>` + `rename` → `current`, replies;
+if_match, version, after_commit})` — the server reads `current`, checks the
+precondition, writes an exclusive `current.tmp-<32hex>` + `rename` →
+`current`, replies;
 (3) on `:precondition_failed` the caller deletes its version dir.
 `get`/`head`: `GenServer.call(server, {:pin, hash})` → the server
 reads `current`, reads and validates `meta` (metadata captured at pin

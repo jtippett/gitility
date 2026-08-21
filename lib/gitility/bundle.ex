@@ -590,7 +590,8 @@ defmodule Gitility.Bundle do
 
   defp validate_strict_ref_name(name) do
     case RefName.validate(name) do
-      :ok -> :ok
+      :ok ->
+        :ok
 
       {:error, reason} ->
         strict_ref_error("ref #{inspect(name)} is not a portable full reference name",

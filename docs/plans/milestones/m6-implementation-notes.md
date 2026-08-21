@@ -85,6 +85,37 @@ Frozen specification: `m6-mirror-replication.md`, SPEC v7
 - B8: Local's timeout row blocks after reading a 64 MiB body chunk and proves
   both destination paths are absent.
 
+## Review round 2
+
+- R2-1: the Sprite's whole-project `mix format` output was synced back for
+  `lib/gitility/bundle.ex`, `lib/gitility/mirror.ex`,
+  `test/milestone_6_bundle_repository_test.exs`, and
+  `test/milestone_6_mirror_test.exs`. The remote `mix` stage now runs
+  `mix format --check-formatted` before compilation so default verification
+  catches formatter drift.
+- R2-2: Local `put` acquires a caller-monitored server `{:hold, ref}` before
+  any hook or version creation. Holds share the pin monitor lifecycle, block
+  idle shutdown, release in the caller's `after`, and are removed on caller
+  `:DOWN`. A validated `test_hooks.idle_timeout` Server start option drives a
+  100 ms regression that sleeps 350 ms before commit and observes one server
+  pid and one hold throughout; a caller-kill regression proves `:DOWN` cleanup
+  lets the short-idle server exit normally.
+- R2-3: Local per-key sweep now removes only aged regular files whose names
+  exactly match `current.tmp-<32hex>` or `key.tmp-<32hex>`. Coverage proves
+  aged files disappear while fresh files and an aged directory decoy survive.
+- R2-4: `Repository.init_bare/2` documents its running-application
+  requirement and classifies a `Gitility.Fetch.Locks` `:noproc` exit as a
+  non-retryable `:backend_error` with the application-start message. Other
+  lock-manager failures retain their retryable classification.
+- R2-5: SPEC v7 §1.2 now records the actual five-element Local commit message,
+  `{:commit, hash, if_match, version, after_commit}`.
+- R2-6: every publish deadline exit before PUT invocation now carries
+  `details.indeterminate: false`; only a killed in-flight PUT remains
+  indeterminate. FakeStore's HEAD hook consumes a small callback budget and
+  proves deterministic pre-PUT expiry with zero PUT calls. During repetition,
+  the existing S3 stalled-PUT row's budget was widened from 100 ms to 500 ms
+  so it reliably reaches the intended PUT before its five-second stub stall.
+
 ## Req streamed SigV4 verification
 
 The resolved and locked `req 0.5.18` implementation (satisfying `~> 0.5.8`)
@@ -157,7 +188,7 @@ The final command was `./scripts/remote-test.sh`, whose default stages are
 `sync rust loom postgres mix rehearsal soak`. Summary lines:
 
 ```text
-==> sync: done (content-verified b8c1ab71c2ca018e2ba9cd294c99f8270f5cb3f3)
+==> sync: done (content-verified ea89b6eb094c743a8035ad1d7dbd58bc98b9b6e0)
 gitility NIF tests:                 2 passed; 0 failed
 gitility-core unit tests (Linux): 268 passed; 0 failed
 HTTP integration tests:            3 passed; 0 failed
@@ -165,13 +196,14 @@ FMT-OK
 Verified exactly two allowlisted, budgeted native thread spawn sites.
 loom: 233 passed; 0 failed
 [remote] PostgreSQL database=sprite_gitility_test role=sprite ready
-3 doctests, 461 tests, 0 failures, 2 skipped (1 excluded)
+mix format --check-formatted: passed
+3 doctests, 466 tests, 0 failures, 2 skipped (1 excluded)
 M5a: 12 repetitions × 23 tests, 0 failures
-M6: 12 repetitions × 36 tests, 0 failures
-ObjectStore.Local: 12 repetitions × 16 tests, 0 failures
+M6: 12 repetitions × 37 tests, 0 failures
+ObjectStore.Local: 12 repetitions × 19 tests, 0 failures
 ObjectStore.S3/MinIO: 12 repetitions × 13 tests, 0 failures
 consumer-smoke: COMPILE WITHOUT REQ + RESTORE -> FETCH -> PUBLISH PARITY OK
 DRESS REHEARSAL: ALL CHECKS PASSED
-soak: 1 test, 0 failures (452 excluded)
+soak: 1 test, 0 failures (457 excluded)
 ==> all requested stages finished
 ```

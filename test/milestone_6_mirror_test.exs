@@ -12,13 +12,15 @@ defmodule Gitility.Milestone6MirrorTest.FakeStore do
   def init(_arg), do: {:error, {:adapter, :invalid_options}}
 
   @impl true
-  def head(%{agent: agent}, key, _opts) do
-    Agent.get(agent, fn state ->
-      case get_in(state, [:objects, key]) do
-        nil -> {:error, :not_found}
-        object -> {:ok, Map.take(object, [:etag, :size, :metadata])}
-      end
-    end)
+  def head(%{agent: agent} = adapter, key, opts) do
+    with :ok <- before_head(adapter, opts) do
+      Agent.get(agent, fn state ->
+        case get_in(state, [:objects, key]) do
+          nil -> {:error, :not_found}
+          object -> {:ok, Map.take(object, [:etag, :size, :metadata])}
+        end
+      end)
+    end
   end
 
   @impl true
@@ -92,6 +94,9 @@ defmodule Gitility.Milestone6MirrorTest.FakeStore do
   defp precondition_matches?(nil, :none), do: true
   defp precondition_matches?(%{etag: etag}, etag), do: true
   defp precondition_matches?(_current, _if_match), do: false
+
+  defp before_head(%{head_hook: hook}, opts) when is_function(hook, 1), do: hook.(opts)
+  defp before_head(_adapter, _opts), do: :ok
 
   defp after_get(%{get_mode: :unreadable}, destination), do: File.chmod(destination, 0o000)
   defp after_get(_adapter, _destination), do: :ok
@@ -220,9 +225,7 @@ defmodule Gitility.Milestone6MirrorTest.HTTPStub do
     [headers, initial] = :binary.split(request, "\r\n\r\n")
 
     expected =
-      case Regex.run(~r/(?:\A|\r\n)content-length:\s*([0-9]+)/i, headers,
-             capture: :all_but_first
-           ) do
+      case Regex.run(~r/(?:\A|\r\n)content-length:\s*([0-9]+)/i, headers, capture: :all_but_first) do
         [digits] -> String.to_integer(digits)
         _missing -> 0
       end
@@ -307,12 +310,14 @@ defmodule Gitility.Milestone6MirrorTest do
   alias Gitility.Differential.Oracle
   alias Gitility.Fetch
   alias Gitility.Fetch.Locks
+
   alias Gitility.Milestone6MirrorTest.{
     FakeStore,
     GraceStore,
     HTTPStub,
     MissingCallbackStore
   }
+
   alias Gitility.Mirror
   alias Gitility.Mirror.{Receipt, Restore}
   alias Gitility.ObjectStore.Local
@@ -669,7 +674,10 @@ defmodule Gitility.Milestone6MirrorTest do
 
   test "14d Mirror metadata validation enforces every boundary and key rule" do
     exact = Map.new(?a..?h, fn letter -> {<<letter>>, String.duplicate("x", 127)} end)
-    assert Enum.sum(Enum.map(exact, fn {key, value} -> byte_size(key) + byte_size(value) end)) == 1_024
+
+    assert Enum.sum(Enum.map(exact, fn {key, value} -> byte_size(key) + byte_size(value) end)) ==
+             1_024
+
     assert :ok = Mirror.validate_metadata(exact)
 
     invalid = [
@@ -721,6 +729,7 @@ defmodule Gitility.Milestone6MirrorTest do
       assert_hygienic(precondition_error, [access, secret, session, "x-amz-"])
 
       second = start_supervised!({HTTPStub, mode: {:status, 200}})
+
       first =
         start_supervised!(
           {HTTPStub,
@@ -748,7 +757,8 @@ defmodule Gitility.Milestone6MirrorTest do
       assert_receive {:put_redirect,
                       {:error,
                        %Error{code: :backend_error, cause: {:http, 301, nil}} =
-                         put_redirect_error}}, 6_000
+                         put_redirect_error}},
+                     6_000
 
       assert HTTPStub.methods(first) == ["HEAD", "PUT"]
       assert HTTPStub.requests(second) == 0
@@ -760,9 +770,7 @@ defmodule Gitility.Milestone6MirrorTest do
       get_first =
         start_supervised!(
           {HTTPStub,
-           mode:
-             {:methods,
-              %{"GET" => {:redirect, HTTPStub.url(get_second) <> "/hostile"}}}}
+           mode: {:methods, %{"GET" => {:redirect, HTTPStub.url(get_second) <> "/hostile"}}}}
         )
 
       get_redirect_log =
@@ -782,7 +790,8 @@ defmodule Gitility.Milestone6MirrorTest do
       assert_receive {:get_redirect,
                       {:error,
                        %Error{code: :backend_error, cause: {:http, 301, nil}} =
-                         get_redirect_error}}, 6_000
+                         get_redirect_error}},
+                     6_000
 
       assert HTTPStub.methods(get_first) == ["GET"]
       assert HTTPStub.requests(get_second) == 0
@@ -835,7 +844,8 @@ defmodule Gitility.Milestone6MirrorTest do
                          %Error{
                            code: :authentication_failed,
                            cause: {:http, 403, "Redacted"}
-                         } = error}}, 6_000
+                         } = error}},
+                       6_000
 
         assert_hygienic_text(log, [access, secret, session, "x-amz-"])
         assert_hygienic(error, [access, secret, session, "x-amz-"])
@@ -844,8 +854,7 @@ defmodule Gitility.Milestone6MirrorTest do
       for {put_response, label} <- [{:close, "close"}, {:stall, "stall"}] do
         stub =
           start_supervised!(
-            {HTTPStub,
-             mode: {:methods, %{"HEAD" => {:status, 404}, "PUT" => put_response}}}
+            {HTTPStub, mode: {:methods, %{"HEAD" => {:status, 404}, "PUT" => put_response}}}
           )
 
         tag = make_ref()
@@ -859,13 +868,15 @@ defmodule Gitility.Milestone6MirrorTest do
                  source,
                  s3_store(HTTPStub.url(stub), credentials),
                  "transport/#{label}",
-                 timeout: if(put_response == :stall, do: 100, else: 2_000)
+                 timeout: if(put_response == :stall, do: 500, else: 2_000)
                )}
             )
           end)
 
         expected_code = if put_response == :stall, do: :timeout, else: :backend_error
-        expected_methods = if put_response == :stall, do: ["HEAD", "PUT"], else: ["HEAD", "PUT", "HEAD"]
+
+        expected_methods =
+          if put_response == :stall, do: ["HEAD", "PUT"], else: ["HEAD", "PUT", "HEAD"]
 
         assert_receive {^tag, {:error, %Error{code: ^expected_code} = error}}, 3_000
         assert HTTPStub.methods(stub) == expected_methods
@@ -975,9 +986,7 @@ defmodule Gitility.Milestone6MirrorTest do
          %{name: "refs/tags/v1", target: oid, kind: :commit}
        ], "refs/tags/v1", :malformed_ref},
       {"self", [], "HEAD", :malformed_ref},
-      {"5000-byte",
-       [],
-       "refs/heads/" <> String.duplicate("a", 5_000 - byte_size("refs/heads/")),
+      {"5000-byte", [], "refs/heads/" <> String.duplicate("a", 5_000 - byte_size("refs/heads/")),
        :malformed_ref},
       {"one-level-lowercase",
        [
@@ -1170,6 +1179,25 @@ defmodule Gitility.Milestone6MirrorTest do
     elapsed = System.monotonic_time(:millisecond) - started
     assert elapsed >= 200
     assert elapsed < 1_500
+  end
+
+  test "21d deadline expiry before PUT is determinate and issues no PUT", context do
+    source = copy_fixture(context.scratch, "pre-put-timeout-source", "sha1-basic-packed.git")
+    {:ok, agent} = Agent.start_link(fn -> %{objects: %{}, put_calls: 0} end)
+
+    head_hook = fn opts ->
+      Process.sleep(Keyword.fetch!(opts, :timeout))
+    end
+
+    store = {FakeStore, %{agent: agent, head_hook: head_hook}}
+
+    assert {:error,
+            %Error{
+              code: :timeout,
+              details: %{phase: :bundle_write, indeterminate: false}
+            }} = Mirror.publish(source, store, "deadline/pre-put", timeout: 250)
+
+    assert Agent.get(agent, & &1.put_calls) == 0
   end
 
   test "22 raising and malformed S3 credential providers are credentials_unavailable and hygienic",
@@ -1671,10 +1699,12 @@ defmodule Gitility.Milestone6MirrorTest do
       |> File.read!()
       |> String.replace(" sorted", "")
 
-    File.write!(component_packed_refs, existing_packed_refs <> "#{component_oid} #{component_name}\n")
+    File.write!(
+      component_packed_refs,
+      existing_packed_refs <> "#{component_oid} #{component_name}\n"
+    )
 
-    assert {:error,
-            %Error{code: :malformed_ref, details: %{reason: :component_too_long}}} =
+    assert {:error, %Error{code: :malformed_ref, details: %{reason: :component_too_long}}} =
              Bundle.write(Path.join(context.scratch, "component-strict.bundle"),
                source: {:repository, component_source},
                strict_refs: true

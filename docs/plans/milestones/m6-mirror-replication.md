@@ -3,7 +3,8 @@
 Status: SPEC v4 (2026-08-21; v1 → v2 after codex review round 1: 12
 blockers, 14 highs, 7 mediums, 2 lows; v2 → v3 after round 2: 6
 blockers, 11 highs, 7 mediums, 1 low; v3 → v4 after round 3: 5
-blockers, 5 highs, 6 mediums, 1 low). Design:
+blockers, 5 highs, 6 mediums, 1 low; v4 → v5 after round 4: 3
+blockers, 3 highs, 5 mediums). Design:
 `docs/plans/2026-08-21-mirror-replication-design.md`. Bundle format is
 FROZEN at 1.0 (`docs/format/bundle-v1.md`); this milestone does not
 change it.
@@ -46,7 +47,12 @@ change it.
   empty mirror. ONE exception: an UNBORN symbolic `HEAD` (HEAD →
   `refs/heads/x` where `x` does not exist, the state of every fresh
   bare repo) is valid — strict mode emits no HEAD row, records
-  `head_symref` in metadata, and returns no warning for it. Default
+  `head_symref` in metadata, and returns no warning for it. "Unborn"
+  is enforced on both sides: the symref MUST be a valid name under
+  `refs/heads/` AND absent from the ref rows (write: absent from the
+  source's refs; restore: absent from the bundle's rows). A symref to
+  an existing ref, to a non-branch, or to `HEAD` itself with no HEAD
+  row is `:malformed_ref` (write) / `:malformed_bundle` (restore). Default
   stays lenient for the existing `write/2` callers.
 
 ## 0. Ground rules (unchanged from M5a, load-bearing)
@@ -385,8 +391,9 @@ returning `NifResult<Term>` built the way `open_local` does
 encoding so `NativeSupport.nif_error/2` applies. Core exposes PUBLIC,
 engine-neutral functions `pub fn init_bare(path: &Path, hash:
 HashKind) -> Result<(), Error>` and `pub fn write_refs(path: &Path,
-refs: Vec<(Vec<u8>, Vec<u8>)>, head: Option<(Vec<u8>, Option<Vec<u8>>)>)
--> Result<u64, Error>` in a new `crates/gitility-core/src/repo_admin.rs`;
+refs: Vec<(Vec<u8>, Vec<u8>)>, head: Option<(Option<Vec<u8>>, Option<Vec<u8>>)>)
+-> Result<u64, Error>` (`(None, None)` → `InvalidArgument`) in a new
+`crates/gitility-core/src/repo_admin.rs`;
 the gix-returning `init_bare_repo(path) -> Result<gix::Repository,
 Error>` stays `pub(crate)` and is shared with `fetch.rs`. The module
 is `#[cfg(feature = "fetch")]` in core (it uses gix; loom builds are
@@ -406,7 +413,9 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
   followed by the §2 config write. `open_or_init_bare` calls it, so
   fetch auto-init gets the config. `hash != sha1` → `UnsupportedHash`.
   Non-empty/non-dir path → `InvalidArgument`.
-- `repo_write_refs(path: Binary, refs: Vec<(Binary, Binary)>, head: Option<(Binary /*oid*/, Option<Binary> /*symref*/)>)`:
+- `repo_write_refs(path: Binary, refs: Vec<(Binary, Binary)>, head: Option<(Option<Binary> /*oid*/, Option<Binary> /*symref*/)>)`
+  (Rustler decodes `nil` as `None` for `Option<Binary>`; a bare
+  `Binary` would `badarg` on the unborn case):
   NEW core helper `repo_admin::write_refs` (there is no existing
   create/update transaction to factor — fetch's updates happen inside
   gix's `prepared.receive`; only prune's delete transaction is ours,
@@ -419,8 +428,10 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
   With `(Some(oid), Some(name))`: `name` MUST be among `refs` AND that
   row's oid MUST equal `oid`, else `InvalidArgument` ("HEAD symref
   target disagrees with HEAD row"). With `(None, Some(name))` (unborn
-  HEAD): write `HEAD` symbolic to `name`, which need not exist. With
-  `(Some(oid), None)`: detached HEAD → `Target::Object(oid)`. A bundle
+  HEAD): `name` MUST start with `refs/heads/`, pass name validation,
+  and be ABSENT from `refs` → write `HEAD` symbolic to it; otherwise
+  `InvalidArgument`. With `(Some(oid), None)`: detached HEAD →
+  `Target::Object(oid)`. `(None, None)` → `InvalidArgument`. A bundle
   cannot restore a HEAD different from the one in its digest. Builds ONE transaction via `repo.edit_references(edits)`
   with the exact gix 0.86 shape:
   ```rust
@@ -474,12 +485,21 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
    no `Gitility.Job`, holder death releases the lease at once (the only
    in-flight native work is `Bundle.write` into a temp file, which is
    never uploaded if the caller died; documented).
-3. Sweep crash leftovers from THIS mirror's previous calls: every
-   `#{expanded}.publish-*` and `.#{basename}.publish-*.tmp-*` (Writer's
-   hidden temp for our tmp name) in the parent directory is removed
-   regardless of age — we hold the lease for `expanded`, so no live
-   publish on this mirror can own them (same-VM), and cross-process
-   publishers are outside the contract. The 1 h rule is gone.
+3. Sweep crash leftovers from THIS mirror's previous calls. No
+   globs: list the parent directory with `File.ls/1` and match each
+   entry EXACTLY against the owned shapes (`Regex.escape(basename)`):
+   - `^#{b}\.publish-[0-9a-f]{32}\.tmp$` (our tmp file),
+   - `^\.#{b}\.publish-[0-9a-f]{32}\.tmp\.tmp-\d+$` (Writer's hidden temp,
+     `writer.ex:16`),
+   - `^\.#{b}\.publish-[0-9a-f]{32}\.tmp\.staging-\d+$` (Bundle's
+     staging dir, `bundle.ex:261`);
+   and inside the mirror, `objects/.gitility-publish-\d+` directories
+   (pack-inventory scratch, `pack_inventory.ex:163`). Matching
+   entries are removed (`rm_rf` for the dirs) regardless of age — we
+   hold the lease for `expanded`, so no live publish on this mirror
+   can own them (same-VM), and cross-process publishers are outside
+   the contract. A sibling like `repo.git.publish-backup` does not
+   match and is never touched.
 4. `module.init(init_arg)` → state (normalise per §1.4 table).
 5. `head(state, key, timeout: remaining)`:
    - `{:ok, h}`: metadata MUST contain `"generation"` parsing as an
@@ -524,8 +544,14 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
      single reconciliation `head` within the budget (if no budget is
      left, return `:timeout` with `details.indeterminate: true`):
      * `{:ok, h2}` and `h2.metadata["tips_digest"] == digest` and
-       `h2.etag != if_match` (or `if_match == :none`) → it committed:
-       `{:ok, %Receipt{etag: h2.etag, ...}}`;
+       `h2.metadata["generation"] == Integer.to_string(gen)` and
+       `h2.etag != if_match` (or `if_match == :none`) → a bundle with
+       OUR tips at OUR generation is stored (ours, or an equivalent
+       concurrent writer's — indistinguishable and equally correct):
+       `{:ok, %Receipt{etag: h2.etag, bytes: h2.size, generation: gen,
+       tips_digest: digest, ref_count/file_count: from h2.metadata}}`
+       — every Receipt field comes from the reconciled HEAD, never
+       from our local file;
      * `{:ok, h2}` and `h2.etag == if_match` (unchanged) → not
        committed: `:backend_error` retryable, cause the transport reason;
      * `{:ok, h2}` with changed etag AND a different digest → someone
@@ -557,15 +583,17 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
 
 1. Validate as §4.1 except `mirror_dir` must NOT exist or must be an
    empty directory (else `:invalid_argument`). Parent directory is
-   created with `mkdir_p` BEFORE the `get` when it does not exist, and
-   recorded as `created_parent = true`; on `:not_found` (and on any
-   failure before the stage rename) a parent we created is removed
-   again with `File.rmdir/1` (fails harmlessly if something else
-   appeared in it) — net effect: a missing object leaves no trace
-   (the design's promise), and all temps stay siblings of the mirror
-   so the sweep finds them. `expanded`, lease, then sweep
-   `#{expanded}.restore-*` (`.tmp`, `.tmp.part`, `.stage`) regardless
-   of age, same reasoning as §4.3.
+   created with `mkdir_p` BEFORE the `get` when it does not exist;
+   Mirror records the nearest pre-existing ancestor and, on
+   `:not_found` (and on any failure before the stage rename), removes
+   the created chain bottom-up with `File.rmdir/1` (stopping at the
+   first non-empty dir) — net effect: a missing object leaves no
+   trace (the design's promise, scoped to the calling process
+   returning; a VM death between mkdir and rmdir leaves empty dirs,
+   which D7 accepts), and all temps stay siblings of the mirror so
+   the sweep finds them. `expanded`, lease, then sweep — exact shapes, no globs, same
+   reasoning as §4.3: `^#{b}\.restore-[0-9a-f]{32}\.tmp(\.part)?$` files
+   and `^#{b}\.restore-[0-9a-f]{32}\.stage$` dirs.
 2. `init`; `tmp = "#{expanded}.restore-#{rand}.tmp"` (adapter creates
    it 0600 via sibling temp + rename); `get(state, key, tmp, timeout:)`.
    `:not_found` → `{:error, %Error{code: :not_found}}`; nothing created.
@@ -617,27 +645,38 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
    verify_pack_checksums: true)` — the checksum pass is LAZY (it runs
    in `read_prologue` before the FIRST object lookup,
    `local_odb.rs:150`), so force it with ONE probe:
-   `Gitility.ODB.header(repo.odb, <sentinel oid of all zeros>, limits:
-   probe_limits)` — either `{:ok, _}` or `:missing_object` proves the
-   whole-store integrity pass ran and passed; a checksum code →
-   `:malformed_bundle`. (Zero-object packs are valid, so no "first
-   idx entry" probing.) `probe_limits = %{max_provider_bytes:
-   toc.file_size + 16 MiB, timeout: remaining}` — the checksum scan
-   charges every pack/idx byte against the provider-bytes budget
-   (`budget.rs:295`), so the default 256 MiB limit would reject any
-   larger valid mirror; `:budget_exceeded` from the probe is
-   therefore an `:internal_error` (our own limit was wrong), while
-   `:timeout` passes through. Then for every restored ref row:
-   `RefDB.resolve(repo.refs, name)` must return the row's oid;
-   `ODB.header(repo.odb, oid, limits: header_limits)` must succeed and
-   its `type` must equal the row's frozen `kind` (commit/tree/blob/
-   tag); when the row carries a `peeled` oid, the row MUST be a tag
-   row, and `Gitility.peel/3` (`gitility.ex:513`) of the tag must
-   equal `peeled` and be a commit; `HEAD`/`refs/heads/*` rows must be
-   commits. Any violation → `:malformed_bundle`
+   `Gitility.ODB.header(repo.odb, sentinel, limits: probe_limits)`
+   with `sentinel = Gitility.OID.new!(toc.hash_algorithm, <<0::size(
+   oid_bytes * 8)>>)` — either `{:ok, _}` or `{:error, %Error{code:
+   :missing_object}}` proves the whole-store integrity pass ran and
+   passed; a checksum code → `:malformed_bundle`. (Zero-object packs
+   are valid, so no "first idx entry" probing.) `probe_limits =
+   %Gitility.Limits{timeout_ms: remaining, max_total_object_bytes:
+   toc.file_size + 16 MiB, max_provider_bytes: toc.file_size + 16 MiB}`
+   — the integrity scan charges pack/idx bytes against
+   `max_total_object_bytes` (`budget.rs:295`; `limits.ex:24`), so the
+   default 256 MiB would reject any larger valid mirror;
+   `:budget_exceeded` from the probe is therefore `:internal_error`
+   (our own limit was wrong), while `:timeout` passes through. Then
+   for every restored ref row, with typed oids `target =
+   OID.new!(toc.hash_algorithm, row.target)` and `peeled =
+   OID.new!(..., row.peeled)` when present: `RefDB.resolve(repo.refs,
+   name, limits: step_limits)` must return `{:ok, %RefTarget{oid:
+   ^target}}`; `ODB.header(repo.odb, target, limits: step_limits)` must
+   succeed and its `type` must equal the row's frozen `kind`
+   (commit/tree/blob/tag); when `peeled` is present, the row MUST be a
+   tag row and `Gitility.peel(repo, target, limits: peel_limits)` must
+   return `peeled` with type commit; `HEAD`/`refs/heads/*` rows must
+   be commits. `step_limits = %Limits{timeout_ms: remaining}` (refresh
+   `remaining` before every call; `remaining <= 0` → `:timeout`
+   without calling); `peel_limits = %Limits{timeout_ms: remaining,
+   max_object_bytes: 64 MiB}` (annotated-tag payloads above the 4 MiB
+   default are rare but valid; 64 MiB is the documented restore
+   ceiling for a tag object — a larger tag → `:malformed_bundle`
+   `:peel_mismatch` with the budget error as `details.peel_error`,
+   documented). Any violation → `:malformed_bundle`
    (`details.verify_code: :dangling_ref | :kind_mismatch |
-   :peel_mismatch`). Bounded by ref count; `header_limits` uses the
-   remaining deadline and the default byte limit (headers are tiny).
+   :peel_mismatch`). Bounded by ref count and the deadline.
 8. Commit: `File.rename(stage, expanded)`. POSIX `rename(2)` replaces
    an EMPTY target directory atomically, which covers the
    "pre-existing empty dir" case; if the target was created by
@@ -731,8 +770,10 @@ shared minio bucket is fine), optional `store_setup/0` /
 13. metadata boundary rows, each round-tripping through put/head/get:
     (a) 8 keys with short values; (b) 1 key with a 128-byte
     printable-ASCII value; (c) an exact-1 KiB total (keys + values);
-    (d) 1 KiB + 1 byte → rejected by Mirror's validator (Mirror-level
-    test, not an adapter row).
+    (d) 1 KiB + 1 byte and a CR/LF value → rejected by
+    `Gitility.Mirror.validate_metadata/1` (a `@doc false` public
+    function — the validation seam; Mirror-level test, not an adapter
+    row).
 Run against `Local` (always) and `S3` (when env set).
 
 ### 7.2 `test/milestone_6_mirror_test.exs`
@@ -782,8 +823,12 @@ Run against `Local` (always) and `S3` (when env set).
     restore ok with `HEAD` symbolic to the same unborn branch →
     `Fetch.fetch` into it populates it.
 18. detached/direct HEAD source → restore has direct HEAD with the
-    same oid. Unborn HEAD (empty mirror) → restore HEAD symbolic to
-    the init default.
+    same oid. Unborn HEAD pointing at a NON-default missing branch
+    (`git symbolic-ref HEAD refs/heads/trunk` on an empty mirror) →
+    publish records `head_symref = "refs/heads/trunk"`, restore's HEAD
+    is symbolic to exactly that. Crafted bundles with no HEAD row and
+    `head_symref` naming an existing row, a tag, or `HEAD` →
+    `:malformed_bundle`.
 19. hand-crafted bundle with a ref to a missing object →
     `:malformed_bundle` (`:dangling_ref`); with a bad idx checksum →
     `:malformed_bundle`; with conflicting names `refs/heads/a` +
@@ -800,11 +845,12 @@ Run against `Local` (always) and `S3` (when env set).
 23. caller killed mid-publish (`Process.exit(pid, :kill)` while the
     Local `before_put` hook blocks) → lease released (a second publish
     is not `:busy`); that second publish's entry sweep removes the
-    orphaned `*.publish-*` tmp. Separately, pre-seed an orphan
-    `.<basename>.publish-deadbeef.tmp.tmp-1` (Writer's hidden-temp
-    name shape) beside the mirror and assert the sweep removes it too
-    (Bundle.write has no hook point, so the Writer-phase orphan is
-    simulated).
+    orphaned tmp. Separately, pre-seed one orphan of EACH owned shape
+    (Writer hidden temp, Bundle staging dir, `objects/.gitility-
+    publish-1` inside the mirror) plus a decoy sibling
+    `<basename>.publish-backup` and a decoy `objects/pack/keep.me`;
+    assert the sweep removes the three orphans and leaves both decoys
+    (Bundle.write has no hook point, so the orphans are simulated).
 24. publish/restore option validation: unknown key, improper list,
     timeout out of range, store module missing a callback → typed
     `:invalid_argument`, nothing raised.

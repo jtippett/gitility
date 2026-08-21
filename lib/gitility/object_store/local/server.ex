@@ -4,6 +4,7 @@ defmodule Gitility.ObjectStore.Local.Server do
   use GenServer
 
   @registry Gitility.ObjectStore.Local.Registry
+  @idle_timeout 60_000
   @version_age_seconds 60 * 60
   @pointer_regex ~r/\A[0-9a-f]{64}\z/
 
@@ -50,9 +51,8 @@ defmodule Gitility.ObjectStore.Local.Server do
   def init(root) do
     objects = Path.join(root, "objects")
 
-    with :ok <- File.mkdir_p(objects),
-         :ok <- File.chmod(objects, 0o700) do
-      {:ok, %{root: root, objects: objects, pins: %{}, monitors: %{}}}
+    with :ok <- ensure_objects_directory(objects) do
+      {:ok, %{root: root, objects: objects, pins: %{}, monitors: %{}}, @idle_timeout}
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -64,27 +64,28 @@ defmodule Gitility.ObjectStore.Local.Server do
       case read_current(state.objects, hash) do
         {:ok, version, meta} ->
           state = add_pin(state, version, holder)
-          {:reply, {:ok, {version, meta}}, state}
+          {:reply, {:ok, {version, meta}}, state, @idle_timeout}
 
         {:error, reason} ->
-          {:reply, {:error, reason}, state}
+          {:reply, {:error, reason}, state, @idle_timeout}
       end
     else
-      {:reply, {:error, {:adapter, :bad_return}}, state}
+      {:reply, {:error, {:adapter, :bad_return}}, state, @idle_timeout}
     end
   end
 
   def handle_call({:unpin, version}, {holder, _tag}, state) do
-    {:reply, :ok, remove_pin(state, version, holder)}
+    {:reply, :ok, remove_pin(state, version, holder), @idle_timeout}
   end
 
-  def handle_call({:commit, hash, if_match, version}, _from, state) do
+  def handle_call({:commit, hash, if_match, version, after_commit}, _from, state) do
     case commit(state.objects, hash, if_match, version) do
       :ok ->
-        {:reply, :ok, state, {:continue, {:sweep, hash}}}
+        reply = run_after_commit_hook(after_commit)
+        {:reply, reply, state, {:continue, {:sweep, hash}}}
 
       {:error, reason} ->
-        {:reply, {:error, reason}, state}
+        {:reply, {:error, reason}, state, @idle_timeout}
     end
   end
 
@@ -93,16 +94,16 @@ defmodule Gitility.ObjectStore.Local.Server do
     |> object_hashes()
     |> Enum.each(&sweep_hash(state, &1))
 
-    {:reply, :ok, state}
+    {:reply, :ok, state, @idle_timeout}
   end
 
   def handle_call({:force_sweep, hash}, _from, state)
       when is_binary(hash) do
     if valid_pointer?(hash) do
       sweep_hash(state, hash)
-      {:reply, :ok, state}
+      {:reply, :ok, state, @idle_timeout}
     else
-      {:reply, {:error, {:adapter, :bad_return}}, state}
+      {:reply, {:error, {:adapter, :bad_return}}, state, @idle_timeout}
     end
   end
 
@@ -113,18 +114,25 @@ defmodule Gitility.ObjectStore.Local.Server do
       end)
 
     {:reply,
-     %{pins: pins, pin_count: total_pins(state), monitored_pids: Map.keys(state.monitors)}, state}
+     %{pins: pins, pin_count: total_pins(state), monitored_pids: Map.keys(state.monitors)}, state,
+     @idle_timeout}
   end
 
-  def handle_call(:pin_count, _from, state), do: {:reply, total_pins(state), state}
+  def handle_call(:pin_count, _from, state),
+    do: {:reply, total_pins(state), state, @idle_timeout}
 
   @impl GenServer
   def handle_continue({:sweep, hash}, state) do
     sweep_hash(state, hash)
-    {:noreply, state}
+    {:noreply, state, @idle_timeout}
   end
 
   @impl GenServer
+  def handle_info(:timeout, %{pins: pins} = state) when map_size(pins) == 0,
+    do: {:stop, :normal, state}
+
+  def handle_info(:timeout, state), do: {:noreply, state, @idle_timeout}
+
   def handle_info({:DOWN, monitor, :process, holder, _reason}, state) do
     case state.monitors do
       %{^holder => ^monitor} ->
@@ -137,10 +145,11 @@ defmodule Gitility.ObjectStore.Local.Server do
             end
           end)
 
-        {:noreply, %{state | pins: pins, monitors: Map.delete(state.monitors, holder)}}
+        {:noreply, %{state | pins: pins, monitors: Map.delete(state.monitors, holder)},
+         @idle_timeout}
 
       _other ->
-        {:noreply, state}
+        {:noreply, state, @idle_timeout}
     end
   end
 
@@ -172,43 +181,86 @@ defmodule Gitility.ObjectStore.Local.Server do
 
   defp write_current(objects, hash, version) do
     directory = Path.join(objects, hash)
-    temp = Path.join(directory, "current.tmp")
     current = Path.join(directory, "current")
 
-    with :ok <- write_file(temp, version, 0o600),
-         :ok <- File.rename(temp, current) do
-      :ok
-    else
-      {:error, _reason} -> {:error, {:adapter, :io}}
-    end
-  end
+    case create_current_temp(directory, version, 3) do
+      {:ok, temp} ->
+        case File.rename(temp, current) do
+          :ok ->
+            :ok
 
-  defp read_current(objects, hash) do
-    current = Path.join([objects, hash, "current"])
-
-    case File.read(current) do
-      {:ok, version} ->
-        if valid_pointer?(version) do
-          case read_meta(objects, hash, version) do
-            {:ok, meta} -> {:ok, version, meta}
-            {:error, reason} -> {:error, reason}
-          end
-        else
-          {:error, {:adapter, :corrupt_meta}}
+          {:error, _reason} ->
+            File.rm(temp)
+            {:error, {:adapter, :io}}
         end
-
-      {:error, :enoent} ->
-        {:error, :not_found}
 
       {:error, _reason} ->
         {:error, {:adapter, :io}}
     end
   end
 
-  defp read_meta(objects, hash, version) do
-    path = Path.join([objects, hash, "v-#{version}", "meta"])
+  defp create_current_temp(_directory, _version, 0), do: {:error, :collision}
 
-    with {:ok, stat} <- File.stat(path),
+  defp create_current_temp(directory, version, attempts) do
+    temp = Path.join(directory, "current.tmp-#{random_hex(16)}")
+
+    case File.write(temp, version, [:binary, :exclusive]) do
+      :ok ->
+        case File.chmod(temp, 0o600) do
+          :ok ->
+            {:ok, temp}
+
+          {:error, reason} ->
+            File.rm(temp)
+            {:error, reason}
+        end
+
+      {:error, :eexist} ->
+        create_current_temp(directory, version, attempts - 1)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp read_current(objects, hash) do
+    directory = Path.join(objects, hash)
+    current = Path.join(directory, "current")
+
+    case File.lstat(directory) do
+      {:ok, %{type: :directory}} ->
+        case File.read(current) do
+          {:ok, version} ->
+            if valid_pointer?(version) do
+              case read_meta(objects, hash, version) do
+                {:ok, meta} -> {:ok, version, meta}
+                {:error, reason} -> {:error, reason}
+              end
+            else
+              {:error, {:adapter, :corrupt_meta}}
+            end
+
+          {:error, :enoent} ->
+            {:error, :not_found}
+
+          {:error, _reason} ->
+            {:error, {:adapter, :io}}
+        end
+
+      {:error, :enoent} ->
+        {:error, :not_found}
+
+      _other ->
+        {:error, {:adapter, :io}}
+    end
+  end
+
+  defp read_meta(objects, hash, version) do
+    directory = Path.join([objects, hash, "v-#{version}"])
+    path = Path.join(directory, "meta")
+
+    with {:ok, %{type: :directory}} <- File.lstat(directory),
+         {:ok, stat} <- File.stat(path),
          true <- stat.type == :regular and stat.size <= 65_536,
          {:ok, bytes} <- File.read(path),
          {:ok, meta} <- decode_meta(bytes) do
@@ -303,46 +355,52 @@ defmodule Gitility.ObjectStore.Local.Server do
   defp sweep_hash(state, hash) do
     directory = Path.join(state.objects, hash)
 
-    current =
-      case File.read(Path.join(directory, "current")) do
-        {:ok, version} when byte_size(version) == 64 -> version
-        _other -> nil
-      end
+    with {:ok, %{type: :directory}} <- File.lstat(directory),
+         {:ok, current} <- current_for_sweep(directory),
+         {:ok, entries} <- File.ls(directory) do
+      Enum.each(entries, fn entry ->
+        with "v-" <> version <- entry,
+             true <- valid_pointer?(version),
+             false <- version == current,
+             false <- Map.has_key?(state.pins, version),
+             path = Path.join(directory, entry),
+             {:ok, stat} <- File.lstat(path, time: :posix),
+             true <- stat.type == :directory,
+             true <- old_enough?(stat.mtime) do
+          File.rm_rf(path)
+        else
+          _other -> :ok
+        end
+      end)
+    else
+      _error -> :ok
+    end
+  end
 
-    case File.ls(directory) do
-      {:ok, entries} ->
-        Enum.each(entries, fn entry ->
-          with "v-" <> version <- entry,
-               true <- valid_pointer?(version),
-               false <- version == current,
-               false <- Map.has_key?(state.pins, version),
-               path = Path.join(directory, entry),
-               {:ok, stat} <- File.lstat(path, time: :posix),
-               true <- stat.type == :directory,
-               true <- old_enough?(stat.mtime) do
-            File.rm_rf(path)
-          else
-            _other -> :ok
-          end
-        end)
+  defp current_for_sweep(directory) do
+    case File.read(Path.join(directory, "current")) do
+      {:ok, version} ->
+        if valid_pointer?(version), do: {:ok, version}, else: {:error, :invalid_pointer}
+
+      {:error, :enoent} ->
+        {:ok, nil}
 
       {:error, _reason} ->
-        :ok
+        {:error, :unreadable_pointer}
     end
   end
 
   defp object_hashes(objects) do
-    case File.ls(objects) do
-      {:ok, entries} ->
-        Enum.filter(entries, fn entry ->
-          path = Path.join(objects, entry)
+    with {:ok, %{type: :directory}} <- File.lstat(objects),
+         {:ok, entries} <- File.ls(objects) do
+      Enum.filter(entries, fn entry ->
+        path = Path.join(objects, entry)
 
-          valid_pointer?(entry) and
-            match?({:ok, %{type: :directory}}, File.lstat(path))
-        end)
-
-      {:error, _reason} ->
-        []
+        valid_pointer?(entry) and
+          match?({:ok, %{type: :directory}}, File.lstat(path))
+      end)
+    else
+      _error -> []
     end
   end
 
@@ -363,10 +421,53 @@ defmodule Gitility.ObjectStore.Local.Server do
   defp valid_pointer?(value),
     do: is_binary(value) and Regex.match?(@pointer_regex, value)
 
-  defp write_file(path, bytes, mode) do
-    with :ok <- File.write(path, bytes, [:binary]),
-         :ok <- File.chmod(path, mode) do
-      :ok
+  defp ensure_objects_directory(objects) do
+    case File.lstat(objects) do
+      {:ok, %{type: :directory}} ->
+        :ok
+
+      {:ok, _stat} ->
+        {:error, :unsafe_directory_type}
+
+      {:error, :enoent} ->
+        case File.mkdir(objects) do
+          :ok ->
+            case File.chmod(objects, 0o700) do
+              :ok ->
+                :ok
+
+              {:error, reason} ->
+                File.rmdir(objects)
+                {:error, reason}
+            end
+
+          {:error, :eexist} ->
+            ensure_objects_directory(objects)
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
+
+  defp run_after_commit_hook(nil), do: :ok
+
+  defp run_after_commit_hook(hook) when is_function(hook, 0) do
+    try do
+      case hook.() do
+        :ok -> :ok
+        _other -> {:error, {:transport, :closed}}
+      end
+    rescue
+      _exception -> {:error, {:transport, :closed}}
+    catch
+      _kind, _reason -> {:error, {:transport, :closed}}
+    end
+  end
+
+  defp random_hex(bytes),
+    do: bytes |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower)
 end

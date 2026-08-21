@@ -10,7 +10,9 @@ defmodule Gitility.Repository do
   `init_bare/2` creates a SHA-1 bare repository with automatic garbage
   collection and maintenance disabled. Every bare directory created by
   Gitility has that gc-safe configuration; Gitility does not retrofit or
-  otherwise change repositories it did not create.
+  otherwise change repositories it did not create. Initialisation shares the
+  expanded-path lease used by fetch, publish, and restore; contention returns
+  retryable `:busy` immediately.
 
   Opening is intentionally cheap. The first query in a fresh process also
   starts and warms the native runtime and may take roughly 700 ms; subsequent
@@ -31,6 +33,9 @@ defmodule Gitility.Repository do
   """
 
   alias Gitility.{Error, Native, NativeSupport, ODB, OID, RefDB, RefTarget, Snapshot}
+  alias Gitility.Fetch.Locks
+
+  @init_lease_timeout 600_000
 
   @typedoc "A repository handle: object store plus optional ref store."
   @type t :: %__MODULE__{
@@ -65,10 +70,15 @@ defmodule Gitility.Repository do
          {:ok, options} <- validate_init_options(opts),
          :ok <- validate_init_hash(options.hash),
          expanded <- Path.expand(path),
-         :ok <- validate_init_destination(expanded) do
-      case Native.repo_init_bare(expanded, options.hash) do
-        :ok -> :ok
-        {:error, error} -> {:error, NativeSupport.nif_error(error, :repository_init_bare)}
+         :ok <- validate_init_destination(expanded),
+         :ok <- acquire_init_lease(expanded) do
+      try do
+        case Native.repo_init_bare(expanded, options.hash) do
+          :ok -> :ok
+          {:error, error} -> {:error, NativeSupport.nif_error(error, :repository_init_bare)}
+        end
+      after
+        release_init_lease(expanded)
       end
     end
   end
@@ -338,6 +348,45 @@ defmodule Gitility.Repository do
   defp proper_list?([]), do: true
   defp proper_list?([_head | tail]), do: proper_list?(tail)
   defp proper_list?(_tail), do: false
+
+  defp acquire_init_lease(path) do
+    try do
+      case Locks.acquire(path, @init_lease_timeout) do
+        :ok ->
+          :ok
+
+        {:error, %Error{} = error} ->
+          {:error, %{error | operation: :repository_init_bare}}
+
+        _bad_return ->
+          init_lock_error()
+      end
+    rescue
+      _exception -> init_lock_error()
+    catch
+      :exit, _reason -> init_lock_error()
+      _kind, _reason -> init_lock_error()
+    end
+  end
+
+  defp release_init_lease(path) do
+    try do
+      _ = Locks.release(path)
+      :ok
+    rescue
+      _exception -> :ok
+    catch
+      _kind, _reason -> :ok
+    end
+  end
+
+  defp init_lock_error do
+    {:error,
+     Error.new(:backend_error, "fetch lock manager is unavailable",
+       operation: :repository_init_bare,
+       retryable: true
+     )}
+  end
 
   defp init_invalid(message) do
     {:error, Error.new(:invalid_argument, message, operation: :repository_init_bare)}

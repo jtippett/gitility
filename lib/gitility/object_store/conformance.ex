@@ -237,12 +237,17 @@ defmodule Gitility.ObjectStore.Conformance do
                    )
         end
 
+        slow_phase =
+          if @object_store == Gitility.ObjectStore.Local,
+            do: :before_chunk,
+            else: :before_get
+
         assert {:ok, slow_state} =
                  Gitility.ObjectStore.Conformance.slow_state(
                    @object_store,
                    context.state,
                    __MODULE__,
-                   :before_get
+                   slow_phase
                  )
 
         {elapsed, result} =
@@ -411,8 +416,9 @@ defmodule Gitility.ObjectStore.Conformance do
           source = Gitility.ObjectStore.Conformance.write_source(context, "encoded-source", "x")
 
           Enum.each(vectors, fn {key, encoded} ->
-            assert Gitility.ObjectStore.S3.encode_key(key) == encoded
             full_key = Gitility.ObjectStore.Conformance.key(context, key)
+            assert {:ok, url} = Gitility.ObjectStore.S3.url_for(context.state, full_key)
+            assert String.ends_with?(url, "/#{encoded}")
 
             assert {:ok, %{etag: etag}} =
                      @object_store.put(

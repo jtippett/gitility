@@ -298,9 +298,16 @@ GITILITY_MIX_STAGE
 
   echo "==> mix"
   rexec "$REMOTE_PRELUDE
-capped bash -s <<'GITILITY_MIX_REMOTE'
+stage_file=\$(mktemp \"\${TMPDIR:-/tmp}/gitility-mix-stage.XXXXXX\")
+cat >\"\$stage_file\" <<'GITILITY_MIX_REMOTE'
 $command
-GITILITY_MIX_REMOTE"
+GITILITY_MIX_REMOTE
+if capped bash \"\$stage_file\"; then stage_status=0; else stage_status=\$?; fi
+rm -f -- \"\$stage_file\"
+# Let a successful remote shell reach EOF naturally.  `sprite exec` reports a
+# false failure when an explicit `exit 0` races the EXIT trap that stops the
+# background sampler.
+if [ \"\$stage_status\" -ne 0 ]; then exit \"\$stage_status\"; fi"
 }
 
 stage_rehearsal() {
@@ -323,9 +330,13 @@ GITILITY_REHEARSAL_STAGE
 
   echo "==> rehearsal"
   rexec "$REMOTE_PRELUDE
-capped bash -s <<'GITILITY_REHEARSAL_REMOTE'
+stage_file=\$(mktemp \"\${TMPDIR:-/tmp}/gitility-rehearsal-stage.XXXXXX\")
+cat >\"\$stage_file\" <<'GITILITY_REHEARSAL_REMOTE'
 $command
-GITILITY_REHEARSAL_REMOTE"
+GITILITY_REHEARSAL_REMOTE
+if capped bash \"\$stage_file\"; then stage_status=0; else stage_status=\$?; fi
+rm -f -- \"\$stage_file\"
+if [ \"\$stage_status\" -ne 0 ]; then exit \"\$stage_status\"; fi"
 }
 
 for s in "${STAGES[@]}"; do

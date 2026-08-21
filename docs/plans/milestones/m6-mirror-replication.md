@@ -1,12 +1,8 @@
 # M6 — Mirror replication (`Gitility.Mirror`, `Gitility.ObjectStore`, `Repository.init_bare`)
 
-Status: SPEC v6 — FROZEN FOR DISPATCH (2026-08-21; v1 → v2 after codex review round 1: 12
-blockers, 14 highs, 7 mediums, 2 lows; v2 → v3 after round 2: 6
-blockers, 11 highs, 7 mediums, 1 low; v3 → v4 after round 3: 5
-blockers, 5 highs, 6 mediums, 1 low; v4 → v5 after round 4: 3
-blockers, 3 highs, 5 mediums; v5 → v6 after round 5: 0 blockers, 3
-highs, 4 mediums, 3 lows — round 5 cleared of blockers; v6 folds the
-rest and records one pushback, D10). Design:
+Status: SPEC v7 (post-review amendments, 2026-08-21)
+
+Design:
 `docs/plans/2026-08-21-mirror-replication-design.md`. Bundle format is
 FROZEN at 1.0 (`docs/format/bundle-v1.md`); this milestone does not
 change it.
@@ -153,15 +149,17 @@ inside AWS's 2 KiB user-metadata ceiling with room for the
 metadata and validates these limits before calling `put`; adapters
 may re-validate.
 
-MUSTs: `get` streams into exactly `dest_path <> ".part"` and renames
-to `dest_path` on success (a partial download never occupies
+MUSTs: a `get` worker streams into exactly `dest_path <> ".part"`; the
+adapter's caller-side wrapper renames it to `dest_path` only after the worker
+returns success (a partial download never occupies
 `dest_path`; the caller owns both names and cleans them up); `put` is
 old-or-new from any reader's view; `head`/`get` metadata is exactly
 what `put` stored.
 
 ### 1.2 `Gitility.ObjectStore.Local`
 
-`init_arg = [root: Path.t()]` (`root` created if missing, 0700).
+`init_arg = [root: Path.t()]` (`root` created if missing, 0700; a pre-existing
+directory, including one reached through a symlink, retains its mode).
 Single-VM adapter: correctness relies on a per-root server, not on
 filesystem locks.
 
@@ -173,6 +171,10 @@ root/objects/<sha256hex(key)>/v-<64 random hex>/data
 root/objects/<sha256hex(key)>/v-<64 random hex>/meta   # see encoding below
 root/objects/<sha256hex(key)>/key                # the original key bytes (debug aid only)
 ```
+
+The debug `key` file is installed through an exclusive random temporary file
+and rename. A missing, partial, or mismatching debug file is replaced and never
+blocks a put; object identity is the full SHA-256 key directory plus `current`.
 
 `meta` = `:erlang.term_to_binary(%{"etag" => etag, "size" => n,
 "metadata" => map})`; decoded with `binary_to_term(bytes, [:safe])`
@@ -187,7 +189,7 @@ the application tree) and registered in a `Registry` keyed by root.
 `put`: (1) outside the server, write `v-<rand>/data` (from `src_path`,
 0600) and `meta`; (2) `GenServer.call(server, {:commit, hash,
 if_match, version})` — the server reads `current`, checks the
-precondition, writes `current.tmp` + `rename` → `current`, replies;
+precondition, writes an exclusive `current.tmp-<32hex>` + `rename` → `current`, replies;
 (3) on `:precondition_failed` the caller deletes its version dir.
 `get`/`head`: `GenServer.call(server, {:pin, hash})` → the server
 reads `current`, reads and validates `meta` (metadata captured at pin
@@ -201,7 +203,9 @@ the file and calls `{:unpin, version}`; if the reader dies (incl.
 brutal kill by the Mirror wrapper) the server's monitor drops the
 pin. Sweep (inside the server, AFTER replying to the commit — via a
 `handle_continue`): delete version dirs that are not `current`, have
-refcount 0, and are older than 1 h. `put`'s copy into the version dir
+refcount 0, and are older than 1 h. A missing `current` means no current
+version; any other pointer read error or a non-64-byte pointer aborts that
+key's sweep without deleting anything. `put`'s copy into the version dir
 is chunked with the same per-chunk deadline check; the commit call
 uses the remaining budget as the `GenServer.call` timeout. Commit
 timeout: the caller does NOT delete its version dir (the server may
@@ -210,9 +214,11 @@ leaves the dir for the sweep, which will keep it if it became
 `current` and remove it after 1 h otherwise. This is the same
 indeterminacy S3 has and Mirror reconciles it the same way (§4.9). Meta validation: `etag` non-empty binary, `size` non-negative
 integer, `metadata` binary→binary map; anything else
-`{:adapter, :corrupt_meta}`. Test mode: `test_hooks: %{before_commit:
-(-> :ok), before_head: (-> :ok), before_get: (-> :ok), before_put:
-(-> :ok)}` init option — each hook runs in the caller process right
+`{:adapter, :corrupt_meta}`. An idle per-root server stops after 60 seconds
+when it has no pins and is revived on demand. Test mode: `test_hooks: %{before_commit:
+(-> :ok), after_commit: (-> :ok), before_head: (-> :ok), before_get:
+(-> :ok), before_chunk: (-> :ok), before_put: (-> :ok)}` init option —
+hooks run in the owning callback/server process right
 before the phase and is how timeout/race tests make phases block
 deterministically (§7.1.7–9, §7.2.10, §7.2.23).
 
@@ -292,7 +298,8 @@ slow-drip server cannot exceed the budget.
   size from `content-length`, metadata from `x-amz-meta-*` (prefix
   removed, keys lowercased).
 - `get` → `GET` with `into: fn` collecting into an open 0600 temp
-  file (sibling of `dest_path`), then `rename`; 404 → `:not_found`;
+  file (sibling of `dest_path`); the caller-side wrapper then renames it;
+  404 → `:not_found`;
   byte count ≠ `content-length` → `{:adapter, :short_body}`; returns
   metadata from the response headers.
 - `put` → `PUT` with `Content-Length` (file size), `Content-Type`,
@@ -306,7 +313,9 @@ slow-drip server cannot exceed the budget.
 - Error mapping: transport exceptions → `{:transport, reason_atom}`
   (`Exception.message/1` NEVER retained); non-2xx → `{:http, status,
   code}` where `code` is the `<Code>` element parsed from the XML body
-  with a tolerant regex (`~r/<Code>([A-Za-z0-9]+)<\/Code>/`) or nil.
+  with a tolerant regex (`~r/<Code>([A-Za-z0-9]+)<\/Code>/`) or nil. Codes
+  of 40 or more bytes, or equal case-insensitively to the configured access
+  key, secret, or session token, become `"Redacted"`.
   Response headers and URLs are never placed in any error.
 
 ### 1.4 `Gitility.Mirror`
@@ -370,11 +379,13 @@ unchanged from `Bundle.write`/`Bundle.verify`/`Fetch` keep their own
 Options: `hash: :sha1` (default; `:sha256` → `:unsupported_hash`
 before touching the filesystem). `path` must not exist or must be an
 empty directory (else `:invalid_argument`); the parent is created
-(`mkdir_p`). Not idempotent. Runs the §3 NIF on a dirty IO scheduler.
+(`mkdir_p`). Not idempotent. It acquires the same immediate, expanded-path
+`Fetch.Locks` lease as fetch/publish/restore and returns retryable `:busy` on
+contention. Runs the §3 NIF on a dirty IO scheduler.
 
 ## 2. gc-safe bare directories (contract)
 
-Every bare directory gitility CREATES — via `init_bare/2`, via
+Every bare directory gitility CREATES — via leased `init_bare/2`, via
 `Fetch.fetch` auto-init of a missing/empty dest, and via
 `Mirror.restore` — has these keys in `$GIT_DIR/config` on return:
 
@@ -448,9 +459,10 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
   must match the repo's hash → `InvalidOid`; duplicate names →
   `InvalidArgument`; D/F conflicts surface from gix-ref's transaction
   as `MalformedRef`. HEAD consistency: `head` is `Option<(Option<oid>, Option<symref>)>`.
-  With `(Some(oid), Some(name))`: `name` MUST be among `refs` AND that
-  row's oid MUST equal `oid`, else `InvalidArgument` ("HEAD symref
-  target disagrees with HEAD row"). With `(None, Some(name))` (unborn
+  With `(Some(oid), Some(name))`: `name` MUST start with `refs/heads/`, pass
+  full name validation, be among `refs`, AND that row's oid MUST equal `oid`;
+  a non-branch/invalid name is `MalformedRef`, while a missing/disagreeing row
+  is `InvalidArgument` ("HEAD symref target disagrees with HEAD row"). With `(None, Some(name))` (unborn
   HEAD): `name` MUST start with `refs/heads/`, pass name validation,
   and be ABSENT from `refs` → write `HEAD` symbolic to it; otherwise
   `InvalidArgument`. With `(Some(oid), None)`: detached HEAD →
@@ -474,8 +486,11 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
   would restore nothing. Reflog FILES are still not created because
   bare repos default `core.logAllRefUpdates=false` (store-level
   `WriteReflog::Disable`); asserted in §7.2.12. Returns the number of
-  edits committed. Bound: `refs.len()` ≤ the frozen
-  TOC cap; DirtyIo, not cancellable (D5).
+  edits committed. Because gix's packed-ref transaction still takes a loose
+  lock for each update, strict write and restore symmetrically reject any ref
+  path component over 255 bytes (`:malformed_ref`, reason
+  `:component_too_long`). Bound: `refs.len()` ≤ `64 MiB / 27`, derived from
+  the frozen TOC cap and minimum ref-row size; DirtyIo, not cancellable (D5).
 - `Bundle.write` gains three Elixir-side options (no native change):
   `generation: pos_integer` — `1..(2^64 - 1)`; when a file exists at
   `path`, must be ≥ existing + 1 → else `:invalid_argument`; default
@@ -522,12 +537,14 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
    globs: list the parent directory with `File.ls/1` and match each
    entry EXACTLY against the owned shapes (`Regex.escape(basename)`):
    - `\A#{b}\.publish-[0-9a-f]{32}\.tmp\z` (our tmp file, regular file),
-   - `\A\.#{b}\.publish-[0-9a-f]{32}\.tmp\.tmp-[1-9][0-9]*\z` (Writer's
+   - `\A\.#{b}\.publish-[0-9a-f]{32}\.tmp\.tmp-[0-9a-f]{32}\z` (Writer's
      hidden temp, `writer.ex:16`, regular file),
-   - `\A\.#{b}\.publish-[0-9a-f]{32}\.tmp\.staging-[1-9][0-9]*\z`
-     (Bundle's staging dir, `bundle.ex:261`, directory);
-   and inside the mirror, `objects/.gitility-publish-[1-9][0-9]*`
-   directories (pack-inventory scratch, `pack_inventory.ex:163`).
+   - `\A\.#{b}\.publish-[0-9a-f]{32}\.tmp\.staging-[0-9a-f]{32}\z`
+     (Bundle's staging dir, `bundle.ex:261`, directory).
+   There is deliberately no sweep inside the mirror's `objects` directory:
+   public `Bundle.write` holds no mirror lease, and `objects` may itself be a
+   symlink to a shared store. `PackInventory` removes only its own scratch in
+   an `after` block.
    `\A…\z` anchors (not `^…$`, which admits a trailing newline) and an
    `lstat` type check (regular file vs directory, never a symlink)
    precede every deletion. Matching entries are removed (`rm_rf` for
@@ -608,8 +625,11 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
      Documented: "publish can report an indeterminate failure;
      re-running is always safe because the next run's HEAD reconciles."
    - other errors → table.
+   If the deadline expires before the PUT callback is invoked, no bytes were
+   issued and the timeout carries `details.indeterminate: false`; only a
+   callback killed after invocation is marked indeterminate at this point.
 10. Deadline: every adapter call runs inside `Task.async` +
-    `Task.yield(task, remaining) || Task.shutdown(task, :brutal_kill)`
+    `Task.yield(task, remaining + 1_000) || Task.shutdown(task, :brutal_kill)`
     so a callback that ignores `opts[:timeout]` is still hard-bounded;
     kill → `:timeout` naming the phase in `details`. Because a killed
     adapter cannot clean up, adapters write ONLY to paths Mirror hands
@@ -626,7 +646,8 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
 1. Validate as §4.1 except `mirror_dir` must NOT exist or must be an
    empty directory (else `:invalid_argument`). Parent directory is
    created with `mkdir_p` BEFORE the `get` when it does not exist;
-   Mirror records the nearest pre-existing ancestor and, on
+   Mirror records the nearest pre-existing ancestor using `File.stat/1` so a
+   symlinked ancestor is accepted as the directory it resolves to, and, on
    `:not_found` (and on any failure before the stage rename), removes
    the created chain bottom-up with `File.rmdir/1` (stopping at the
    first non-empty dir) — net effect: a missing object leaves no
@@ -685,8 +706,9 @@ bytes, no UTF-8 validation; `BString` in Rust) — never `String`.
    `Bundle.write` always emits one of the two, and restore must never
    inherit gix's initialiser HEAD (`refs/heads/main`), which would
    invent a HEAD relationship absent from the digest. A `HEAD` row
-   whose `head_symref` names a missing row, or a symref whose row oid
-   ≠ `head_oid`, is rejected natively (§3). Zero rows is
+   whose `head_symref` is not a fully valid name under `refs/heads/`, names a
+   missing row, or has a row oid unequal to `head_oid`, is rejected before or
+   within the native transaction (§3). Zero rows is
    fine (D3).
 7. Deep check: `Repository.open(stage, require_bare: true,
    verify_pack_checksums: true)` — the checksum pass is LAZY (it runs
@@ -807,7 +829,7 @@ shared minio bucket is fine), optional `store_setup/0` /
    48 MiB (VM-wide, so worker processes count; the suite runs this
    row serially with `async: false`).
 7. get of the 64 MiB object with the adapter's blocking hook
-   (`before_get` for Local; for S3 a slow local HTTP stub that drips
+   (`before_chunk` for Local, after the first body read; for S3 a slow local HTTP stub that drips
    1 byte/s — the conformance module accepts a `slow_store_init_arg/0`
    hook for this) and `timeout: 50` → `{:transport, :timeout}` within
    1 s; no file at `dest_path` and none at `dest_path <> ".part"`.
@@ -906,11 +928,10 @@ Run against `Local` (always) and `S3` (when env set).
 23. caller killed mid-publish (`Process.exit(pid, :kill)` while the
     Local `before_put` hook blocks) → lease released (a second publish
     is not `:busy`); that second publish's entry sweep removes the
-    orphaned tmp. Separately, pre-seed one orphan of EACH owned shape
-    (Writer hidden temp, Bundle staging dir, `objects/.gitility-
-    publish-1` inside the mirror) plus a decoy sibling
+    orphaned tmp. Separately, pre-seed one orphan of each sibling shape
+    (Writer hidden temp and Bundle staging dir) plus a decoy sibling
     `<basename>.publish-backup` and a decoy `objects/pack/keep.me`;
-    assert the sweep removes the three orphans and leaves both decoys
+    assert the sweep removes the two orphans and leaves both decoys
     (Bundle.write has no hook point, so the orphans are simulated).
 24. publish/restore option validation: unknown key, improper list,
     timeout out of range, store module missing a callback → typed
@@ -933,12 +954,15 @@ Run against `Local` (always) and `S3` (when env set).
 29. Local adapter: reader pinned on version A while a commit moves
     `current` to B and a forced sweep runs → reader still completes
     with A's bytes; reader killed mid-copy → pin dropped (server state
-    inspected via a test-only call); commit timeout leaves the version
-    dir in place and `current` consistent.
+    inspected via a test-only call); commit timeout injected after the server
+    renames `current` to version C leaves C's directory in place and keeps C
+    current through a later age-eligible sweep.
 30. `Bundle.write` default generation on a file at `2^64 - 1` →
     `:unsupported_operation`.
 31. strict_refs with a >4096-byte ref name in the source (created via
-    the oracle git) → `:malformed_ref`; lenient mode → ok + warning.
+    the oracle git) → `:malformed_ref`; lenient mode → ok + warning. A ref with
+    one 300-byte path component is rejected by strict write and restore with
+    reason `:component_too_long`.
 32. init_bare: a pre-seeded `<path>.init-<hex>` orphan is swept; a
     forced failure in the config write (test hook on the Elixir side
     is impossible — use an unwritable staging parent via chmod 0500 on

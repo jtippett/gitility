@@ -2,6 +2,7 @@ defmodule Gitility.M6.BundleRepositoryTest do
   use ExUnit.Case, async: false
 
   alias Gitility.{Bundle, Bundle.Format, Bundle.Writer, Error, Repository}
+  alias Gitility.Fetch.Locks
 
   @moduletag :gitility_engine
   @maximum_generation 18_446_744_073_709_551_615
@@ -151,6 +152,39 @@ defmodule Gitility.M6.BundleRepositoryTest do
     assert File.read!(marker) == "untouched"
     assert {:error, %Error{code: :invalid_argument}} = Repository.init_bare(nonempty, nope: true)
     assert {:error, %Error{code: :invalid_argument}} = Repository.init_bare(nonempty, :not_a_list)
+  end
+
+  test "bundle and writer cleanup leave pre-existing decoy temporary paths untouched", context do
+    source = Path.join(context.directory, "decoy-source.git")
+    git!(["init", "--bare", source])
+    path = Path.join(context.directory, "decoy.bundle")
+    staging = Path.join(context.directory, ".decoy.bundle.staging-#{String.duplicate("a", 32)}")
+    writer = Path.join(context.directory, ".decoy.bundle.tmp-#{String.duplicate("b", 32)}")
+    marker = Path.join(staging, "owner")
+
+    File.mkdir!(staging)
+    File.write!(marker, "staging owner")
+    File.write!(writer, "writer owner")
+
+    assert {:ok, _receipt} = Bundle.write(path, source: {:repository, source})
+    assert File.read!(marker) == "staging owner"
+    assert File.read!(writer) == "writer owner"
+  end
+
+  test "init_bare shares the fetch lease and returns busy without touching the path", context do
+    destination = Path.join(context.directory, "leased-init.git")
+    expanded = Path.expand(destination)
+    assert :ok = Locks.acquire(expanded, 5_000)
+
+    try do
+      assert {:error,
+              %Error{code: :busy, operation: :repository_init_bare, retryable: true}} =
+               Repository.init_bare(destination)
+
+      refute File.exists?(destination)
+    after
+      Locks.release(expanded)
+    end
   end
 
   defp git!(args) do

@@ -18,7 +18,14 @@ use std::path::{Path, PathBuf};
 
 const STAGING_RANDOM_BYTES: usize = 16;
 const STAGING_ATTEMPTS: usize = 16;
-const BUNDLE_TOC_CAP: usize = 67_108_864;
+const BUNDLE_TOC_CAP_BYTES: usize = 67_108_864;
+// Four name-length bytes, one name byte, a SHA-1 oid, kind, and peeled flag.
+// Format.parse applies the byte ceiling before write_refs is reached; derive a
+// count guard from that format bound instead of treating bytes as rows.
+const MIN_BUNDLE_REF_ROW_BYTES: usize = 27;
+const MAX_BUNDLE_REF_ROWS: usize = BUNDLE_TOC_CAP_BYTES / MIN_BUNDLE_REF_ROW_BYTES;
+const MAX_REF_NAME_BYTES: usize = 4096;
+const MAX_REF_COMPONENT_BYTES: usize = 255;
 
 /// Initialize a gc-safe bare repository without ever exposing a partial
 /// repository at `path`.
@@ -36,7 +43,7 @@ pub fn init_bare(path: &Path, hash: HashKind) -> Result<(), Error> {
 /// Initialize a gc-safe SHA-1 bare repository and return a handle opened at
 /// its final path. Native fetch shares this exact creation path.
 pub(crate) fn init_bare_repo(path: &Path) -> Result<gix::Repository, Error> {
-    validate_destination(path)?;
+    let destination_preexisted = validate_destination(path)?;
 
     let parent = destination_parent(path)?;
     std::fs::create_dir_all(parent).map_err(|_| {
@@ -78,14 +85,25 @@ pub(crate) fn init_bare_repo(path: &Path) -> Result<gix::Repository, Error> {
             // just-installed repository behind. Compare the directory
             // identity before cleanup so a cross-process replacement is
             // never removed accidentally.
-            if directory_identity(path).ok() == Some(staging_identity) {
-                let _ = std::fs::remove_dir_all(path);
-            }
+            cleanup_failed_install(path, staging_identity, destination_preexisted);
             Err(Error::new(
                 ErrorCode::BackendError,
                 "initialized bare repository could not be reopened",
             ))
         }
+    }
+}
+
+fn cleanup_failed_install(path: &Path, staging_identity: (u64, u64), preexisted: bool) {
+    if directory_identity(path).ok() != Some(staging_identity) {
+        return;
+    }
+    let removed = std::fs::remove_dir_all(path).is_ok();
+    if removed && preexisted {
+        // rename(2) replaced the caller's pre-existing empty directory.
+        // Recreate it so an initialization error does not make a path the
+        // caller already owned disappear.
+        let _ = std::fs::create_dir(path);
     }
 }
 
@@ -133,7 +151,7 @@ pub fn write_refs(
     refs: Vec<(Vec<u8>, Vec<u8>)>,
     head: Option<(Option<Vec<u8>>, Option<Vec<u8>>)>,
 ) -> Result<u64, Error> {
-    if refs.len() > BUNDLE_TOC_CAP {
+    if refs.len() > MAX_BUNDLE_REF_ROWS {
         return Err(Error::new(
             ErrorCode::InvalidArgument,
             "reference count exceeds the bundle TOC cap",
@@ -178,22 +196,20 @@ pub fn write_refs(
     let head_target = match (head_oid, head_symref) {
         (Some(raw_oid), Some(raw_symref)) => {
             let oid = oid_for_repo(hash, &raw_oid)?;
-            let symref = validated_ref_name(&raw_symref)?;
+            let symref = validated_head_symref(&raw_symref)?;
             match targets.get(raw_symref.as_slice()) {
                 Some(target) if *target == oid => Target::Symbolic(symref),
                 _ => {
                     return Err(Error::new(
                         ErrorCode::InvalidArgument,
                         "HEAD symref target disagrees with HEAD row",
-                    ))
+                    ));
                 }
             }
         }
         (None, Some(raw_symref)) => {
-            let symref = validated_ref_name(&raw_symref)?;
-            if !raw_symref.starts_with(b"refs/heads/")
-                || targets.contains_key(raw_symref.as_slice())
-            {
+            let symref = validated_head_symref(&raw_symref)?;
+            if targets.contains_key(raw_symref.as_slice()) {
                 return Err(Error::new(
                     ErrorCode::InvalidArgument,
                     "unborn HEAD must name an absent branch reference",
@@ -206,7 +222,7 @@ pub fn write_refs(
             return Err(Error::new(
                 ErrorCode::InvalidArgument,
                 "HEAD target must contain an object ID or symbolic reference",
-            ))
+            ));
         }
     };
 
@@ -297,11 +313,38 @@ fn update_edit(name: gix_ref::FullName, new: Target, expected: PreviousValue) ->
 }
 
 fn validated_ref_name(name: &[u8]) -> Result<gix_ref::FullName, Error> {
+    if name.len() > MAX_REF_NAME_BYTES {
+        return Err(
+            Error::new(ErrorCode::MalformedRef, "reference name is too long")
+                .with_reason("name_too_long"),
+        );
+    }
+    if name
+        .split(|byte| *byte == b'/')
+        .any(|component| component.len() > MAX_REF_COMPONENT_BYTES)
+    {
+        return Err(Error::new(
+            ErrorCode::MalformedRef,
+            "reference name component is too long",
+        )
+        .with_reason("component_too_long"));
+    }
     gix::validate::reference::name(name.as_bstr())
         .map_err(|_| Error::new(ErrorCode::MalformedRef, "reference name is malformed"))?;
     BString::from(name)
         .try_into()
         .map_err(|_| Error::new(ErrorCode::MalformedRef, "reference name is malformed"))
+}
+
+fn validated_head_symref(name: &[u8]) -> Result<gix_ref::FullName, Error> {
+    let name = validated_ref_name(name)?;
+    if !name.as_bstr().starts_with(b"refs/heads/") {
+        return Err(Error::new(
+            ErrorCode::MalformedRef,
+            "HEAD symbolic reference must name a branch",
+        ));
+    }
+    Ok(name)
 }
 
 fn oid_for_repo(hash: gix_hash::Kind, raw: &[u8]) -> Result<gix_hash::ObjectId, Error> {
@@ -326,7 +369,7 @@ fn oid_for_repo(hash: gix_hash::Kind, raw: &[u8]) -> Result<gix_hash::ObjectId, 
     Ok(oid)
 }
 
-fn validate_destination(path: &Path) -> Result<(), Error> {
+fn validate_destination(path: &Path) -> Result<bool, Error> {
     destination_name(path)?;
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => {
@@ -334,11 +377,11 @@ fn validate_destination(path: &Path) -> Result<(), Error> {
             if entries.next().is_some() {
                 Err(invalid_destination())
             } else {
-                Ok(())
+                Ok(true)
             }
         }
         Ok(_) => Err(invalid_destination()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(invalid_destination()),
     }
 }
@@ -429,14 +472,14 @@ fn create_staging_directory(path: &Path, parent: &Path) -> Result<(PathBuf, Stag
                         path: staging_path,
                         committed: false,
                     },
-                ))
+                ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => {
                 return Err(Error::new(
                     ErrorCode::BackendError,
                     "bare repository staging directory could not be created",
-                ))
+                ));
             }
         }
     }
@@ -647,6 +690,28 @@ mod tests {
     }
 
     #[test]
+    fn failed_install_cleanup_restores_a_preexisting_empty_destination() {
+        let root = TestDir::new("reopen-failure-cleanup");
+        let preexisting = root.join("preexisting.git");
+        std::fs::create_dir(&preexisting).unwrap();
+        std::fs::write(preexisting.join("partial"), b"installed staging").unwrap();
+        let identity = directory_identity(&preexisting).unwrap();
+
+        cleanup_failed_install(&preexisting, identity, true);
+
+        assert!(preexisting.is_dir());
+        assert_eq!(std::fs::read_dir(&preexisting).unwrap().count(), 0);
+
+        let originally_absent = root.join("absent.git");
+        std::fs::create_dir(&originally_absent).unwrap();
+        let identity = directory_identity(&originally_absent).unwrap();
+
+        cleanup_failed_install(&originally_absent, identity, false);
+
+        assert!(!originally_absent.exists());
+    }
+
+    #[test]
     fn write_refs_commits_named_and_symbolic_head_edits_together() {
         let root = TestDir::new("write-symbolic");
         let destination = root.join("repo.git");
@@ -737,6 +802,12 @@ mod tests {
     #[test]
     fn write_refs_validates_names_oids_duplicates_and_head_consistency() {
         let root = TestDir::new("validation");
+        let mut oversized_head = b"refs/heads/".to_vec();
+        while oversized_head.len() + 251 <= 5000 {
+            oversized_head.extend(vec![b'a'; 250]);
+            oversized_head.push(b'/');
+        }
+        oversized_head.extend(vec![b'a'; 5000 - oversized_head.len()]);
 
         let cases = [
             (
@@ -770,7 +841,17 @@ mod tests {
             (
                 Vec::new(),
                 Some((None, Some(b"refs/tags/missing".to_vec()))),
-                ErrorCode::InvalidArgument,
+                ErrorCode::MalformedRef,
+            ),
+            (
+                vec![(b"refs/tags/v1".to_vec(), oid(1))],
+                Some((Some(oid(1)), Some(b"refs/tags/v1".to_vec()))),
+                ErrorCode::MalformedRef,
+            ),
+            (
+                Vec::new(),
+                Some((None, Some(oversized_head))),
+                ErrorCode::MalformedRef,
             ),
         ];
 
@@ -798,6 +879,25 @@ mod tests {
                 .code,
             ErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn write_refs_rejects_a_component_too_long_for_loose_refs() {
+        let root = TestDir::new("component-too-long");
+        let destination = root.join("repo.git");
+        init_bare(&destination, HashKind::Sha1).unwrap();
+        let name = [b"refs/heads/".as_slice(), vec![b'a'; 300].as_slice()].concat();
+
+        let error = write_refs(
+            &destination,
+            vec![(name, oid(1))],
+            Some((Some(oid(1)), None)),
+        )
+        .expect_err("a ref component beyond the portable filesystem limit is refused");
+
+        assert_eq!(error.code, ErrorCode::MalformedRef);
+        assert_eq!(error.reason.as_deref(), Some("component_too_long"));
+        assert!(!destination.join("packed-refs").exists());
     }
 
     #[test]

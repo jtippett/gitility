@@ -105,10 +105,13 @@ defmodule Gitility.ObjectStore.S3 do
 
     result =
       with :ok <- validate_key(key),
-           {:ok, timeout} <- timeout_options(opts) do
-        run_with_timeout(timeout, fn deadline ->
-          do_get(state, key, dest_path, part, deadline)
-        end)
+           {:ok, timeout} <- timeout_options(opts),
+           {:ok, reply} <-
+             run_with_timeout(timeout, fn deadline ->
+               do_get(state, key, part, deadline)
+             end),
+           :ok <- finish_download(part, dest_path) do
+        {:ok, reply}
       end
 
     case result do
@@ -236,10 +239,10 @@ defmodule Gitility.ObjectStore.S3 do
           {:error, :not_found}
 
         {:ok, %{status: status, body: body}} when status in 100..599 ->
-          {:error, http_reason(status, body)}
+          {:error, http_reason(status, body, credentials)}
 
         {:ok, %{status: status}} when status in 100..599 ->
-          {:error, http_reason(status, nil)}
+          {:error, http_reason(status, nil, credentials)}
 
         {:error, _reason} = error ->
           error
@@ -250,7 +253,7 @@ defmodule Gitility.ObjectStore.S3 do
     end
   end
 
-  defp do_get(state, key, dest_path, part, deadline) do
+  defp do_get(state, key, part, deadline) do
     File.rm(part)
 
     with {:ok, credentials} <- credentials(state, deadline),
@@ -268,44 +271,48 @@ defmodule Gitility.ObjectStore.S3 do
              into: into
            ) do
       :file.close(file)
-      finish_get(result, counter, part, dest_path)
+      finish_get(result, counter, credentials)
     else
       {:error, {:transport, _reason}} = error -> error
       {:error, {:adapter, _reason}} = error -> error
-      {:error, _reason} -> {:error, {:adapter, :io}}
     end
   end
 
-  defp finish_get({:ok, %{status: 200, headers: headers}}, counter, part, dest_path) do
+  defp finish_get({:ok, %{status: 200, headers: headers}}, counter, _credentials) do
     bytes = :counters.get(counter, 1)
 
     with {:ok, expected} <- response_size(headers),
          true <- bytes == expected,
-         {:ok, etag} <- response_etag(headers),
-         :ok <- File.rename(part, dest_path) do
+         {:ok, etag} <- response_etag(headers) do
       {:ok, %{etag: etag, bytes: bytes, metadata: response_metadata(headers)}}
     else
       false -> {:error, {:adapter, :short_body}}
       {:error, {:adapter, _reason}} = error -> error
-      {:error, _reason} -> {:error, {:adapter, :io}}
     end
   end
 
-  defp finish_get({:ok, %{status: 404}}, _counter, _part, _dest_path),
+  defp finish_get({:ok, %{status: 404}}, _counter, _credentials),
     do: {:error, :not_found}
 
-  defp finish_get({:ok, %{status: status, body: body}}, _counter, _part, _dest_path)
+  defp finish_get({:ok, %{status: status, body: body}}, _counter, credentials)
        when status in 100..599,
-       do: {:error, http_reason(status, body)}
+       do: {:error, http_reason(status, body, credentials)}
 
-  defp finish_get({:ok, %{status: status}}, _counter, _part, _dest_path)
+  defp finish_get({:ok, %{status: status}}, _counter, credentials)
        when status in 100..599,
-       do: {:error, http_reason(status, nil)}
+       do: {:error, http_reason(status, nil, credentials)}
 
-  defp finish_get({:error, _reason} = error, _counter, _part, _dest_path), do: error
+  defp finish_get({:error, _reason} = error, _counter, _credentials), do: error
 
-  defp finish_get(_other, _counter, _part, _dest_path),
+  defp finish_get(_other, _counter, _credentials),
     do: {:error, {:adapter, :bad_return}}
+
+  defp finish_download(part, dest_path) do
+    case File.rename(part, dest_path) do
+      :ok -> :ok
+      {:error, _reason} -> {:error, {:adapter, :io}}
+    end
+  end
 
   defp do_put(state, src_path, key, opts, deadline) do
     with {:ok, stat} <- File.stat(src_path),
@@ -325,7 +332,7 @@ defmodule Gitility.ObjectStore.S3 do
              headers: headers,
              body: body
            ) do
-      finish_put(result)
+      finish_put(result, credentials)
     else
       false -> {:error, {:adapter, :io}}
       {:error, {:unsupported_operation, _message}} = error -> error
@@ -335,29 +342,31 @@ defmodule Gitility.ObjectStore.S3 do
     end
   end
 
-  defp finish_put({:ok, %{status: status, headers: headers}}) when status in 200..299 do
+  defp finish_put({:ok, %{status: status, headers: headers}}, _credentials)
+       when status in 200..299 do
     with {:ok, etag} <- response_etag(headers) do
       {:ok, %{etag: etag}}
     end
   end
 
-  defp finish_put({:ok, %{status: 412}}), do: {:error, :precondition_failed}
+  defp finish_put({:ok, %{status: 412}}, _credentials), do: {:error, :precondition_failed}
 
-  defp finish_put({:ok, %{status: 409, body: body}}) do
-    case provider_code(body) do
+  defp finish_put({:ok, %{status: 409, body: body}}, credentials) do
+    case provider_code(body, credentials) do
       "ConditionalRequestConflict" -> {:error, :precondition_failed}
       code -> {:error, {:http, 409, code}}
     end
   end
 
-  defp finish_put({:ok, %{status: status, body: body}}) when status in 100..599,
-    do: {:error, http_reason(status, body)}
+  defp finish_put({:ok, %{status: status, body: body}}, credentials)
+       when status in 100..599,
+       do: {:error, http_reason(status, body, credentials)}
 
-  defp finish_put({:ok, %{status: status}}) when status in 100..599,
-    do: {:error, http_reason(status, nil)}
+  defp finish_put({:ok, %{status: status}}, credentials) when status in 100..599,
+    do: {:error, http_reason(status, nil, credentials)}
 
-  defp finish_put({:error, _reason} = error), do: error
-  defp finish_put(_other), do: {:error, {:adapter, :bad_return}}
+  defp finish_put({:error, _reason} = error, _credentials), do: error
+  defp finish_put(_other, _credentials), do: {:error, {:adapter, :bad_return}}
 
   defp request(state, credentials, deadline, request_options) do
     time_left = remaining(deadline)
@@ -631,17 +640,44 @@ defmodule Gitility.ObjectStore.S3 do
 
   defp strip_quotes(etag), do: etag
 
-  defp http_reason(status, _body) when status in 300..399, do: {:http, status, nil}
-  defp http_reason(status, body), do: {:http, status, provider_code(body)}
+  defp http_reason(status, _body, _credentials) when status in 300..399,
+    do: {:http, status, nil}
 
-  defp provider_code(body) when is_binary(body) do
+  defp http_reason(status, body, credentials),
+    do: {:http, status, provider_code(body, credentials)}
+
+  defp provider_code(body, credentials) when is_binary(body) do
     case Regex.run(~r/<Code>([A-Za-z0-9]+)<\/Code>/, body, capture: :all_but_first) do
-      [code] -> code
+      [code] -> if redact_provider_code?(code, credentials), do: "Redacted", else: code
       _other -> nil
     end
   end
 
-  defp provider_code(_body), do: nil
+  defp provider_code(_body, _credentials), do: nil
+
+  defp redact_provider_code?(code, credentials) do
+    byte_size(code) >= 40 or
+      Enum.any?(
+        [credentials.access_key_id, credentials.secret_access_key, credentials.session_token],
+        &ascii_case_equal?(code, &1)
+      )
+  end
+
+  defp ascii_case_equal?(left, right)
+       when is_binary(right) and byte_size(left) == byte_size(right),
+       do: ascii_case_equal_bytes?(left, right)
+
+  defp ascii_case_equal?(_left, _right), do: false
+
+  defp ascii_case_equal_bytes?(<<>>, <<>>), do: true
+
+  defp ascii_case_equal_bytes?(<<left, left_rest::binary>>, <<right, right_rest::binary>>) do
+    ascii_lower(left) == ascii_lower(right) and
+      ascii_case_equal_bytes?(left_rest, right_rest)
+  end
+
+  defp ascii_lower(byte) when byte in ?A..?Z, do: byte + (?a - ?A)
+  defp ascii_lower(byte), do: byte
 
   defp within_put_limit(size) when size <= @put_limit, do: :ok
 
@@ -837,8 +873,10 @@ defmodule Gitility.ObjectStore.S3 do
         {:error, {:adapter, :exception}}
 
       nil ->
-        Task.shutdown(task, :brutal_kill)
-        {:error, {:transport, :timeout}}
+        case Task.shutdown(task, :brutal_kill) do
+          {:ok, result} -> result
+          _killed_or_exited -> {:error, {:transport, :timeout}}
+        end
     end
   end
 

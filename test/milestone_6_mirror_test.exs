@@ -22,7 +22,7 @@ defmodule Gitility.Milestone6MirrorTest.FakeStore do
   end
 
   @impl true
-  def get(%{agent: agent}, key, destination, _opts) do
+  def get(%{agent: agent} = adapter, key, destination, _opts) do
     case Agent.get(agent, &get_in(&1, [:objects, key])) do
       nil ->
         {:error, :not_found}
@@ -31,7 +31,8 @@ defmodule Gitility.Milestone6MirrorTest.FakeStore do
         part = destination <> ".part"
 
         with :ok <- File.write(part, object.bytes, [:binary]),
-             :ok <- File.rename(part, destination) do
+             :ok <- File.rename(part, destination),
+             :ok <- after_get(adapter, destination) do
           {:ok,
            %{
              etag: object.etag,
@@ -91,6 +92,9 @@ defmodule Gitility.Milestone6MirrorTest.FakeStore do
   defp precondition_matches?(nil, :none), do: true
   defp precondition_matches?(%{etag: etag}, etag), do: true
   defp precondition_matches?(_current, _if_match), do: false
+
+  defp after_get(%{get_mode: :unreadable}, destination), do: File.chmod(destination, 0o000)
+  defp after_get(_adapter, _destination), do: :ok
 end
 
 defmodule Gitility.Milestone6MirrorTest.MissingCallbackStore do
@@ -99,6 +103,27 @@ defmodule Gitility.Milestone6MirrorTest.MissingCallbackStore do
   def init(arg), do: {:ok, arg}
   def head(_state, _key, _opts), do: {:error, :not_found}
   def get(_state, _key, _destination, _opts), do: {:error, :not_found}
+end
+
+defmodule Gitility.Milestone6MirrorTest.GraceStore do
+  @moduledoc false
+
+  @behaviour Gitility.ObjectStore
+
+  @impl true
+  def init(state), do: {:ok, state}
+
+  @impl true
+  def head(_state, _key, opts) do
+    Process.sleep(Keyword.fetch!(opts, :timeout) + 200)
+    {:error, {:transport, :timeout}}
+  end
+
+  @impl true
+  def get(_state, _key, _destination, _opts), do: {:error, :not_found}
+
+  @impl true
+  def put(_state, _source, _key, _opts), do: {:error, {:adapter, :unexpected_put}}
 end
 
 defmodule Gitility.Milestone6MirrorTest.HTTPStub do
@@ -114,6 +139,7 @@ defmodule Gitility.Milestone6MirrorTest.HTTPStub do
 
   def url(server), do: GenServer.call(server, :url)
   def requests(server), do: GenServer.call(server, :requests)
+  def methods(server), do: GenServer.call(server, :methods)
 
   @impl GenServer
   def init(opts) do
@@ -127,7 +153,7 @@ defmodule Gitility.Milestone6MirrorTest.HTTPStub do
       ])
 
     {:ok, {_address, port}} = :inet.sockname(listener)
-    state = %{listener: listener, mode: Keyword.fetch!(opts, :mode), requests: 0}
+    state = %{listener: listener, mode: Keyword.fetch!(opts, :mode), requests: []}
     server = self()
     acceptor = spawn_link(fn -> accept_loop(server, listener, state.mode) end)
 
@@ -140,10 +166,11 @@ defmodule Gitility.Milestone6MirrorTest.HTTPStub do
 
   @impl GenServer
   def handle_call(:url, _from, state), do: {:reply, state.url, state}
-  def handle_call(:requests, _from, state), do: {:reply, state.requests, state}
+  def handle_call(:requests, _from, state), do: {:reply, length(state.requests), state}
+  def handle_call(:methods, _from, state), do: {:reply, Enum.reverse(state.requests), state}
 
-  @impl GenServer
-  def handle_cast(:request, state), do: {:noreply, %{state | requests: state.requests + 1}}
+  def handle_call({:record, method}, _from, state),
+    do: {:reply, :ok, %{state | requests: [method | state.requests]}}
 
   @impl GenServer
   def terminate(_reason, state) do
@@ -166,18 +193,70 @@ defmodule Gitility.Milestone6MirrorTest.HTTPStub do
   end
 
   defp serve(server, socket, mode) do
-    _ = recv_headers(socket, <<>>)
-    GenServer.cast(server, :request)
+    case recv_headers(socket, <<>>) do
+      {:ok, request} ->
+        method = request_method(request)
+        :ok = GenServer.call(server, {:record, method})
+        :ok = consume_request_body(socket, method, request)
+        respond(socket, response_for(mode, method))
 
-    case mode do
-      {:status, status} -> send_response(socket, status, [])
-      {:redirect, location} -> send_response(socket, 301, [{"Location", location}])
-      :close -> :ok
-      :stall -> Process.sleep(5_000)
+      {:error, _reason} ->
+        :ok
     end
 
     :gen_tcp.close(socket)
   end
+
+  defp request_method(request) do
+    case :binary.split(request, " ", [:global]) do
+      [method | _rest] -> method
+      _other -> ""
+    end
+  end
+
+  defp consume_request_body(_socket, method, _request) when method != "PUT", do: :ok
+
+  defp consume_request_body(socket, "PUT", request) do
+    [headers, initial] = :binary.split(request, "\r\n\r\n")
+
+    expected =
+      case Regex.run(~r/(?:\A|\r\n)content-length:\s*([0-9]+)/i, headers,
+             capture: :all_but_first
+           ) do
+        [digits] -> String.to_integer(digits)
+        _missing -> 0
+      end
+
+    receive_body(socket, max(expected - byte_size(initial), 0))
+  end
+
+  defp receive_body(_socket, 0), do: :ok
+
+  defp receive_body(socket, remaining) do
+    case :gen_tcp.recv(socket, min(remaining, 1_048_576), 5_000) do
+      {:ok, bytes} -> receive_body(socket, max(remaining - byte_size(bytes), 0))
+      {:error, _reason} -> :ok
+    end
+  end
+
+  defp response_for({:methods, responses}, method), do: Map.get(responses, method, :close)
+  defp response_for(mode, _method), do: mode
+
+  defp respond(socket, {:status, status}), do: send_response(socket, status, [], "")
+
+  defp respond(socket, {:status, status, headers}),
+    do: send_response(socket, status, headers, "")
+
+  defp respond(socket, {:xml, status, code}) do
+    body = "<Error><Code>#{code}</Code></Error>"
+    send_response(socket, status, [{"Content-Type", "application/xml"}], body)
+  end
+
+  defp respond(socket, {:redirect, location}),
+    do: send_response(socket, 301, [{"Location", location}], "")
+
+  defp respond(_socket, :close), do: :ok
+  defp respond(_socket, :stall), do: Process.sleep(5_000)
 
   defp recv_headers(socket, bytes) do
     if :binary.match(bytes, "\r\n\r\n") == :nomatch do
@@ -190,21 +269,30 @@ defmodule Gitility.Milestone6MirrorTest.HTTPStub do
     end
   end
 
-  defp send_response(socket, status, headers) do
+  defp send_response(socket, status, headers, body) do
     reason =
       case status do
         200 -> "OK"
         301 -> "Moved Permanently"
         403 -> "Forbidden"
+        404 -> "Not Found"
+        409 -> "Conflict"
         412 -> "Precondition Failed"
         _other -> "Response"
+      end
+
+    headers =
+      if Enum.any?(headers, fn {name, _value} -> String.downcase(name) == "content-length" end) do
+        headers
+      else
+        [{"Content-Length", Integer.to_string(byte_size(body))} | headers]
       end
 
     encoded = Enum.map_join(headers, "", fn {name, value} -> "#{name}: #{value}\r\n" end)
 
     :gen_tcp.send(
       socket,
-      "HTTP/1.1 #{status} #{reason}\r\n#{encoded}Content-Length: 0\r\nConnection: close\r\n\r\n"
+      "HTTP/1.1 #{status} #{reason}\r\n#{encoded}Connection: close\r\n\r\n#{body}"
     )
   end
 end
@@ -219,7 +307,12 @@ defmodule Gitility.Milestone6MirrorTest do
   alias Gitility.Differential.Oracle
   alias Gitility.Fetch
   alias Gitility.Fetch.Locks
-  alias Gitility.Milestone6MirrorTest.{FakeStore, HTTPStub, MissingCallbackStore}
+  alias Gitility.Milestone6MirrorTest.{
+    FakeStore,
+    GraceStore,
+    HTTPStub,
+    MissingCallbackStore
+  }
   alias Gitility.Mirror
   alias Gitility.Mirror.{Receipt, Restore}
   alias Gitility.ObjectStore.Local
@@ -319,7 +412,7 @@ defmodule Gitility.Milestone6MirrorTest do
     assert {:ok, %Receipt{} = published} = Mirror.publish(source, context.store, key)
     assert {:ok, %Restore{} = restored} = Mirror.restore(context.store, key, destination)
     assert restored.generation == published.generation
-    assert git!(destination, ["fsck", "--strict"]) =~ ""
+    assert_fsck_clean(destination)
     assert refs(destination) == refs(source)
     assert head_state(destination) == head_state(source)
     assert_gc_safe(destination)
@@ -372,7 +465,16 @@ defmodule Gitility.Milestone6MirrorTest do
     empty = Path.join(context.scratch, "existing-empty.git")
     File.mkdir_p!(empty)
     assert {:ok, %Restore{}} = Mirror.restore(context.store, key, empty)
-    assert git!(empty, ["fsck", "--strict"]) =~ ""
+    assert_fsck_clean(empty)
+
+    symlink_target = Path.join(context.scratch, "restore-target")
+    symlink_parent = Path.join(context.scratch, "restore-link")
+    File.mkdir!(symlink_target)
+    File.ln_s!(symlink_target, symlink_parent)
+    through_symlink = Path.join([symlink_parent, "missing", "intermediate", "restored.git"])
+
+    assert {:ok, %Restore{}} = Mirror.restore(context.store, key, through_symlink)
+    assert_fsck_clean(through_symlink)
   end
 
   test "07 a missing key is typed not_found and creates no destination or siblings", context do
@@ -565,53 +667,215 @@ defmodule Gitility.Milestone6MirrorTest do
              "3996fe4fdc62e0739daccbf3ec7846ca18b73771117c5499c67597f077c52281"
   end
 
+  test "14d Mirror metadata validation enforces every boundary and key rule" do
+    exact = Map.new(?a..?h, fn letter -> {<<letter>>, String.duplicate("x", 127)} end)
+    assert Enum.sum(Enum.map(exact, fn {key, value} -> byte_size(key) + byte_size(value) end)) == 1_024
+    assert :ok = Mirror.validate_metadata(exact)
+
+    invalid = [
+      Map.put(exact, "a", String.duplicate("x", 128)),
+      %{"value" => "printable\r\nno"},
+      Map.new(?a..?i, fn letter -> {<<letter>>, "v"} end),
+      %{"Upper.case" => "v"},
+      %{"dotted.key" => "v"}
+    ]
+
+    Enum.each(invalid, fn metadata ->
+      assert {:error, %Error{code: :invalid_argument}} = Mirror.validate_metadata(metadata)
+    end)
+  end
+
   test "15 credentials, HTTP failures, logs, and redirects retain no secret", context do
     if Code.ensure_loaded?(Req) do
       source = copy_fixture(context.scratch, "hygiene-source", "sha1-basic-packed.git")
-      secret = "SENTINEL_SECRET_M6"
-      session = "SENTINEL_SESSION_M6"
+      access = "SentinelAccessM6"
+      secret = "SentinelSecretM6"
+      session = "SentinelSessionM6"
 
       credentials = %{
-        access_key_id: "sentinel-access",
+        access_key_id: access,
         secret_access_key: secret,
         session_token: session
       }
 
+      precondition =
+        start_supervised!(
+          {HTTPStub,
+           mode:
+             {:methods,
+              %{
+                "HEAD" => {:status, 200, mirror_head_headers()},
+                "PUT" => {:status, 412}
+              }}}
+        )
+
+      assert {:error, %Error{code: :conflict, retryable: true} = precondition_error} =
+               Mirror.publish(
+                 source,
+                 s3_store(HTTPStub.url(precondition), credentials),
+                 "precondition/object",
+                 timeout: 5_000
+               )
+
+      assert HTTPStub.methods(precondition) == ["HEAD", "PUT", "HEAD"]
+      assert_hygienic(precondition_error, [access, secret, session, "x-amz-"])
+
       second = start_supervised!({HTTPStub, mode: {:status, 200}})
-      first = start_supervised!({HTTPStub, mode: {:redirect, HTTPStub.url(second) <> "/hostile"}})
+      first =
+        start_supervised!(
+          {HTTPStub,
+           mode:
+             {:methods,
+              %{
+                "HEAD" => {:status, 404},
+                "PUT" => {:redirect, HTTPStub.url(second) <> "/hostile"}
+              }}}
+        )
+
       redirect_store = s3_store(HTTPStub.url(first), credentials)
 
-      assert {:error, %Error{code: :backend_error, cause: {:http, 301, nil}} = redirect_error} =
-               Mirror.publish(source, redirect_store, "redirect/object", timeout: 2_000)
+      parent = self()
 
-      assert HTTPStub.requests(first) == 1
+      put_redirect_log =
+        capture_log([level: :debug], fn ->
+          send(
+            parent,
+            {:put_redirect,
+             Mirror.publish(source, redirect_store, "redirect/object", timeout: 5_000)}
+          )
+        end)
+
+      assert_receive {:put_redirect,
+                      {:error,
+                       %Error{code: :backend_error, cause: {:http, 301, nil}} =
+                         put_redirect_error}}, 6_000
+
+      assert HTTPStub.methods(first) == ["HEAD", "PUT"]
       assert HTTPStub.requests(second) == 0
-      assert_hygienic(redirect_error, [secret, session, "X-Amz-"])
+      assert_hygienic_text(put_redirect_log, [access, secret, session, "x-amz-"])
+      assert_hygienic(put_redirect_error, [access, secret, session, "x-amz-"])
 
-      for {mode, expected_code} <- [
-            {{:status, 403}, :authentication_failed},
-            {{:status, 412}, :backend_error},
-            {:close, :backend_error},
-            {:stall, :timeout}
-          ] do
-        stub = start_supervised!({HTTPStub, mode: mode})
-        store = s3_store(HTTPStub.url(stub), credentials)
-        parent = self()
+      get_second = start_supervised!({HTTPStub, mode: {:status, 200}})
+
+      get_first =
+        start_supervised!(
+          {HTTPStub,
+           mode:
+             {:methods,
+              %{"GET" => {:redirect, HTTPStub.url(get_second) <> "/hostile"}}}}
+        )
+
+      get_redirect_log =
+        capture_log([level: :debug], fn ->
+          send(
+            parent,
+            {:get_redirect,
+             Mirror.restore(
+               s3_store(HTTPStub.url(get_first), credentials),
+               "redirect/get",
+               Path.join(context.scratch, "redirect-get.git"),
+               timeout: 5_000
+             )}
+          )
+        end)
+
+      assert_receive {:get_redirect,
+                      {:error,
+                       %Error{code: :backend_error, cause: {:http, 301, nil}} =
+                         get_redirect_error}}, 6_000
+
+      assert HTTPStub.methods(get_first) == ["GET"]
+      assert HTTPStub.requests(get_second) == 0
+      assert_hygienic_text(get_redirect_log, [access, secret, session, "x-amz-"])
+      assert_hygienic(get_redirect_error, [access, secret, session, "x-amz-"])
+
+      reflection_cases = [
+        {:get, access},
+        {:put, secret},
+        {:put, session}
+      ]
+
+      Enum.with_index(reflection_cases)
+      |> Enum.each(fn {{operation, reflected}, index} ->
+        responses =
+          case operation do
+            :get -> %{"GET" => {:xml, 403, reflected}}
+            :put -> %{"HEAD" => {:status, 404}, "PUT" => {:xml, 403, reflected}}
+          end
+
+        stub = start_supervised!({HTTPStub, mode: {:methods, responses}})
+        tag = make_ref()
 
         log =
-          capture_log([level: :info], fn ->
-            timeout = if mode == :stall, do: 100, else: 2_000
-            result = Mirror.publish(source, store, "hygiene/#{inspect(mode)}", timeout: timeout)
-            send(parent, {:hygiene, result})
+          capture_log([level: :debug], fn ->
+            result =
+              case operation do
+                :get ->
+                  Mirror.restore(
+                    s3_store(HTTPStub.url(stub), credentials),
+                    "reflection/get/#{index}",
+                    Path.join(context.scratch, "reflection-#{index}.git"),
+                    timeout: 5_000
+                  )
+
+                :put ->
+                  Mirror.publish(
+                    source,
+                    s3_store(HTTPStub.url(stub), credentials),
+                    "reflection/put/#{index}",
+                    timeout: 5_000
+                  )
+              end
+
+            send(parent, {tag, result})
           end)
 
-        assert_receive {:hygiene, {:error, %Error{code: ^expected_code} = error}}, 2_000
-        assert log == ""
-        assert_hygienic(error, [secret, session, "X-Amz-"])
+        assert_receive {^tag,
+                        {:error,
+                         %Error{
+                           code: :authentication_failed,
+                           cause: {:http, 403, "Redacted"}
+                         } = error}}, 6_000
+
+        assert_hygienic_text(log, [access, secret, session, "x-amz-"])
+        assert_hygienic(error, [access, secret, session, "x-amz-"])
+      end)
+
+      for {put_response, label} <- [{:close, "close"}, {:stall, "stall"}] do
+        stub =
+          start_supervised!(
+            {HTTPStub,
+             mode: {:methods, %{"HEAD" => {:status, 404}, "PUT" => put_response}}}
+          )
+
+        tag = make_ref()
+
+        log =
+          capture_log([level: :debug], fn ->
+            send(
+              parent,
+              {tag,
+               Mirror.publish(
+                 source,
+                 s3_store(HTTPStub.url(stub), credentials),
+                 "transport/#{label}",
+                 timeout: if(put_response == :stall, do: 100, else: 2_000)
+               )}
+            )
+          end)
+
+        expected_code = if put_response == :stall, do: :timeout, else: :backend_error
+        expected_methods = if put_response == :stall, do: ["HEAD", "PUT"], else: ["HEAD", "PUT", "HEAD"]
+
+        assert_receive {^tag, {:error, %Error{code: ^expected_code} = error}}, 3_000
+        assert HTTPStub.methods(stub) == expected_methods
+        assert_hygienic_text(log, [access, secret, session, "x-amz-"])
+        assert_hygienic(error, [access, secret, session, "x-amz-"])
       end
 
       assert {:ok, state} = S3.init(elem(redirect_store, 1))
       inspected = inspect(state, limit: :infinity)
+      refute inspected =~ access
       refute inspected =~ secret
       refute inspected =~ session
       refute inspected =~ "Req.Request"
@@ -705,8 +969,21 @@ defmodule Gitility.Milestone6MirrorTest do
     malformed_shapes = [
       {"existing", [%{name: "refs/heads/main", target: oid, kind: :commit}], "refs/heads/main",
        :malformed_ref},
-      {"tag", [%{name: "refs/tags/v1", target: oid, kind: :tag}], "refs/tags/v1", :malformed_ref},
+      {"tag",
+       [
+         %{name: "HEAD", target: oid, kind: :commit},
+         %{name: "refs/tags/v1", target: oid, kind: :commit}
+       ], "refs/tags/v1", :malformed_ref},
       {"self", [], "HEAD", :malformed_ref},
+      {"5000-byte",
+       [],
+       "refs/heads/" <> String.duplicate("a", 5_000 - byte_size("refs/heads/")),
+       :malformed_ref},
+      {"one-level-lowercase",
+       [
+         %{name: "HEAD", target: oid, kind: :commit},
+         %{name: "lower", target: oid, kind: :commit}
+       ], nil, :malformed_ref},
       {"missing", [%{name: "refs/heads/main", target: oid, kind: :commit}], nil, :missing_head}
     ]
 
@@ -772,12 +1049,16 @@ defmodule Gitility.Milestone6MirrorTest do
     assert {:ok, _receipt} =
              Bundle.write(bad_index, source: {:repository, source}, strict_refs: true)
 
-    corrupt_named_section!(bad_index, :idx, 20)
+    corrupt_index_trailing_checksum!(bad_index)
     assert :ok = Bundle.verify(bad_index)
     put_bundle!(context.store, "crafted/bad-index", bad_index)
     bad_index_dest = Path.join(context.scratch, "bad-index.git")
 
-    assert {:error, %Error{code: :malformed_bundle}} =
+    assert {:error,
+            %Error{
+              code: :malformed_bundle,
+              details: %{verify_code: :index_checksum_mismatch}
+            }} =
              Mirror.restore(context.store, "crafted/bad-index", bad_index_dest)
 
     assert owned_restore_siblings(bad_index_dest) == []
@@ -848,6 +1129,49 @@ defmodule Gitility.Milestone6MirrorTest do
     assert Agent.get(absent_agent, & &1.objects) == %{}
   end
 
+  test "21b verification open failures stay retryable-domain backend errors", context do
+    source = copy_fixture(context.scratch, "verify-io-source", "sha1-basic-packed.git")
+    {:ok, agent} = Agent.start_link(fn -> %{objects: %{}} end)
+    store = {FakeStore, %{agent: agent}}
+    key = "verify/io"
+    assert {:ok, %Receipt{}} = Mirror.publish(source, store, key)
+
+    probe = Path.join(context.scratch, "permission-probe")
+    File.write!(probe, "probe")
+    File.chmod!(probe, 0o000)
+    permission_bypass? = match?({:ok, _bytes}, File.read(probe))
+    File.chmod!(probe, 0o600)
+
+    if permission_bypass? do
+      assert true
+    else
+      unreadable_store = {FakeStore, %{agent: agent, get_mode: :unreadable}}
+      destination = Path.join(context.scratch, "verify-io.git")
+
+      assert {:error, %Error{code: :backend_error, operation: :restore}} =
+               Mirror.restore(unreadable_store, key, destination)
+
+      refute File.exists?(destination)
+      assert owned_restore_siblings(destination) == []
+    end
+  end
+
+  test "21c Mirror gives adapters their documented one-second deadline grace", context do
+    source = copy_fixture(context.scratch, "adapter-grace-source", "sha1-basic-packed.git")
+    started = System.monotonic_time(:millisecond)
+
+    assert {:error,
+            %Error{
+              code: :backend_error,
+              retryable: true,
+              cause: {:transport, :timeout}
+            }} = Mirror.publish(source, {GraceStore, :state}, "grace/object", timeout: 50)
+
+    elapsed = System.monotonic_time(:millisecond) - started
+    assert elapsed >= 200
+    assert elapsed < 1_500
+  end
+
   test "22 raising and malformed S3 credential providers are credentials_unavailable and hygienic",
        context do
     if Code.ensure_loaded?(Req) do
@@ -901,21 +1225,21 @@ defmodule Gitility.Milestone6MirrorTest do
 
     basename = Path.basename(source)
     parent_dir = Path.dirname(source)
-    writer = Path.join(parent_dir, ".#{basename}.publish-#{@owned_hex}.tmp.tmp-1")
-    staging = Path.join(parent_dir, ".#{basename}.publish-#{@owned_hex}.tmp.staging-1")
-    pack_orphan = Path.join(source, "objects/.gitility-publish-1")
+    writer = Path.join(parent_dir, ".#{basename}.publish-#{@owned_hex}.tmp.tmp-#{@owned_hex}")
+
+    staging =
+      Path.join(parent_dir, ".#{basename}.publish-#{@owned_hex}.tmp.staging-#{@owned_hex}")
+
     decoy_sibling = Path.join(parent_dir, "#{basename}.publish-backup")
     decoy_pack = Path.join(source, "objects/pack/keep.me")
     File.write!(writer, "orphan")
     File.mkdir_p!(staging)
-    File.mkdir_p!(pack_orphan)
     File.write!(decoy_sibling, "owner")
     File.write!(decoy_pack, "owner")
 
     assert {:ok, :not_newer} = Mirror.publish(source, context.store, key)
     refute File.exists?(writer)
     refute File.exists?(staging)
-    refute File.exists?(pack_orphan)
     assert File.read!(decoy_sibling) == "owner"
     assert File.read!(decoy_pack) == "owner"
     refute_receive {:killed_result, _result}
@@ -925,6 +1249,8 @@ defmodule Gitility.Milestone6MirrorTest do
     source = copy_fixture(context.scratch, "validation-source", "sha1-basic-packed.git")
     destination = Path.join(context.scratch, "validation-restore.git")
     invalid_store = {MissingCallbackStore, :state}
+    {:ok, counter} = Agent.start_link(fn -> %{objects: %{}, init_calls: 0} end)
+    counting_store = {FakeStore, %{agent: counter}}
 
     publish_calls = [
       fn -> Mirror.publish(source, context.store, "valid/key", unknown: true) end,
@@ -945,6 +1271,41 @@ defmodule Gitility.Milestone6MirrorTest do
     Enum.each(publish_calls ++ restore_calls, fn call ->
       assert {:error, %Error{code: :invalid_argument}} = call.()
     end)
+
+    invalid_keys = [
+      "",
+      "/a",
+      "a/../b",
+      "a//b",
+      "a/",
+      "a\0",
+      String.duplicate("k", 1_025),
+      <<0xFF>>
+    ]
+
+    Enum.each(invalid_keys, fn key ->
+      assert {:error, %Error{code: :invalid_argument}} =
+               Mirror.publish(source, counting_store, key)
+
+      assert {:error, %Error{code: :invalid_argument}} =
+               Mirror.restore(counting_store, key, destination)
+    end)
+
+    assert Agent.get(counter, & &1.init_calls) == 0
+
+    if Code.ensure_loaded?(Req) do
+      dotted_store =
+        {S3,
+         [
+           bucket: "dotted.bucket",
+           region: "us-east-1",
+           credentials: %{access_key_id: "access", secret_access_key: "secret"},
+           addressing: :virtual_host
+         ]}
+
+      assert {:error, %Error{code: :invalid_argument, message: "use addressing: :path"}} =
+               Mirror.publish(source, dotted_store, "valid/key")
+    end
   end
 
   test "25 strict refs reject missing targets while lenient mode warns and publish never uploads",
@@ -1153,7 +1514,7 @@ defmodule Gitility.Milestone6MirrorTest do
     assert {:ok, %Restore{bytes: ^bytes}} =
              Mirror.restore(context.store, "crafted/large", large_restore, timeout: 3_600_000)
 
-    assert git!(large_restore, ["fsck", "--strict"]) =~ ""
+    assert_fsck_clean(large_restore)
   end
 
   test "29 Local pins readers, drops killed pins, and preserves timeout orphans coherently",
@@ -1175,6 +1536,8 @@ defmodule Gitility.Milestone6MirrorTest do
                content_type: @content_type
              )
 
+    version_a = local_current_version(root, key)
+    age_local_version!(root, key, version_a)
     {:ok, %{etag: first_etag}} = Local.head(plain, key, timeout: 5_000)
 
     block_get = fn ->
@@ -1201,7 +1564,10 @@ defmodule Gitility.Milestone6MirrorTest do
                content_type: @content_type
              )
 
+    version_b = local_current_version(root, key)
+    refute version_b == version_a
     assert :ok = Local.force_sweep(plain, key)
+    assert File.dir?(Local.version_path(plain, key, version_a))
     send(reader_hook, :read_now)
     assert_receive {:reader_result, {:ok, _result}}, 2_000
     refute Process.alive?(reader)
@@ -1220,13 +1586,16 @@ defmodule Gitility.Milestone6MirrorTest do
     assert :ok = eventually(fn -> LocalServer.pin_count(Local.server(plain)) == 0 end)
 
     current_before = local_current_version(root, key)
+    assert current_before == version_b
+    versions_before_timeout = MapSet.new(local_version_directories(root, key))
 
     timeout_hook = fn ->
       send(parent, :commit_hook_entered)
-      Process.sleep(:infinity)
+      Process.sleep(250)
+      :ok
     end
 
-    timeout_state = Local.with_test_hooks(plain, %{before_commit: timeout_hook})
+    timeout_state = Local.with_test_hooks(plain, %{after_commit: timeout_hook})
 
     assert {:error, {:transport, :timeout}} =
              Local.put(timeout_state, new_source, key,
@@ -1237,8 +1606,21 @@ defmodule Gitility.Milestone6MirrorTest do
              )
 
     assert_receive :commit_hook_entered
-    assert local_current_version(root, key) == current_before
-    assert length(local_version_directories(root, key)) >= 2
+
+    [version_c_directory] =
+      root
+      |> local_version_directories(key)
+      |> MapSet.new()
+      |> MapSet.difference(versions_before_timeout)
+      |> MapSet.to_list()
+
+    version_c = String.replace_prefix(Path.basename(version_c_directory), "v-", "")
+    refute version_c == current_before
+    assert local_current_version(root, key) == version_c
+    age_local_version!(root, key, version_c)
+    assert :ok = Local.force_sweep(plain, key)
+    assert local_current_version(root, key) == version_c
+    assert File.dir?(version_c_directory)
   end
 
   test "30 default bundle generation refuses exhaustion at u64 max", context do
@@ -1276,6 +1658,53 @@ defmodule Gitility.Milestone6MirrorTest do
              )
 
     assert warnings != []
+
+    component_source =
+      copy_fixture(context.scratch, "long-component-source", "sha1-basic-packed.git")
+
+    component_oid = git!(component_source, ["rev-parse", "refs/heads/main"])
+    component_name = "refs/heads/" <> String.duplicate("c", 300)
+    component_packed_refs = Path.join(component_source, "packed-refs")
+
+    existing_packed_refs =
+      component_packed_refs
+      |> File.read!()
+      |> String.replace(" sorted", "")
+
+    File.write!(component_packed_refs, existing_packed_refs <> "#{component_oid} #{component_name}\n")
+
+    assert {:error,
+            %Error{code: :malformed_ref, details: %{reason: :component_too_long}}} =
+             Bundle.write(Path.join(context.scratch, "component-strict.bundle"),
+               source: {:repository, component_source},
+               strict_refs: true
+             )
+
+    component_bundle = Path.join(context.scratch, "component-lenient.bundle")
+
+    assert {:ok, _receipt} =
+             Bundle.write(component_bundle, source: {:repository, component_source})
+
+    rewrite_bundle!(component_bundle, fn toc, sections ->
+      main = Enum.find(toc.refs, &(&1.name == "refs/heads/main"))
+      {sections, [%{main | name: component_name} | toc.refs], toc.metadata}
+    end)
+
+    put_bundle!(context.store, "crafted/component-too-long", component_bundle)
+    component_destination = Path.join(context.scratch, "component-too-long.git")
+
+    assert {:error,
+            %Error{
+              code: :malformed_bundle,
+              details: %{verify_code: :malformed_ref, reason: :component_too_long}
+            }} =
+             Mirror.restore(
+               context.store,
+               "crafted/component-too-long",
+               component_destination
+             )
+
+    refute File.exists?(component_destination)
   end
 
   test "32 init_bare sweeps exact orphans and config failure never exposes the destination",
@@ -1463,6 +1892,18 @@ defmodule Gitility.Milestone6MirrorTest do
     git_command(prefix ++ arguments)
   end
 
+  defp assert_fsck_clean(repository) do
+    {output, status} = git_result(repository, ["fsck", "--strict"])
+    assert status == 0, "git fsck --strict failed with status #{status}: #{output}"
+
+    bad_lines =
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&Regex.match?(~r/error:|missing|broken link/i, &1))
+
+    assert bad_lines == [], "git fsck reported integrity failures: #{Enum.join(bad_lines, "\n")}"
+  end
+
   defp git_command(arguments, opts \\ []) do
     environment =
       Oracle.git_environment() ++
@@ -1554,6 +1995,25 @@ defmodule Gitility.Milestone6MirrorTest do
     end)
   end
 
+  defp corrupt_index_trailing_checksum!(path) do
+    rewrite_bundle!(path, fn toc, sections ->
+      {updated, changed?} =
+        Enum.map_reduce(sections, false, fn
+          {:idx, name, bytes}, false ->
+            offset = byte_size(bytes) - 1
+            old = :binary.at(bytes, offset)
+            replacement = replace_binary(bytes, offset, 1, <<Bitwise.bxor(old, 1)>>)
+            {{:idx, name, replacement}, true}
+
+          section, changed? ->
+            {section, changed?}
+        end)
+
+      assert changed?
+      {updated, toc.refs, toc.metadata}
+    end)
+  end
+
   defp replace_binary(binary, offset, length, replacement) do
     prefix = binary_part(binary, 0, offset)
     suffix_offset = offset + length
@@ -1597,6 +2057,20 @@ defmodule Gitility.Milestone6MirrorTest do
     |> Path.wildcard()
   end
 
+  defp age_local_version!(root, key, version) do
+    old =
+      DateTime.utc_now()
+      |> DateTime.add(-2 * 60 * 60, :second)
+      |> DateTime.to_naive()
+      |> NaiveDateTime.to_erl()
+
+    root
+    |> Path.join("objects")
+    |> Path.join(key_hash(key))
+    |> Path.join("v-#{version}")
+    |> File.touch!(old)
+  end
+
   defp local_head_etag(state, key) do
     assert {:ok, %{etag: etag}} = Local.head(state, key, timeout: 5_000)
     etag
@@ -1631,6 +2105,18 @@ defmodule Gitility.Milestone6MirrorTest do
      ]}
   end
 
+  defp mirror_head_headers do
+    [
+      {"ETag", "\"existing-etag\""},
+      {"Content-Length", "123"},
+      {"x-amz-meta-format", "gitility-bundle/1.0"},
+      {"x-amz-meta-generation", "1"},
+      {"x-amz-meta-tips_digest", String.duplicate("0", 64)},
+      {"x-amz-meta-ref_count", "1"},
+      {"x-amz-meta-file_count", "2"}
+    ]
+  end
+
   defp assert_hygienic(error, sentinels) do
     inspected =
       [
@@ -1640,8 +2126,14 @@ defmodule Gitility.Milestone6MirrorTest do
         inspect(error.cause)
       ]
       |> Enum.join(" ")
+      |> String.downcase()
 
-    Enum.each(sentinels, fn sentinel -> refute inspected =~ sentinel end)
+    Enum.each(sentinels, fn sentinel -> refute inspected =~ String.downcase(sentinel) end)
+  end
+
+  defp assert_hygienic_text(text, sentinels) do
+    inspected = String.downcase(text)
+    Enum.each(sentinels, fn sentinel -> refute inspected =~ String.downcase(sentinel) end)
   end
 
   defp lease_present?(key) do

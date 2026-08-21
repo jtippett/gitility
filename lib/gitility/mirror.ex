@@ -38,9 +38,24 @@ defmodule Gitility.Mirror do
   adapter/provider terms or credentials. Req and Finch telemetry are outside
   that boundary; do not attach Finch telemetry handlers that log requests for
   the gitility pool.
+
+  Strict publication and restore reject ref names containing a path component
+  longer than 255 bytes. This keeps accepted bundles round-trippable on the
+  filesystems used by gix's ref transaction.
   """
 
-  alias Gitility.{Bundle, Error, Limits, Native, NativeSupport, ODB, OID, RefDB, RefTarget}
+  alias Gitility.{
+    Bundle,
+    Error,
+    Limits,
+    Native,
+    NativeSupport,
+    ODB,
+    OID,
+    RefDB,
+    RefName,
+    RefTarget
+  }
   alias Gitility.Bundle.Format
   alias Gitility.Fetch.Locks
   alias Gitility.Mirror.{Receipt, Restore}
@@ -55,6 +70,7 @@ defmodule Gitility.Mirror do
   @probe_slack_bytes 16 * 1024 * 1024
   @peel_object_bytes 64 * 1024 * 1024
   @peel_total_bytes 256 * 1024 * 1024
+  @adapter_grace_ms 1_000
 
   @type store :: {module(), term()}
 
@@ -291,7 +307,7 @@ defmodule Gitility.Mirror do
       }
 
       with :ok <- rewrite_result(validate_metadata(metadata), :publish),
-           :ok <- deadline_check(request.deadline, :publish, :put) do
+           :ok <- deadline_check(request.deadline, :publish, :put, %{indeterminate: false}) do
         local = %{
           generation: generation,
           bytes: toc.file_size,
@@ -330,6 +346,9 @@ defmodule Gitility.Mirror do
 
           :deadline_timeout ->
             timeout_error(:publish, :put, %{indeterminate: true})
+
+          :deadline_expired_before_call ->
+            timeout_error(:publish, :put, %{indeterminate: false})
         end
       end
     end
@@ -669,7 +688,8 @@ defmodule Gitility.Mirror do
     {head_rows, rows} = Enum.split_with(toc.refs, &(&1.name == "HEAD"))
     head_symref = toc.metadata["head_symref"]
 
-    with {:ok, head} <- restored_head(head_rows, head_symref) do
+    with :ok <- validate_restore_ref_names(toc.refs, head_symref),
+         {:ok, head} <- restored_head(head_rows, head_symref) do
       native_rows = Enum.map(rows, &{&1.name, &1.target})
 
       case Native.repo_write_refs(stage, native_rows, head) do
@@ -700,6 +720,38 @@ defmodule Gitility.Mirror do
   defp restored_head([], head_symref) when is_binary(head_symref), do: {:ok, {nil, head_symref}}
   defp restored_head([], nil), do: malformed_bundle(:missing_head)
   defp restored_head(_heads, _head_symref), do: malformed_bundle(:malformed_ref)
+
+  defp validate_restore_ref_names(refs, head_symref) do
+    with :ok <- validate_restore_rows(refs),
+         :ok <- validate_restore_head_symref(head_symref) do
+      :ok
+    end
+  end
+
+  defp validate_restore_rows(refs) do
+    Enum.reduce_while(refs, :ok, fn row, :ok ->
+      case RefName.validate(row.name) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, malformed_bundle(:malformed_ref, %{reason: reason})}
+      end
+    end)
+  end
+
+  defp validate_restore_head_symref(nil), do: :ok
+
+  defp validate_restore_head_symref(head_symref) do
+    if RefName.valid_branch?(head_symref) do
+      :ok
+    else
+      reason =
+        case RefName.validate(head_symref) do
+          :ok -> :not_a_branch
+          {:error, ref_reason} -> ref_reason
+        end
+
+      malformed_bundle(:malformed_ref, %{reason: reason})
+    end
+  end
 
   defp verify_pack_pairs(stage, toc, deadline) do
     toc.files
@@ -1045,7 +1097,7 @@ defmodule Gitility.Mirror do
         :deadline_timeout -> :deadline_timeout
       end
     else
-      :expired -> deadline_marker(operation)
+      :expired -> deadline_expired_before_call(operation)
     end
   end
 
@@ -1061,7 +1113,7 @@ defmodule Gitility.Mirror do
         end
       end)
 
-    result = Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill)
+    result = Task.yield(task, timeout + @adapter_grace_ms) || Task.shutdown(task, :brutal_kill)
 
     case result do
       {:ok, {:adapter_return, value}} -> {:ok, value}
@@ -1098,12 +1150,22 @@ defmodule Gitility.Mirror do
   defp validate_adapter_reason(:precondition_failed, :put),
     do: {:error, :precondition_failed}
 
+  defp validate_adapter_reason({:http, status, code}, _phase)
+       when is_integer(status) and status in 100..599 and (is_nil(code) or is_binary(code)) do
+    {:error, {:http, status, sanitize_provider_code(code)}}
+  end
+
   defp validate_adapter_reason(reason, _phase) do
     if valid_general_reason?(reason) do
       {:error, reason}
     else
       {:error, {:adapter, :bad_return}}
     end
+  end
+
+  defp sanitize_init_reason({:http, status, code})
+       when is_integer(status) and status in 100..599 and (is_nil(code) or is_binary(code)) do
+    {:http, status, sanitize_provider_code(code)}
   end
 
   defp sanitize_init_reason(reason) do
@@ -1113,6 +1175,11 @@ defmodule Gitility.Mirror do
       true -> {:init, :failed}
     end
   end
+
+  defp sanitize_provider_code(code) when is_binary(code) and byte_size(code) >= 40,
+    do: "Redacted"
+
+  defp sanitize_provider_code(code), do: code
 
   defp valid_general_reason?({:unsupported_operation, message}), do: is_binary(message)
   defp valid_general_reason?({:invalid_key, message}), do: is_binary(message)
@@ -1427,19 +1494,15 @@ defmodule Gitility.Mirror do
 
     sibling_patterns = [
       {Regex.compile!("\\A#{basename}\\.publish-[0-9a-f]{32}\\.tmp\\z"), :regular},
-      {Regex.compile!("\\A\\.#{basename}\\.publish-[0-9a-f]{32}\\.tmp\\.tmp-[1-9][0-9]*\\z"),
+      {Regex.compile!("\\A\\.#{basename}\\.publish-[0-9a-f]{32}\\.tmp\\.tmp-[0-9a-f]{32}\\z"),
        :regular},
-      {Regex.compile!("\\A\\.#{basename}\\.publish-[0-9a-f]{32}\\.tmp\\.staging-[1-9][0-9]*\\z"),
+      {Regex.compile!(
+         "\\A\\.#{basename}\\.publish-[0-9a-f]{32}\\.tmp\\.staging-[0-9a-f]{32}\\z"
+       ),
        :directory}
     ]
 
-    with :ok <- sweep_entries(parent, sibling_patterns),
-         :ok <-
-           sweep_entries(Path.join(expanded, "objects"), [
-             {~r/\A\.gitility-publish-[1-9][0-9]*\z/, :directory}
-           ]) do
-      :ok
-    end
+    sweep_entries(parent, sibling_patterns)
   end
 
   defp sweep_restore(expanded) do
@@ -1531,7 +1594,7 @@ defmodule Gitility.Mirror do
   end
 
   defp missing_parent_chain(path, acc) do
-    case File.lstat(path) do
+    case File.stat(path) do
       {:ok, %{type: :directory}} ->
         acc
 
@@ -1685,13 +1748,18 @@ defmodule Gitility.Mirror do
   end
 
   defp deadline_check(deadline, operation, phase) do
+    deadline_check(deadline, operation, phase, %{})
+  end
+
+  defp deadline_check(deadline, operation, phase, extra_details) do
     case raw_time_left(deadline) do
       {:ok, _remaining} -> :ok
-      :expired -> timeout_error(operation, phase)
+      :expired -> timeout_error(operation, phase, extra_details)
     end
   end
 
   defp deadline_marker(_operation), do: :deadline_timeout
+  defp deadline_expired_before_call(_operation), do: :deadline_expired_before_call
 
   defp timeout_error(operation, phase, extra_details \\ %{}) do
     {:error,

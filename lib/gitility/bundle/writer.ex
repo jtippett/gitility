@@ -15,53 +15,84 @@ defmodule Gitility.Bundle.Writer do
     warnings = Keyword.get(opts, :warnings, [])
     mode = Keyword.get(opts, :mode)
     directory = Path.dirname(path)
-    suffix = System.unique_integer([:positive, :monotonic])
+    suffix = random_hex(16)
     temp = Path.join(directory, ".#{Path.basename(path)}.tmp-#{suffix}")
 
-    try do
-      with :ok <- mkdir_destination(directory),
-           {:ok, output} <- File.open(temp, [:write, :binary, :exclusive]) do
-        result =
-          try do
-            with :ok <- apply_mode(temp, mode),
-                 :ok <- IO.binwrite(output, Format.encode_header()),
-                 {:ok, files, toc_offset} <- stream_pairs(pairs, output, 16, []),
-                 toc <-
-                   Format.encode_toc(%{
-                     hash_algorithm: hash,
-                     generation: generation,
-                     metadata: metadata,
-                     files: files,
-                     refs: refs
-                   }),
-                 :ok <- validate_toc_size(toc),
-                 toc_sha256 <- :crypto.hash(:sha256, toc),
-                 :ok <- IO.binwrite(output, toc),
-                 :ok <-
-                   IO.binwrite(
-                     output,
-                     Format.encode_trailer(toc_offset, byte_size(toc), toc_sha256)
-                   ),
-                 :ok <- :file.sync(output) do
-              bytes = toc_offset + byte_size(toc) + 64
-              {:ok, files, bytes}
-            end
-          after
-            File.close(output)
-          end
+    with :ok <- mkdir_destination(directory) do
+      case File.open(temp, [:write, :binary, :exclusive]) do
+        {:ok, output} ->
+          write_owned_temp(
+            output,
+            temp,
+            path,
+            pairs,
+            hash,
+            generation,
+            metadata,
+            refs,
+            warnings,
+            mode
+          )
 
-        with {:ok, files, bytes} <- result,
-             :ok <- File.rename(temp, path) do
-          {:ok,
-           %Receipt{
-             path: path,
-             generation: generation,
-             bytes: bytes,
-             files: length(files),
-             refs: length(refs),
-             warnings: warnings
-           }}
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp write_owned_temp(
+         output,
+         temp,
+         path,
+         pairs,
+         hash,
+         generation,
+         metadata,
+         refs,
+         warnings,
+         mode
+       ) do
+    try do
+      result =
+        try do
+          with :ok <- apply_mode(temp, mode),
+               :ok <- IO.binwrite(output, Format.encode_header()),
+               {:ok, files, toc_offset} <- stream_pairs(pairs, output, 16, []),
+               toc <-
+                 Format.encode_toc(%{
+                   hash_algorithm: hash,
+                   generation: generation,
+                   metadata: metadata,
+                   files: files,
+                   refs: refs
+                 }),
+               :ok <- validate_toc_size(toc),
+               toc_sha256 <- :crypto.hash(:sha256, toc),
+               :ok <- IO.binwrite(output, toc),
+               :ok <-
+                 IO.binwrite(
+                   output,
+                   Format.encode_trailer(toc_offset, byte_size(toc), toc_sha256)
+                 ),
+               :ok <- :file.sync(output) do
+            bytes = toc_offset + byte_size(toc) + 64
+            {:ok, files, bytes}
+          end
+        after
+          File.close(output)
         end
+
+      with {:ok, files, bytes} <- result,
+           :ok <- File.rename(temp, path) do
+        {:ok,
+         %Receipt{
+           path: path,
+           generation: generation,
+           bytes: bytes,
+           files: length(files),
+           refs: length(refs),
+           warnings: warnings
+         }}
       end
     after
       File.rm(temp)
@@ -95,6 +126,8 @@ defmodule Gitility.Bundle.Writer do
       {:error, reason} -> {:error, {:destination_directory_failed, reason}}
     end
   end
+
+  defp random_hex(bytes), do: :crypto.strong_rand_bytes(bytes) |> Base.encode16(case: :lower)
 
   defp stream_pairs([], _output, offset, files), do: {:ok, Enum.reverse(files), offset}
 

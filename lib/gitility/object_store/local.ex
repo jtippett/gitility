@@ -27,7 +27,14 @@ defmodule Gitility.ObjectStore.Local do
 
   @chunk_bytes 8 * 1024 * 1024
   @content_type "application/vnd.gitility.bundle"
-  @hook_names [:before_commit, :before_head, :before_get, :before_put]
+  @hook_names [
+    :after_commit,
+    :before_chunk,
+    :before_commit,
+    :before_head,
+    :before_get,
+    :before_put
+  ]
 
   @enforce_keys [:root, :server]
   defstruct [:root, :server, test_hooks: %{}]
@@ -82,13 +89,20 @@ defmodule Gitility.ObjectStore.Local do
       with :ok <- validate_key(key),
            {:ok, timeout} <- timeout_options(opts) do
         run_with_timeout(timeout, fn deadline ->
-          do_get(state, key, dest_path, part, deadline)
+          do_get(state, key, part, deadline)
         end)
       end
 
     case result do
-      {:ok, _reply} ->
-        result
+      {:ok, _reply} = ok ->
+        case File.rename(part, dest_path) do
+          :ok ->
+            ok
+
+          {:error, _reason} ->
+            File.rm(part)
+            {:error, {:adapter, :io}}
+        end
 
       _error ->
         File.rm(part)
@@ -172,17 +186,16 @@ defmodule Gitility.ObjectStore.Local do
     end
   end
 
-  defp do_get(state, key, dest_path, part, deadline) do
+  defp do_get(state, key, part, deadline) do
     with {:ok, _server} <- start_server(state.root),
          {:ok, {version, meta}} <- pin(state, key, deadline) do
       try do
         source = version_path(state, key, version) |> Path.join("data")
 
         with :ok <- run_hook(state, :before_get),
-             {:ok, bytes} <- copy_for_get(source, part, deadline),
+             {:ok, bytes} <- copy_for_get(state, source, part, deadline),
              true <- bytes == meta["size"],
-             :ok <- remaining_ok(deadline),
-             :ok <- File.rename(part, dest_path) do
+             :ok <- remaining_ok(deadline) do
           {:ok,
            %{
              etag: meta["etag"],
@@ -218,16 +231,16 @@ defmodule Gitility.ObjectStore.Local do
             commit_version(state, key, version, directory, opts.if_match, etag, size, deadline)
 
           {:error, _reason} = error ->
-            File.rm_rf(directory)
+            remove_version_directory(directory)
             error
         end
 
       {:error, {:transport, :timeout}} = error ->
-        File.rm_rf(directory)
+        remove_version_directory(directory)
         error
 
       {:error, _reason} = error ->
-        File.rm_rf(directory)
+        remove_version_directory(directory)
         error
     end
   end
@@ -235,14 +248,14 @@ defmodule Gitility.ObjectStore.Local do
   defp commit_version(state, key, version, directory, if_match, etag, _size, deadline) do
     case server_call(
            state.server,
-           {:commit, key_hash(key), if_match, version},
+           {:commit, key_hash(key), if_match, version, Map.get(state.test_hooks, :after_commit)},
            remaining(deadline)
          ) do
       :ok ->
         {:ok, %{etag: etag}}
 
       {:error, :precondition_failed} = error ->
-        File.rm_rf(directory)
+        remove_version_directory(directory)
         error
 
       {:error, {:transport, _reason}} = error ->
@@ -252,7 +265,7 @@ defmodule Gitility.ObjectStore.Local do
         error
 
       {:error, _reason} = error ->
-        File.rm_rf(directory)
+        remove_version_directory(directory)
         error
     end
   end
@@ -281,10 +294,11 @@ defmodule Gitility.ObjectStore.Local do
 
   defp create_version(state, key) do
     hash = key_hash(key)
-    object_directory = Path.join([state.root, "objects", hash])
+    objects = Path.join(state.root, "objects")
+    object_directory = Path.join(objects, hash)
 
-    with :ok <- File.mkdir_p(object_directory),
-         :ok <- File.chmod(object_directory, 0o700),
+    with :ok <- ensure_owned_directory(objects),
+         :ok <- ensure_owned_directory(object_directory),
          :ok <- ensure_key_file(object_directory, key) do
       create_random_version(object_directory, 3)
     else
@@ -302,12 +316,12 @@ defmodule Gitility.ObjectStore.Local do
 
     case File.mkdir(directory) do
       :ok ->
-        case File.chmod(directory, 0o700) do
-          :ok ->
+        case {File.chmod(directory, 0o700), File.lstat(directory)} do
+          {:ok, {:ok, %{type: :directory}}} ->
             {:ok, version, directory}
 
-          {:error, _reason} ->
-            File.rm_rf(directory)
+          _error ->
+            remove_version_directory(directory)
             {:error, {:adapter, :io}}
         end
 
@@ -322,19 +336,59 @@ defmodule Gitility.ObjectStore.Local do
   defp ensure_key_file(object_directory, key) do
     path = Path.join(object_directory, "key")
 
-    case File.write(path, key, [:binary, :exclusive]) do
-      :ok ->
-        case File.chmod(path, 0o600) do
-          :ok -> :ok
-          {:error, _reason} -> {:error, {:adapter, :io}}
+    case File.read(path) do
+      {:ok, ^key} ->
+        :ok
+
+      {:ok, other} ->
+        if other != key and key_hash(other) == Path.basename(object_directory) do
+          {:error, {:adapter, :hash_collision}}
+        else
+          replace_key_file(path, key, 3)
+        end
+
+      {:error, _reason} ->
+        # `key` is a debug aid. A missing, unreadable, or partially written
+        # copy must never make the object itself permanently unpublishable.
+        replace_key_file(path, key, 3)
+    end
+  end
+
+  defp replace_key_file(_path, _key, 0), do: {:error, {:adapter, :io}}
+
+  defp replace_key_file(path, key, attempts) do
+    temp = path <> ".tmp-" <> random_hex(16)
+
+    case open_raw(temp, [:write, :exclusive]) do
+      {:ok, file} ->
+        result =
+          with :ok <- File.chmod(temp, 0o600),
+               :ok <- :file.write(file, key) do
+            :ok
+          else
+            {:error, _reason} -> {:error, {:adapter, :io}}
+          end
+
+        :file.close(file)
+
+        case result do
+          :ok ->
+            case File.rename(temp, path) do
+              :ok ->
+                :ok
+
+              {:error, _reason} ->
+                File.rm(temp)
+                {:error, {:adapter, :io}}
+            end
+
+          {:error, _reason} = error ->
+            File.rm(temp)
+            error
         end
 
       {:error, :eexist} ->
-        case File.read(path) do
-          {:ok, ^key} -> :ok
-          {:ok, _other} -> {:error, {:adapter, :hash_collision}}
-          {:error, _reason} -> {:error, {:adapter, :io}}
-        end
+        replace_key_file(path, key, attempts - 1)
 
       {:error, _reason} ->
         {:error, {:adapter, :io}}
@@ -343,7 +397,7 @@ defmodule Gitility.ObjectStore.Local do
 
   defp copy_for_put(source, destination, deadline) do
     with {:ok, input} <- open_raw(source, [:read]),
-         result <- copy_to_new_file(input, destination, deadline, true) do
+         result <- copy_to_new_file(input, destination, deadline, true, nil) do
       :file.close(input)
       result
     else
@@ -351,11 +405,11 @@ defmodule Gitility.ObjectStore.Local do
     end
   end
 
-  defp copy_for_get(source, destination, deadline) do
+  defp copy_for_get(state, source, destination, deadline) do
     File.rm(destination)
 
     with {:ok, input} <- open_raw(source, [:read]),
-         result <- copy_to_new_file(input, destination, deadline, false) do
+         result <- copy_to_new_file(input, destination, deadline, false, state) do
       :file.close(input)
 
       case result do
@@ -367,13 +421,13 @@ defmodule Gitility.ObjectStore.Local do
     end
   end
 
-  defp copy_to_new_file(input, destination, deadline, hash?) do
+  defp copy_to_new_file(input, destination, deadline, hash?, hook_state) do
     case open_raw(destination, [:write, :exclusive]) do
       {:ok, output} ->
         result =
           with :ok <- File.chmod(destination, 0o600) do
             context = if hash?, do: :crypto.hash_init(:sha256), else: nil
-            copy_chunks(input, output, context, 0, deadline)
+            copy_chunks(input, output, context, 0, deadline, hook_state)
           else
             {:error, _reason} -> {:error, {:adapter, :io}}
           end
@@ -386,19 +440,19 @@ defmodule Gitility.ObjectStore.Local do
     end
   end
 
-  defp copy_chunks(input, output, context, bytes, deadline) do
+  defp copy_chunks(input, output, context, bytes, deadline, hook_state) do
     if remaining(deadline) <= 0 do
       {:error, {:transport, :timeout}}
     else
       case :file.read(input, @chunk_bytes) do
         {:ok, chunk} ->
-          case :file.write(output, chunk) do
-            :ok ->
-              context = if context, do: :crypto.hash_update(context, chunk), else: nil
-              copy_chunks(input, output, context, bytes + byte_size(chunk), deadline)
-
-            {:error, _reason} ->
-              {:error, {:adapter, :io}}
+          with :ok <- run_chunk_hook(hook_state),
+               :ok <- :file.write(output, chunk) do
+            context = if context, do: :crypto.hash_update(context, chunk), else: nil
+            copy_chunks(input, output, context, bytes + byte_size(chunk), deadline, hook_state)
+          else
+            {:error, {:adapter, _reason}} = error -> error
+            {:error, _reason} -> {:error, {:adapter, :io}}
           end
 
         :eof ->
@@ -415,8 +469,24 @@ defmodule Gitility.ObjectStore.Local do
     end
   end
 
-  defp pin(state, key, deadline) do
-    server_call(state.server, {:pin, key_hash(key)}, remaining(deadline))
+  defp run_chunk_hook(nil), do: :ok
+  defp run_chunk_hook(state), do: run_hook(state, :before_chunk)
+
+  defp pin(state, key, deadline), do: pin(state, key, deadline, 3)
+
+  defp pin(state, key, deadline, retries_left) do
+    case server_call(state.server, {:pin, key_hash(key)}, remaining(deadline)) do
+      {:error, {:transport, :closed}} when retries_left > 0 ->
+        Process.sleep(1)
+
+        case start_server(state.root) do
+          {:ok, _server} -> pin(state, key, deadline, retries_left - 1)
+          {:error, _reason} = error -> error
+        end
+
+      result ->
+        result
+    end
   end
 
   defp unpin(server, version, deadline) do
@@ -474,8 +544,10 @@ defmodule Gitility.ObjectStore.Local do
         {:error, {:adapter, :exception}}
 
       nil ->
-        Task.shutdown(task, :brutal_kill)
-        {:error, {:transport, :timeout}}
+        case Task.shutdown(task, :brutal_kill) do
+          {:ok, result} -> result
+          _killed -> {:error, {:transport, :timeout}}
+        end
     end
   end
 
@@ -504,21 +576,83 @@ defmodule Gitility.ObjectStore.Local do
   defp validate_hooks(_hooks), do: {:error, :invalid_hooks}
 
   defp ensure_root(root) do
-    case File.lstat(root) do
+    case File.stat(root) do
       {:ok, %{type: :directory}} ->
-        File.chmod(root, 0o700)
+        :ok
 
       {:ok, _stat} ->
         {:error, :not_a_directory}
 
       {:error, :enoent} ->
-        with :ok <- File.mkdir_p(root),
-             :ok <- File.chmod(root, 0o700) do
-          :ok
+        with :ok <- File.mkdir_p(Path.dirname(root)) do
+          case File.mkdir(root) do
+            :ok ->
+              case File.chmod(root, 0o700) do
+                :ok ->
+                  :ok
+
+                {:error, reason} ->
+                  File.rmdir(root)
+                  {:error, reason}
+              end
+
+            {:error, :eexist} ->
+              ensure_existing_root(root)
+
+            {:error, reason} ->
+              {:error, reason}
+          end
         end
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp ensure_existing_root(root) do
+    case File.stat(root) do
+      {:ok, %{type: :directory}} -> :ok
+      {:ok, _stat} -> {:error, :not_a_directory}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp ensure_owned_directory(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :directory}} ->
+        :ok
+
+      {:ok, _stat} ->
+        {:error, :unsafe_directory_type}
+
+      {:error, :enoent} ->
+        case File.mkdir(path) do
+          :ok ->
+            case File.chmod(path, 0o700) do
+              :ok ->
+                :ok
+
+              {:error, reason} ->
+                File.rmdir(path)
+                {:error, reason}
+            end
+
+          {:error, :eexist} ->
+            ensure_owned_directory(path)
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp remove_version_directory(directory) do
+    case File.lstat(directory) do
+      {:ok, %{type: :directory}} -> File.rm_rf(directory)
+      _other -> :ok
     end
   end
 

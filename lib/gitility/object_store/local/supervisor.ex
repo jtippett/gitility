@@ -6,6 +6,7 @@ defmodule Gitility.ObjectStore.Local.Supervisor do
   alias Gitility.ObjectStore.Local.Server
 
   @registry Gitility.ObjectStore.Local.Registry
+  @start_race_attempts 20
 
   def start_link(_opts) do
     DynamicSupervisor.start_link(__MODULE__, :ok, name: __MODULE__)
@@ -16,25 +17,27 @@ defmodule Gitility.ObjectStore.Local.Supervisor do
 
   @doc false
   @spec server(Path.t()) :: {:ok, pid()} | {:error, term()}
-  def server(root) when is_binary(root) do
+  def server(root) when is_binary(root), do: server(root, @start_race_attempts)
+
+  defp server(root, attempts_left) do
     case Registry.lookup(@registry, root) do
-      [{pid, _value}] ->
+      [{pid, _value}] when is_pid(pid) ->
         {:ok, pid}
 
       [] ->
         case DynamicSupervisor.start_child(__MODULE__, {Server, root}) do
           {:ok, pid} -> {:ok, pid}
-          {:error, {:already_started, pid}} -> {:ok, pid}
-          {:error, {:already_present, _child}} -> lookup_after_race(root)
+          {:error, {:already_started, pid}} when is_pid(pid) -> {:ok, pid}
+          {:error, {:already_present, _child}} -> retry_after_race(root, attempts_left)
           {:error, reason} -> {:error, reason}
         end
     end
   end
 
-  defp lookup_after_race(root) do
-    case Registry.lookup(@registry, root) do
-      [{pid, _value}] -> {:ok, pid}
-      [] -> {:error, :server_start_race}
-    end
+  defp retry_after_race(_root, 0), do: {:error, :server_start_race}
+
+  defp retry_after_race(root, attempts_left) do
+    Process.sleep(1)
+    server(root, attempts_left - 1)
   end
 end

@@ -26,6 +26,7 @@ defmodule Gitility.Bundle do
     ODB,
     OID,
     RefDB,
+    RefName,
     Repository
   }
 
@@ -258,37 +259,41 @@ defmodule Gitility.Bundle do
 
   defp publish(path, source, repository, generation, metadata, opts) do
     directory = Path.dirname(path)
-    suffix = System.unique_integer([:positive, :monotonic])
+    suffix = random_hex(16)
     staging = Path.join(directory, ".#{Path.basename(path)}.staging-#{suffix}")
 
-    try do
-      with :ok <- mkdir_destination(directory),
-           :ok <- mkdir_staging(staging),
-           {:ok, pairs} <-
-             PackInventory.collect(source, staging,
-               allow_empty: true,
-               git_executable: opts[:git_executable]
-             ),
-           :ok <- validate_inventory(pairs, repository.odb.hash),
-           {:ok, refs, ref_metadata, warnings} <- snapshot_refs(repository, source, opts),
-           {:ok, receipt} <-
-             Writer.write(
-               path,
-               pairs: pairs,
-               hash_algorithm: repository.odb.hash,
-               generation: generation,
-               metadata: Map.merge(metadata, ref_metadata),
-               refs: refs,
-               warnings: warnings,
-               mode: opts[:mode]
-             ) do
-        {:ok, receipt}
-      else
-        {:error, %Error{} = error} -> {:error, error}
-        {:error, reason} -> write_error(reason)
+    with :ok <- mkdir_destination(directory),
+         :ok <- mkdir_staging(staging) do
+      try do
+        with {:ok, pairs} <-
+               PackInventory.collect(source, staging,
+                 allow_empty: true,
+                 git_executable: opts[:git_executable]
+               ),
+             :ok <- validate_inventory(pairs, repository.odb.hash),
+             {:ok, refs, ref_metadata, warnings} <- snapshot_refs(repository, source, opts),
+             {:ok, receipt} <-
+               Writer.write(
+                 path,
+                 pairs: pairs,
+                 hash_algorithm: repository.odb.hash,
+                 generation: generation,
+                 metadata: Map.merge(metadata, ref_metadata),
+                 refs: refs,
+                 warnings: warnings,
+                 mode: opts[:mode]
+               ) do
+          {:ok, receipt}
+        else
+          {:error, %Error{} = error} -> {:error, error}
+          {:error, reason} -> write_error(reason)
+        end
+      after
+        File.rm_rf(staging)
       end
-    after
-      File.rm_rf(staging)
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> write_error(reason)
     end
   end
 
@@ -388,40 +393,49 @@ defmodule Gitility.Bundle do
 
   defp snapshot_listed_refs(refs, repository, source, git, warnings, strict?) do
     Enum.reduce_while(refs, {:ok, [], warnings}, fn ref, {:ok, rows, accumulated_warnings} ->
-      case RefDB.resolve(repository.refs, ref.name) do
-        {:ok, target} when target != :not_found ->
-          case ref_row(ref.name, target, repository.odb, source, git, strict?) do
-            {:ok, row, row_warnings} ->
-              {:cont, {:ok, [row | rows], accumulated_warnings ++ row_warnings}}
+      case maybe_validate_strict_ref_name(ref.name, strict?) do
+        :ok ->
+          case RefDB.resolve(repository.refs, ref.name) do
+            {:ok, target} when target != :not_found ->
+              case ref_row(ref.name, target, repository.odb, source, git, strict?) do
+                {:ok, row, row_warnings} ->
+                  {:cont, {:ok, [row | rows], accumulated_warnings ++ row_warnings}}
 
-            {:skip, message} ->
-              {:cont, {:ok, rows, accumulated_warnings ++ [warning(message)]}}
+                {:skip, message} ->
+                  {:cont, {:ok, rows, accumulated_warnings ++ [warning(message)]}}
+
+                {:error, %Error{} = error} ->
+                  {:halt, {:error, error}}
+              end
+
+            {:ok, :not_found} when strict? ->
+              {:halt, strict_ref_error("ref #{inspect(ref.name)} became unresolved")}
+
+            {:ok, :not_found} ->
+              {:cont,
+               {:ok, rows,
+                accumulated_warnings ++ [warning("ref #{inspect(ref.name)} became unresolved")]}}
+
+            {:error, %Error{} = error} when strict? ->
+              {:halt,
+               strict_ref_error("ref #{inspect(ref.name)} could not be resolved",
+                 resolve_error: error.code
+               )}
 
             {:error, %Error{} = error} ->
-              {:halt, {:error, error}}
+              {:cont,
+               {:ok, rows,
+                accumulated_warnings ++ [warning("ref #{inspect(ref.name)}: #{error.message}")]}}
           end
 
-        {:ok, :not_found} when strict? ->
-          {:halt, strict_ref_error("ref #{inspect(ref.name)} became unresolved")}
-
-        {:ok, :not_found} ->
-          {:cont,
-           {:ok, rows,
-            accumulated_warnings ++ [warning("ref #{inspect(ref.name)} became unresolved")]}}
-
-        {:error, %Error{} = error} when strict? ->
-          {:halt,
-           strict_ref_error("ref #{inspect(ref.name)} could not be resolved",
-             resolve_error: error.code
-           )}
-
         {:error, %Error{} = error} ->
-          {:cont,
-           {:ok, rows,
-            accumulated_warnings ++ [warning("ref #{inspect(ref.name)}: #{error.message}")]}}
+          {:halt, {:error, error}}
       end
     end)
   end
+
+  defp maybe_validate_strict_ref_name(name, true), do: validate_strict_ref_name(name)
+  defp maybe_validate_strict_ref_name(_name, false), do: :ok
 
   defp snapshot_head(repository, source, git, _listed, _rows, warnings, false) do
     case RefDB.resolve(repository.refs, "HEAD") do
@@ -481,10 +495,20 @@ defmodule Gitility.Bundle do
   defp validate_strict_head_symref(nil), do: :ok
 
   defp validate_strict_head_symref(symref) do
-    if valid_branch_symref?(symref) do
-      :ok
-    else
-      strict_ref_error("HEAD symbolic target must be a valid name under refs/heads/")
+    case RefName.validate(symref) do
+      :ok ->
+        if RefName.valid_branch?(symref) do
+          :ok
+        else
+          strict_ref_error("HEAD symbolic target must be a valid name under refs/heads/",
+            reason: :not_a_branch
+          )
+        end
+
+      {:error, reason} ->
+        strict_ref_error("HEAD symbolic target must be a valid name under refs/heads/",
+          reason: reason
+        )
     end
   end
 
@@ -517,33 +541,17 @@ defmodule Gitility.Bundle do
     strict_ref_error("HEAD is unresolved and has no symbolic branch target")
   end
 
-  defp valid_branch_symref?(<<"refs/heads/", suffix::binary>> = symref)
-       when byte_size(suffix) > 0 and byte_size(symref) <= 4096 do
-    String.valid?(symref) and valid_ref_name_bytes?(symref)
+  defp ref_row(name, target, odb, source, git, true) do
+    with :ok <- validate_strict_ref_name(name) do
+      do_ref_row(name, target, odb, source, git, true)
+    end
   end
 
-  defp valid_branch_symref?(_symref), do: false
-
-  defp valid_ref_name_bytes?(name) do
-    components = :binary.split(name, "/", [:global])
-
-    name != "@" and not String.contains?(name, "@{") and not String.ends_with?(name, ".") and
-      Enum.all?(components, fn component ->
-        valid_component? =
-          component != "" and component != "." and component != ".." and
-            not String.starts_with?(component, ".") and
-            not String.ends_with?(component, ".lock") and
-            not String.contains?(component, "..")
-
-        valid_component? and
-          Enum.all?(:binary.bin_to_list(component), fn byte ->
-            byte > 0x20 and byte != 0x7F and
-              byte not in [0x7E, 0x5E, 0x3A, 0x3F, 0x2A, 0x5B, 0x5C]
-          end)
-      end)
+  defp ref_row(name, target, odb, source, git, false) do
+    do_ref_row(name, target, odb, source, git, false)
   end
 
-  defp ref_row(name, target, odb, source, git, strict?) do
+  defp do_ref_row(name, target, odb, source, git, strict?) do
     case object_kind(odb, target.oid) do
       {:ok, header} ->
         with {:ok, peeled, peel_warnings} <-
@@ -577,6 +585,18 @@ defmodule Gitility.Bundle do
 
       {:error, %Error{} = error} ->
         {:error, error}
+    end
+  end
+
+  defp validate_strict_ref_name(name) do
+    case RefName.validate(name) do
+      :ok -> :ok
+
+      {:error, reason} ->
+        strict_ref_error("ref #{inspect(name)} is not a portable full reference name",
+          ref: name,
+          reason: reason
+        )
     end
   end
 
@@ -887,7 +907,7 @@ defmodule Gitility.Bundle do
   defp open_read(path) when is_binary(path) do
     case :file.open(String.to_charlist(path), [:read, :raw, :binary]) do
       {:ok, file} -> {:ok, file}
-      {:error, reason} -> malformed_verify("could not open bundle: #{inspect(reason)}")
+      {:error, reason} -> verify_io_error("could not open bundle", reason)
     end
   end
 
@@ -929,7 +949,7 @@ defmodule Gitility.Bundle do
         malformed_verify("unexpected EOF while verifying #{name}")
 
       {:error, reason} ->
-        malformed_verify("could not verify #{name}: #{inspect(reason)}")
+        verify_io_error("could not verify #{name}", reason)
     end
   end
 
@@ -1005,4 +1025,15 @@ defmodule Gitility.Bundle do
   defp malformed_verify(message) do
     {:error, Error.new(:malformed_object, message, operation: :bundle_verify)}
   end
+
+  defp verify_io_error(message, reason) do
+    {:error,
+     Error.new(:backend_error, message,
+       retryable: reason in [:eagain, :eintr, :eio, :emfile, :enfile, :estale],
+       operation: :bundle_verify,
+       details: %{reason: reason}
+     )}
+  end
+
+  defp random_hex(bytes), do: :crypto.strong_rand_bytes(bytes) |> Base.encode16(case: :lower)
 end

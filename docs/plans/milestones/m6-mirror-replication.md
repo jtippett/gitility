@@ -857,7 +857,7 @@ returns `:unsupported_operation`; `Gitility.ObjectStore.Local` and
   artifact — restore it, don't open it".
 - `Gitility.ObjectStore` moduledoc: §1.1 contract incl. atomicity,
   streaming, reason shapes; how to `use` the conformance suite.
-- `Gitility.ObjectStore.S3` moduledoc: add `{:req, "~> 0.5"}`;
+- `Gitility.ObjectStore.S3` moduledoc: add `{:req, "~> 0.5.8"}`;
   minio/Tigris/R2 examples (`addressing: :path`); credentials fun;
   "conditional writes required (AWS, minio, R2, Tigris)"; no redirects.
 - `Gitility.ObjectStore.Local` moduledoc: single-VM, layout, sweep.

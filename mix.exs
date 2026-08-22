@@ -3,7 +3,7 @@ defmodule Gitility.MixProject do
 
   # Do not hand-edit. The release script (scripts/release.exs, via `just release`)
   # bumps this line and the CHANGELOG together when cutting a release.
-  @version "0.4.0"
+  @version "0.5.0"
   @source_url "https://github.com/jtippett/gitility"
 
   def project do

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## 0.5.0 - 2026-08-22
+
 ### Added
 
 - `Gitility.Mirror.publish/4` and `restore/4` for conditional, generation-aware
